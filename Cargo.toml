@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/arc-proto",
+    "crates/arc-config",
+    "crates/arc-security",
+    "crates/arc-hyprland",
+    "crates/arc-system",
+    "crates/arc-tools",
+    "crates/arc-ai",
+    "crates/arc-core",
+    "crates/arc-daemon",
+    "crates/arc-cli",
+    "crates/arc-ui",
+]
+default-members = [
+    "crates/arc-proto",
+    "crates/arc-config",
+    "crates/arc-security",
+    "crates/arc-hyprland",
+    "crates/arc-system",
+    "crates/arc-tools",
+    "crates/arc-ai",
+    "crates/arc-core",
+    "crates/arc-daemon",
+    "crates/arc-cli",
+    "crates/arc-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["ciancom"]
+rust-version = "1.85"
+repository = "https://github.com/ciancom/arc"
+
+[workspace.dependencies]
+arc-proto = { path = "crates/arc-proto" }
+arc-config = { path = "crates/arc-config" }
+arc-security = { path = "crates/arc-security" }
+arc-hyprland = { path = "crates/arc-hyprland" }
+arc-system = { path = "crates/arc-system" }
+arc-tools = { path = "crates/arc-tools" }
+arc-ai = { path = "crates/arc-ai" }
+arc-core = { path = "crates/arc-core" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+toml_edit = "0.25"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+regex = "1"
+async-trait = "0.1"
+futures = "0.3"
+shlex = "1.3"
+libc = "0.2"
+strsim = "0.11"
+rand = "0.9"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+debug = 1

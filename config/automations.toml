@@ -1,0 +1,48 @@
+# Arc automations — multi-step routines run by a phrase.
+#
+# Each step is one of:
+#   { tool = "<tool name>", args = { ... } }   run an Arc tool (see `arc tools`)
+#   { wait_ms = 500 }                           pause (max 60000)
+#   { say = "text" }                            say/show something
+#
+# Every tool step goes through Arc's permission layer exactly as if you had
+# asked for it directly: dangerous steps still ask for confirmation.
+# Reload with `arc reload` (or restart Arc). Validate with `arc config check`.
+
+[[automation]]
+name = "start coding"
+triggers = ["coding mode", "dev mode", "start my development environment"]
+description = "Workspace 2 with the editor, a terminal in ~/Projects and the browser"
+steps = [
+  { tool = "hyprland.switch_workspace", args = { workspace = 2 } },
+  { tool = "apps.launch", args = { name = "code" } },
+  { wait_ms = 700 },
+  { tool = "terminal.open", args = { cwd = "~/Projects" } },
+  { tool = "apps.launch", args = { name = "browser" } },
+  { say = "Development environment is up." },
+]
+
+[[automation]]
+name = "gaming mode"
+triggers = ["game mode", "let's play"]
+description = "Steam on workspace 6, notifications silenced"
+steps = [
+  { tool = "hyprland.switch_workspace", args = { workspace = 6 } },
+  { tool = "notifications.set_dnd", args = { enabled = true } },
+  { tool = "apps.launch", args = { name = "steam" } },
+  { say = "Gaming mode. Notifications are silenced." },
+]
+
+[[automation]]
+name = "work mode"
+triggers = ["focus mode"]
+description = "Notes on workspace 3, browser on workspace 4"
+steps = [
+  { tool = "notifications.set_dnd", args = { enabled = false } },
+  { tool = "hyprland.switch_workspace", args = { workspace = 3 } },
+  { tool = "apps.launch", args = { name = "obsidian" } },
+  { wait_ms = 500 },
+  { tool = "hyprland.switch_workspace", args = { workspace = 4 } },
+  { tool = "apps.launch", args = { name = "browser" } },
+  { say = "Work mode ready." },
+]

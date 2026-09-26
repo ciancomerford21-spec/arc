@@ -1,0 +1,7 @@
+/target
+*.gguf
+*.onnx
+__pycache__/
+*.pyc
+.venv/
+/python/**/*.egg-info

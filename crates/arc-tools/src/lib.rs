@@ -124,6 +124,15 @@ impl Tools {
     /// Registry built from the user's configuration (shell policy,
     /// sensitive paths). Fails on invalid user regexes in the shell policy.
     pub fn from_config(cfg: &Config) -> Result<Self, String> {
+        Self::from_config_with_memory(cfg, None)
+    }
+
+    /// As [`Tools::from_config`], but with a memory store attached so the
+    /// `memory_*` tools can reach it. `None` disables those tools.
+    pub fn from_config_with_memory(
+        cfg: &Config,
+        store: Option<Arc<arc_memory::MemoryStore>>,
+    ) -> Result<Self, String> {
         let sensitive: Vec<String> = cfg
             .files
             .sensitive_paths
@@ -133,7 +142,7 @@ impl Tools {
         let analyzer = ShellAnalyzer::new(&cfg.permissions.shell, &sensitive)
             .map_err(|e| format!("invalid permissions.shell regex: {e}"))?;
         let mut t = Tools { by_name: HashMap::new() };
-        t.register_builtins(ShellExec { analyzer, policy: cfg.permissions.shell.clone() });
+        t.register_builtins(ShellExec { analyzer, policy: cfg.permissions.shell.clone() }, store);
         Ok(t)
     }
 
@@ -164,7 +173,12 @@ impl Tools {
         self.by_name.keys().cloned().collect()
     }
 
-    fn register_builtins(&mut self, shell: ShellExec) {
+    fn register_builtins(&mut self, shell: ShellExec, store: Store) {
+        self.register(Arc::new(shell));
+        self.register(Arc::new(MemoryRemember(store.clone())));
+        self.register(Arc::new(MemoryForget(store.clone())));
+        self.register(Arc::new(MemoryList(store.clone())));
+        self.register(Arc::new(MemorySearch(store)));
         self.register(Arc::new(WorkspaceList));
         self.register(Arc::new(WorkspaceGoto));
         self.register(Arc::new(WindowList));
@@ -189,7 +203,6 @@ impl Tools {
         self.register(Arc::new(NetworkStatus));
         self.register(Arc::new(PowerInfo));
         self.register(Arc::new(MonitorOverview));
-        self.register(Arc::new(shell));
     }
 }
 
@@ -907,6 +920,146 @@ impl Tool for PowerInfo {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Memory tools (persisted across restarts)
+// ---------------------------------------------------------------------------
+
+/// Shared by the four memory tools; `None` means memory is disabled and the
+/// tools report that rather than failing.
+type Store = Option<Arc<arc_memory::MemoryStore>>;
+
+struct MemoryRemember(Store);
+#[async_trait]
+impl Tool for MemoryRemember {
+    fn name(&self) -> &str {
+        "memory_remember"
+    }
+    fn description(&self) -> &str {
+        "Store a fact about the user for later, across sessions. Use only when the user asks you to \
+         remember something, or states a durable preference, name, or goal worth keeping. \
+         Write it as a plain sentence about the user, in the third person."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({"type": "object", "properties": {
+            "fact": {"type": "string", "description": "The fact to remember, as a sentence about the user"}
+        }, "required": ["fact"]})
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        s(v, "fact").map(|f| format!("Noted: {f}."))
+    }
+    async fn execute(&self, args: &JsonMap) -> ToolResult {
+        let Some(store) = self.0.as_ref() else { return not_available() };
+        let fact = args.get("fact").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if fact.is_empty() {
+            return ToolResult::Error("memory_remember: need a non-empty 'fact'".into());
+        }
+        let e = store.remember(fact, vec![]);
+        ToolResult::Ok(serde_json::json!({"id": e.id, "fact": e.fact, "remembered_at": e.remembered_at}))
+    }
+}
+
+struct MemoryForget(Store);
+#[async_trait]
+impl Tool for MemoryForget {
+    fn name(&self) -> &str {
+        "memory_forget"
+    }
+    fn description(&self) -> &str {
+        "Delete a remembered fact by its id. Use when the user asks you to forget something. \
+         Call memory_list first if you need the id."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({"type": "object", "properties": {
+            "id": {"type": "string", "description": "Id of the fact to delete, from memory_list"}
+        }, "required": ["id"]})
+    }
+    fn summarize(&self, _v: &Json) -> Option<String> {
+        Some("Forgotten.".into())
+    }
+    async fn execute(&self, args: &JsonMap) -> ToolResult {
+        let Some(store) = self.0.as_ref() else { return not_available() };
+        let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if id.is_empty() {
+            return ToolResult::Error("memory_forget: need an 'id'".into());
+        }
+        if store.forget(id) {
+            ToolResult::Ok(serde_json::json!({"id": id, "forgotten": true}))
+        } else {
+            ToolResult::Error(format!("memory_forget: no fact with id {id}"))
+        }
+    }
+}
+
+struct MemoryList(Store);
+#[async_trait]
+impl Tool for MemoryList {
+    fn name(&self) -> &str {
+        "memory_list"
+    }
+    fn description(&self) -> &str {
+        "List every fact Arc has remembered, with ids."
+    }
+    fn parameters(&self) -> Json {
+        no_params()
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        Some(match v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) {
+            0 => "I don't have anything remembered yet.".into(),
+            n => format!("{n} thing{} remembered.", if n == 1 { "" } else { "s" }),
+        })
+    }
+    async fn execute(&self, _args: &JsonMap) -> ToolResult {
+        let Some(store) = self.0.as_ref() else { return not_available() };
+        let entries = store.list();
+        let facts: Vec<Json> = entries
+            .iter()
+            .map(|e| serde_json::json!({"id": e.id, "fact": e.fact, "remembered_at": e.remembered_at}))
+            .collect();
+        ToolResult::Ok(serde_json::json!({"count": facts.len(), "facts": facts}))
+    }
+}
+
+struct MemorySearch(Store);
+#[async_trait]
+impl Tool for MemorySearch {
+    fn name(&self) -> &str {
+        "memory_search"
+    }
+    fn description(&self) -> &str {
+        "Search remembered facts for a keyword, returning the ones that match. \
+         Use when the user refers to something they told you previously."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({"type": "object", "properties": {
+            "query": {"type": "string", "description": "Words to look for"}
+        }, "required": ["query"]})
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        Some(match v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) {
+            0 => "Nothing remembered matches that.".into(),
+            n => format!("{n} match{}.", if n == 1 { "" } else { "es" }),
+        })
+    }
+    async fn execute(&self, args: &JsonMap) -> ToolResult {
+        let Some(store) = self.0.as_ref() else { return not_available() };
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if query.is_empty() {
+            return ToolResult::Error("memory_search: need a non-empty 'query'".into());
+        }
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        let entries = store.search(terms);
+        let facts: Vec<Json> = entries
+            .iter()
+            .map(|e| serde_json::json!({"id": e.id, "fact": e.fact, "remembered_at": e.remembered_at}))
+            .collect();
+        ToolResult::Ok(serde_json::json!({"count": facts.len(), "facts": facts}))
+    }
+}
+
+fn not_available() -> ToolResult {
+    ToolResult::Error("memory is disabled (no memory store configured)".into())
+}
+
 struct MonitorOverview;
 #[async_trait]
 impl Tool for MonitorOverview {
@@ -1140,8 +1293,81 @@ mod tests {
     #[test]
     fn specs_have_object_schemas() {
         let specs = Tools::new().specs();
-        assert_eq!(specs.len(), 25);
+        // 25 built-in tools + 4 memory tools.
+        assert_eq!(specs.len(), 29);
         assert!(specs.iter().all(|s| s.parameters["type"] == "object"));
+    }
+
+    #[test]
+    fn registry_has_the_four_memory_tools() {
+        let names = Tools::new().all_names();
+        for t in ["memory_remember", "memory_forget", "memory_list", "memory_search"] {
+            assert!(names.contains(&t.to_string()), "missing tool: {t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_tools_report_when_disabled() {
+        // `Tools::new()` passes no store, so every memory tool must say so
+        // rather than pretending to work or panicking.
+        let t = Tools::new();
+        for (name, a) in [
+            ("memory_remember", args(&[("fact", "x")])),
+            ("memory_forget", args(&[("id", "x")])),
+            ("memory_list", JsonMap::new()),
+            ("memory_search", args(&[("query", "x")])),
+        ] {
+            let r = t.by_name(name).unwrap().execute(&a).await;
+            assert!(matches!(&r, ToolResult::Error(e) if e.contains("disabled")), "{name}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_tools_work_against_a_real_store() {
+        let dir = std::env::temp_dir().join("arc_memory_tool_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(arc_memory::MemoryStore::new_in_dir(&dir));
+        let t = Tools::from_config_with_memory(&Config::default(), Some(store.clone())).unwrap();
+
+        let ToolResult::Ok(saved) = t
+            .by_name("memory_remember")
+            .unwrap()
+            .execute(&args(&[("fact", "The user drinks tea, not coffee")]))
+            .await
+        else { panic!("remember failed") };
+        let id = saved["id"].as_str().expect("id").to_string();
+        assert!(!id.is_empty());
+
+        let ToolResult::Ok(list) = t.by_name("memory_list").unwrap().execute(&JsonMap::new()).await else { panic!() };
+        assert_eq!(list["count"], 1);
+        assert!(list["facts"][0]["fact"].as_str().unwrap().contains("tea"));
+
+        let ToolResult::Ok(found) = t
+            .by_name("memory_search")
+            .unwrap()
+            .execute(&args(&[("query", "tea")]))
+            .await
+        else { panic!() };
+        assert_eq!(found["count"], 1);
+
+        let ToolResult::Ok(_) = t
+            .by_name("memory_forget")
+            .unwrap()
+            .execute(&args(&[("id", id.as_str())]))
+            .await
+        else { panic!("forget failed") };
+        let ToolResult::Ok(list) = t.by_name("memory_list").unwrap().execute(&JsonMap::new()).await else { panic!() };
+        assert_eq!(list["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn memory_remember_rejects_a_blank_fact() {
+        let dir = std::env::temp_dir().join("arc_memory_tool_blank");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(arc_memory::MemoryStore::new_in_dir(&dir));
+        let t = Tools::from_config_with_memory(&Config::default(), Some(store)).unwrap();
+        let r = t.by_name("memory_remember").unwrap().execute(&args(&[("fact", "   ")])).await;
+        assert!(matches!(&r, ToolResult::Error(e) if e.contains("non-empty")));
     }
 
     #[test]

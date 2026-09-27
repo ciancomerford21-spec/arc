@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 arc-config = { workspace = true }
 arc-core = { workspace = true }
+arc-memory = { workspace = true }
 arc-proto = { workspace = true }
 arc-tools = { workspace = true }
 anyhow = { workspace = true }

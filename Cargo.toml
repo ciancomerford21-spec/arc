@@ -9,6 +9,7 @@ members = [
     "crates/arc-tools",
     "crates/arc-ai",
     "crates/arc-core",
+    "crates/arc-memory",
     "crates/arc-daemon",
     "crates/arc-cli",
     "crates/arc-ui",
@@ -22,6 +23,7 @@ default-members = [
     "crates/arc-tools",
     "crates/arc-ai",
     "crates/arc-core",
+    "crates/arc-memory",
     "crates/arc-daemon",
     "crates/arc-cli",
 ]
@@ -43,6 +45,7 @@ arc-system = { path = "crates/arc-system" }
 arc-tools = { path = "crates/arc-tools" }
 arc-ai = { path = "crates/arc-ai" }
 arc-core = { path = "crates/arc-core" }
+arc-memory = { path = "crates/arc-memory" }
 
 anyhow = "1"
 thiserror = "2"

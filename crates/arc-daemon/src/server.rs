@@ -7,7 +7,8 @@
 
 use crate::state::Daemon;
 use arc_proto::{
-    ClientMessage, ErrorCode, Event, PROTOCOL_VERSION, Request, ServerMessage, Topic, VoiceCommand, encode_line,
+    ClientMessage, ErrorCode, Event, MemoryRequest, PROTOCOL_VERSION, Request, ServerMessage, Topic, VoiceCommand,
+    encode_line,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -222,12 +223,65 @@ pub async fn handle(d: &Daemon, msg: ClientMessage) -> ServerMessage {
             ErrorCode::BadRequest,
             "voice reports are accepted only from the daemon's own voice service",
         ),
+        Request::Memory(m) => memory(d, id, m),
         Request::Desktop
-        | Request::Memory(_)
         | Request::Automations(_)
         | Request::Permissions
         | Request::Audit { .. }
         | Request::Reload => ServerMessage::err(id, ErrorCode::Unavailable, "not implemented yet"),
         Request::Subscribe { .. } => unreachable!("handled by the connection loop"),
+    }
+}
+
+/// `Request::Memory` operations. Facts live in the store attached to the
+/// assistant; the daemon is the only writer, so clients go through here.
+fn memory(d: &Daemon, id: u64, m: MemoryRequest) -> ServerMessage {
+    let Some(store) = d.assistant.memory() else {
+        return ServerMessage::err(id, ErrorCode::Unavailable, "memory is disabled");
+    };
+    match m {
+        MemoryRequest::List { category } => {
+            let entries = match &category {
+                Some(c) => store.search(vec![c.as_str()]),
+                None => store.list(),
+            };
+            let facts: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "id": e.id,
+                        "fact": e.fact,
+                        "tags": e.tags,
+                        "remembered_at": e.remembered_at,
+                    })
+                })
+                .collect();
+            ServerMessage::ok(id, json!({"count": facts.len(), "facts": facts}))
+        }
+        MemoryRequest::Remember { key, value, .. } => {
+            // The proto's key/value pair is stored as one readable sentence so
+            // it comes back out in the prompt the way it went in.
+            let fact = format!("{key}: {value}");
+            let e = store.remember(fact, vec![]);
+            ServerMessage::ok(id, json!({"id": e.id, "fact": e.fact, "remembered_at": e.remembered_at}))
+        }
+        MemoryRequest::Forget { key } => {
+            // Accept either the entry id or the leading `key` of a stored fact.
+            if store.forget(&key) {
+                return ServerMessage::ok(id, json!({"forgotten": key}));
+            }
+            match store.list().into_iter().find(|e| e.fact.starts_with(&format!("{key}:"))) {
+                Some(e) if store.forget(&e.id) => ServerMessage::ok(id, json!({"forgotten": e.id})),
+                _ => ServerMessage::err(id, ErrorCode::NotFound, format!("no fact matching `{key}`")),
+            }
+        }
+        MemoryRequest::ForgetLast => match store.list().last() {
+            Some(e) if store.forget(&e.id) => ServerMessage::ok(id, json!({"forgotten": e.fact})),
+            _ => ServerMessage::err(id, ErrorCode::NotFound, "no facts to forget"),
+        },
+        MemoryRequest::Clear => {
+            let n = store.clear();
+            ServerMessage::ok(id, json!({"cleared": n}))
+        }
     }
 }

@@ -83,7 +83,7 @@ class VoiceConfig:
         p = path
         if isinstance(p, str):
             p = Path(p)
-        p = p or cls.config_file()
+        p = p or config_file()
         if not p.exists():
             return cls()
         with p.open("rb") as f:

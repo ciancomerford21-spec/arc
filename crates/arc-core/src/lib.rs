@@ -14,6 +14,7 @@ use agent::{Agent, AgentReply};
 use automations::Automations;
 use arc_ai::AiMessage;
 use arc_config::Config;
+use arc_memory::MemoryStore;
 use arc_proto::{ActionOutcome, ActionRecord, PendingConfirmation, RiskLevel};
 use arc_tools::{JsonMap, ToolResult, Tools};
 use gate::{Gate, Outcome};
@@ -334,26 +335,27 @@ pub struct Assistant {
     voice_confirm_dangerous: bool,
     provider_name: String,
     automations: Automations,
+    store: Option<Arc<MemoryStore>>,
 }
 
 impl Assistant {
     /// Build from configuration. The language model is optional: with
     /// `ai.provider = "none"` (or a broken provider config) Arc still
     /// handles fixed commands.
-    pub fn from_config(cfg: &Config) -> Result<Self, String> {
-        let tools = Arc::new(Tools::from_config(cfg)?);
+    pub fn from_config(cfg: &Config, store: Option<Arc<MemoryStore>>) -> Result<Self, String> {
+        let tools = Arc::new(Tools::from_config_with_memory(cfg, store.clone())?);
         let gate = Arc::new(Gate::new(tools, cfg));
         let (agent, provider_name) = match arc_ai::from_config(&cfg.ai) {
             Ok(p) => {
                 let name = p.primary_name().to_string();
-                (Some(Agent::new(p, gate.clone(), system_prompt(cfg), cfg.ai.max_tool_rounds)), name)
+                (Some(Agent::new(p, gate.clone(), system_prompt(cfg, store.as_ref()), cfg.ai.max_tool_rounds)), name)
             }
             Err(e) => {
                 tracing::info!(error = %e, "language model disabled");
                 (None, "none".to_string())
             }
         };
-        let mut a = Self::with_parts(gate, agent);
+        let mut a = Self::with_parts(gate, agent, store);
         a.voice_confirm_dangerous = cfg.voice.voice_confirm_dangerous;
         a.provider_name = provider_name;
         Ok(a)
@@ -370,7 +372,7 @@ impl Assistant {
         &self.automations
     }
 
-    pub fn with_parts(gate: Arc<Gate>, agent: Option<Agent>) -> Self {
+    pub fn with_parts(gate: Arc<Gate>, agent: Option<Agent>, store: Option<Arc<MemoryStore>>) -> Self {
         Self {
             router: Router::new().expect("built-in grammar compiles"),
             gate,
@@ -380,6 +382,7 @@ impl Assistant {
             voice_confirm_dangerous: false,
             provider_name: "none".into(),
             automations: Automations::empty(),
+            store,
         }
     }
 
@@ -389,6 +392,11 @@ impl Assistant {
 
     pub fn provider_name(&self) -> &str {
         &self.provider_name
+    }
+
+    /// The memory store, if one is attached.
+    pub fn memory(&self) -> Option<&Arc<MemoryStore>> {
+        self.store.as_ref()
     }
 
     fn reply_from_outcome(&self, outcome: Outcome, route: Route) -> Reply {
@@ -451,6 +459,11 @@ impl Assistant {
                 h.push(AiMessage::assistant(text.clone(), vec![]));
                 let excess = h.len().saturating_sub(self.max_history);
                 h.drain(..excess);
+                let store = self.store.clone();
+                if let Some(st) = &store {
+                    let _ = st.append_turn(arc_memory::SessionTurnRole::User, input.text.clone());
+                    let _ = st.append_turn(arc_memory::SessionTurnRole::Assistant, text.clone());
+                }
                 Reply { text, route: Route::Ai, actions, pending }
             }
             Err(e) => Reply::text_only(format!("The language model is unavailable: {e}"), Route::Ai),
@@ -485,7 +498,7 @@ impl Assistant {
     }
 }
 
-fn system_prompt(cfg: &Config) -> String {
+fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
     use arc_config::PersonalityStyle::*;
     let style = match cfg.personality.style {
         Concise => "Answer in one or two short sentences. Occasional dry wit is fine.",
@@ -506,6 +519,15 @@ fn system_prompt(cfg: &Config) -> String {
          instead of acting. 'Desktop' means workspace.",
         name = cfg.general.name
     );
+    if let Some(store) = store {
+        let facts = store.prompt_block(8, None);
+        let convo = store.recent_conversation();
+        if !facts.is_empty() || !convo.is_empty() {
+            p.push_str("\n\n");
+            if !facts.is_empty() { p.push_str(&facts); }
+            if !convo.is_empty() { p.push_str(&convo); }
+        }
+    }
     if !cfg.personality.custom_prompt.trim().is_empty() {
         p.push_str("\n\n");
         p.push_str(cfg.personality.custom_prompt.trim());
@@ -629,7 +651,7 @@ mod tests {
     fn assistant() -> Assistant {
         let mut cfg = Config::default();
         cfg.ai.provider = arc_config::ProviderKind::None;
-        Assistant::from_config(&cfg).unwrap()
+        Assistant::from_config(&cfg, None).unwrap()
     }
 
     #[tokio::test]

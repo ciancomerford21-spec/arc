@@ -54,6 +54,35 @@ steps = [
 - Steps go through the normal permission checks. `continue_on_error = true` keeps going after a failed step.
 - Mistakes (unknown tool, bad TOML) show up in `journalctl --user -u arcd`; Arc still starts.
 
+## Memory
+
+Arc keeps two things on disk in `~/.local/share/arc/memory/`, and both survive
+restarts:
+
+- `facts.json` — things worth keeping: preferences, names, your setup.
+- `sessions.json` — transcripts of recent conversations.
+
+On every reply Arc prepends a `MEMORIZED FACTS` and `RECENT CONVERSATION`
+block to the system prompt, so it can answer "what did I just tell you?" and
+"what editor do I use?" in a session where you never said them. The transcript
+block is capped at the last 24 turns, so the prompt stays bounded.
+
+You rarely need the CLI, but it's there:
+
+```sh
+arc memory list                          # everything remembered, with ids
+arc memory search tea                    # filter by keyword
+arc memory remember editor = "neovim"    # store a fact by hand
+arc memory forget <id-or-key>            # remove one
+arc memory forget-last                   # undo the most recent
+arc memory clear                         # remove everything
+```
+
+Arc also has four tools it can call itself — `memory_remember`,
+`memory_forget`, `memory_list`, `memory_search` — so you can just say
+"remember that I drink tea" and it will. Set `ARC_MEMORY_PATH` to move the
+store somewhere else.
+
 ## Language model
 
 Set in `[ai]` of the config: `provider` is tried first, `fallback` if it fails.

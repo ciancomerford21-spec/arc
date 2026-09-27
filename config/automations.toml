@@ -67,7 +67,7 @@ steps = [
   { tool = "app_launch", args = { app = "steam", workspace = 3 } },
   { wait_ms = 500 },
   { tool = "open_url", args = {url = "youtube.com", workspace = 2} },
-  { tool = "workspace_goto", args {id = 1 } },
+  { tool = "workspace_goto", args = { id = 1 } },
   { say = "gaming mode is ready" },
 ]
 continue_on_error = true

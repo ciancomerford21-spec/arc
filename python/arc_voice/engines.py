@@ -27,7 +27,10 @@ class EngineUnavailable(RuntimeError):
 
 
 def _threads() -> int:
-    return max(1, min(4, (os.cpu_count() or 2) // 2))
+    cpu = os.cpu_count() or 2
+    # Avoid oversubscribing when the TTS backend wins the thread budget: cap
+    # TTS work to a moderate number so the CPU stays responsive for audio I/O.
+    return max(1, min(4, cpu // 2))
 
 
 def _need(p: Path, what: str) -> Path:

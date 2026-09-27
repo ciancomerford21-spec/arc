@@ -108,7 +108,7 @@ stt_engine = "moonshine"
 stt_model = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
 # piper | espeak | none
 tts_engine = "piper"
-tts_voice = "vits-piper-en_GB-alan-medium"
+tts_voice = "vits-piper-en_GB-jenny_dioco-medium"
 # Saying the wake word while Arc talks interrupts it.
 barge_in = true
 # Keep speech models in memory (faster, about 300 MB RAM).

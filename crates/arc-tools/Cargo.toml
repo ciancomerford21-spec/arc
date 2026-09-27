@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 arc-config = { workspace = true }
 arc-hyprland = { workspace = true }
+arc-memory = { workspace = true }
 arc-proto = { workspace = true }
 arc-security = { workspace = true }
 arc-system = { workspace = true }

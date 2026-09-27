@@ -120,6 +120,7 @@ version = "0.1.0"
 dependencies = [
  "arc-ai",
  "arc-config",
+ "arc-memory",
  "arc-proto",
  "arc-security",
  "arc-tools",
@@ -139,6 +140,7 @@ dependencies = [
  "anyhow",
  "arc-config",
  "arc-core",
+ "arc-memory",
  "arc-proto",
  "arc-tools",
  "clap",
@@ -161,6 +163,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "arc-memory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -214,6 +224,7 @@ dependencies = [
  "anyhow",
  "arc-config",
  "arc-hyprland",
+ "arc-memory",
  "arc-proto",
  "arc-security",
  "arc-system",

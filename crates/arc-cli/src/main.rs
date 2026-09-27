@@ -64,6 +64,14 @@ enum Cmd {
     },
     /// Forget the short-term conversation.
     Reset,
+    /// Inspect and edit remembered facts: `arc memory list|search|forget|clear`.
+    Memory {
+        #[arg(value_name = "ACTION", default_value = "list")]
+        action: String,
+        /// Text for `search`, or an id for `forget`.
+        #[arg(trailing_var_arg = true)]
+        arg: Vec<String>,
+    },
     /// Show / hide the Arc panel (starts `arc-ui` if it isn't running).
     Panel {
         #[arg(long)]
@@ -295,6 +303,58 @@ fn main() -> Result<()> {
         Cmd::Reset => {
             Conn::open(&sock, Some(Duration::from_secs(5)))?.call(json!({"type": "reset_conversation"}))?;
             println!("Conversation cleared.");
+        }
+        Cmd::Memory { action, arg } => {
+            let mut c = Conn::open(&sock, Some(Duration::from_secs(5)))?;
+            let join = arg.join(" ");
+            let req = match action.as_str() {
+                "list" => json!({"type": "memory", "op": "list"}),
+                "search" => {
+                    if join.trim().is_empty() {
+                        bail!("`arc memory search` needs something to search for");
+                    }
+                    json!({"type": "memory", "op": "list", "category": join})
+                }
+                "remember" => {
+                    // `arc memory remember key = value`
+                    let Some((k, v)) = join.split_once('=') else {
+                        bail!("usage: arc memory remember <key> = <value>");
+                    };
+                    if k.trim().is_empty() || v.trim().is_empty() {
+                        bail!("both sides of `=` must be non-empty");
+                    }
+                    json!({"type": "memory", "op": "remember", "category": "general", "key": k.trim(), "value": v.trim()})
+                }
+                "forget" => {
+                    if join.trim().is_empty() {
+                        bail!("`arc memory forget` needs an id or key");
+                    }
+                    json!({"type": "memory", "op": "forget", "key": join.trim()})
+                }
+                "forget-last" => json!({"type": "memory", "op": "forget_last"}),
+                "clear" => json!({"type": "memory", "op": "clear"}),
+                other => bail!("unknown memory action `{other}` (list, search, remember, forget, forget-last, clear)"),
+            };
+            let r = c.call(req)?;
+            if cli.json {
+                println!("{r}");
+                return Ok(());
+            }
+            match action.as_str() {
+                "list" | "search" => {
+                    let facts = r["facts"].as_array().cloned().unwrap_or_default();
+                    if facts.is_empty() {
+                        println!("Nothing remembered yet.");
+                    }
+                    for f in facts {
+                        println!("{}  {}", f["id"].as_str().unwrap_or("?"), f["fact"].as_str().unwrap_or(""));
+                    }
+                }
+                "remember" => println!("Noted: {}.", r["fact"].as_str().unwrap_or("")),
+                "forget" | "forget-last" => println!("Forgot {}.", r["forgotten"].as_str().unwrap_or("it")),
+                "clear" => println!("Forgot {} fact(s).", r["cleared"].as_u64().unwrap_or(0)),
+                _ => println!("{r}"),
+            }
         }
         Cmd::Panel { toggle } => {
             // arc-ui is a single-instance GApplication: launching it again

@@ -2,14 +2,16 @@
 //! status reporting and the bar status file.
 
 use arc_config::Config;
+use arc_config::paths;
 use arc_core::{Assistant, InputSource as CoreSource, NluInput, Reply, Route};
+use arc_memory::MemoryStore;
 use arc_proto::{
     AskResult, AssistantState, BarStatus, ComponentStatus, Event, HealthStatus, InputSource, StatusReport, VoiceCommand,
     VoiceMode,
 };
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
@@ -59,7 +61,11 @@ fn route_name(r: Route) -> &'static str {
 
 impl Daemon {
     pub fn new(config: Config, bar_file: Option<PathBuf>) -> Result<Self, String> {
-        let mut assistant = Assistant::from_config(&config)?;
+        let memory_path = std::env::var_os("ARC_MEMORY_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| paths::data_dir().join("memory"));
+        let store = MemoryStore::new(memory_path);
+        let mut assistant = Assistant::from_config(&config, Some(Arc::new(store)))?;
         let path = std::env::var_os("ARC_AUTOMATIONS")
             .map(PathBuf::from)
             .unwrap_or_else(arc_config::paths::automations_file);

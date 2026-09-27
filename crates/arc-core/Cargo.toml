@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 arc-ai = { workspace = true }
 arc-config = { workspace = true }
+arc-memory = { workspace = true }
 arc-proto = { workspace = true }
 arc-security = { workspace = true }
 arc-tools = { workspace = true }

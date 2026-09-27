@@ -59,7 +59,21 @@ fn route_name(r: Route) -> &'static str {
 
 impl Daemon {
     pub fn new(config: Config, bar_file: Option<PathBuf>) -> Result<Self, String> {
-        let assistant = Assistant::from_config(&config)?;
+        let mut assistant = Assistant::from_config(&config)?;
+        let path = std::env::var_os("ARC_AUTOMATIONS")
+            .map(PathBuf::from)
+            .unwrap_or_else(arc_config::paths::automations_file);
+        match arc_config::automations::load(&path) {
+            Ok(file) => {
+                let n = file.automations.len();
+                for p in assistant.set_automations(file) {
+                    tracing::warn!("{p}");
+                }
+                tracing::info!(count = n, path = %path.display(), "automations loaded");
+            }
+            // A broken automations file must not stop Arc from starting.
+            Err(e) => tracing::error!(error = %e, "automations not loaded"),
+        }
         let (events, _) = broadcast::channel(256);
         Ok(Self {
             assistant,

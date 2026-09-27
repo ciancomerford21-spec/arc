@@ -7,9 +7,11 @@
 //! * [`Assistant`]: one entry point that ties them together.
 
 pub mod agent;
+pub mod automations;
 pub mod gate;
 
 use agent::{Agent, AgentReply};
+use automations::Automations;
 use arc_ai::AiMessage;
 use arc_config::Config;
 use arc_proto::{ActionOutcome, ActionRecord, PendingConfirmation, RiskLevel};
@@ -331,6 +333,7 @@ pub struct Assistant {
     max_history: usize,
     voice_confirm_dangerous: bool,
     provider_name: String,
+    automations: Automations,
 }
 
 impl Assistant {
@@ -356,6 +359,17 @@ impl Assistant {
         Ok(a)
     }
 
+    /// Replace the user automations (loaded by the daemon at start / reload).
+    /// Returns problems found (unknown tool names), for logging.
+    pub fn set_automations(&mut self, file: arc_config::automations::AutomationFile) -> Vec<String> {
+        self.automations = Automations::new(file);
+        self.automations.problems(&self.gate)
+    }
+
+    pub fn automations(&self) -> &Automations {
+        &self.automations
+    }
+
     pub fn with_parts(gate: Arc<Gate>, agent: Option<Agent>) -> Self {
         Self {
             router: Router::new().expect("built-in grammar compiles"),
@@ -365,6 +379,7 @@ impl Assistant {
             max_history: 20,
             voice_confirm_dangerous: false,
             provider_name: "none".into(),
+            automations: Automations::empty(),
         }
     }
 
@@ -407,14 +422,20 @@ impl Assistant {
             return self.confirm(&id).await;
         }
 
-        // 2. Deterministic grammar.
+        // 2. User automations (exact phrase match; user phrases win over built-ins).
+        if let Some(a) = self.automations.find(&input.text) {
+            let r = self.automations.run(a, &self.gate).await;
+            return Reply { text: r.text, route: Route::FixedCommand, actions: r.actions, pending: r.pending };
+        }
+
+        // 3. Deterministic grammar.
         let out = self.router.route(input);
         if let (Route::FixedCommand, Some(tool)) = (out.route, out.tool_name.as_deref()) {
             let ctx = json!({"source": input.source});
             return self.reply_from_outcome(self.gate.run(tool, out.args, ctx).await, Route::FixedCommand);
         }
 
-        // 3. Language model.
+        // 4. Language model.
         let Some(agent) = &self.agent else {
             return Reply::text_only("I don't know that command, and no language model is configured.", Route::Unknown);
         };

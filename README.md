@@ -33,6 +33,27 @@ Everything is per-user; no root. `scripts/uninstall.sh` removes it again
   about 5 seconds afterwards; just answer, no "Hey Arc" needed. Turn off with `follow_up = false`
   under `[voice]`.
 
+## Custom commands
+
+Add your own phrases in `~/.config/arc/automations.toml`, then `systemctl --user restart arcd`:
+
+```toml
+[[automation]]
+name = "coding mode"                      # saying the name runs it
+triggers = ["start coding", "dev mode"]   # other phrases that run it
+steps = [
+  { tool = "app_launch", args = { app = "code", workspace = 2 } },
+  { wait_ms = 700 },
+  { tool = "open_url", args = { url = "github.com", workspace = 3 } },
+  { say = "Coding mode is ready." },      # what Arc says at the end
+]
+```
+
+- Phrases match exactly, ignoring case, punctuation, "please" and "Hey Arc". Anything else goes to the AI as usual.
+- `arc tools` lists the tools; `config/automations.toml` in this repo documents their arguments.
+- Steps go through the normal permission checks. `continue_on_error = true` keeps going after a failed step.
+- Mistakes (unknown tool, bad TOML) show up in `journalctl --user -u arcd`; Arc still starts.
+
 ## Language model
 
 Set in `[ai]` of the config: `provider` is tried first, `fallback` if it fails.

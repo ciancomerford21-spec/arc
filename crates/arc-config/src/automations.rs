@@ -118,8 +118,8 @@ mod tests {
     fn shipped_example_parses() {
         let f = parse(EXAMPLE).expect("example automations parse");
         assert!(f.automations.len() >= 3);
-        let coding = f.automations.iter().find(|a| a.name == "start coding").unwrap();
-        assert!(coding.phrases().any(|p| p == "coding mode"));
+        let coding = f.automations.iter().find(|a| a.name == "coding mode").unwrap();
+        assert!(coding.phrases().any(|p| p == "start coding"));
         assert!(coding.steps.iter().any(|s| matches!(s, Step::Say { .. })));
         assert!(coding.steps.iter().any(|s| matches!(s, Step::Wait { .. })));
     }

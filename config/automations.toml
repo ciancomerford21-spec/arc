@@ -1,48 +1,61 @@
-# Arc automations — multi-step routines run by a phrase.
+# Arc custom commands ("automations"): say a phrase, Arc runs the steps.
 #
-# Each step is one of:
-#   { tool = "<tool name>", args = { ... } }   run an Arc tool (see `arc tools`)
-#   { wait_ms = 500 }                           pause (max 60000)
-#   { say = "text" }                            say/show something
+# Copy to ~/.config/arc/automations.toml, edit, then `systemctl --user restart arcd`.
+#
+#   name      what you call it; saying the name also runs it
+#   triggers  other phrases that run it. Matching is exact after ignoring
+#             case, punctuation, "please" and a leading "Hey Arc", so
+#             "Hey Arc, gaming mode please." runs "gaming mode" — but
+#             "start gaming mode now" does not (that goes to the AI as usual).
+#   steps     run in order:
+#     { tool = "<tool>", args = { ... } }   an Arc tool — list them with `arc tools`
+#     { wait_ms = 500 }                     pause (max 60000)
+#     { say = "text" }                      what Arc says when it's done
+#   continue_on_error = true                keep going if a step fails (default: stop)
 #
 # Every tool step goes through Arc's permission layer exactly as if you had
-# asked for it directly: dangerous steps still ask for confirmation.
-# Reload with `arc reload` (or restart Arc). Validate with `arc config check`.
+# asked for it directly: a step that needs confirmation pauses the routine.
+#
+# Handy tools and their args:
+#   app_launch      { app = "code", workspace = 2 }     (workspace optional)
+#   open_url        { url = "github.com", workspace = 4 }
+#   workspace_goto  { id = 3 }
+#   window_move     { app = "code", workspace = 3 }
+#   audio_volume_set { level = 30 }   audio_volume_mute {}   media_play {}   media_pause {}
+#   notify_send     { summary = "Break", body = "Stand up" }
+#   shell_exec      { command = "omarchy theme set tokyo-night" }   (may ask first)
+#   lock {}
 
 [[automation]]
-name = "start coding"
-triggers = ["coding mode", "dev mode", "start my development environment"]
-description = "Workspace 2 with the editor, a terminal in ~/Projects and the browser"
+name = "coding mode"
+triggers = ["start coding", "dev mode"]
+description = "VS Code on workspace 2, a terminal, GitHub on workspace 3"
 steps = [
-  { tool = "hyprland.switch_workspace", args = { workspace = 2 } },
-  { tool = "apps.launch", args = { name = "code" } },
+  { tool = "app_launch", args = { app = "code", workspace = 2 } },
   { wait_ms = 700 },
-  { tool = "terminal.open", args = { cwd = "~/Projects" } },
-  { tool = "apps.launch", args = { name = "browser" } },
-  { say = "Development environment is up." },
+  { tool = "app_launch", args = { app = "terminal" } },
+  { tool = "open_url", args = { url = "github.com", workspace = 3 } },
+  { tool = "workspace_goto", args = { id = 2 } },
+  { say = "Coding mode is ready." },
 ]
 
 [[automation]]
-name = "gaming mode"
-triggers = ["game mode", "let's play"]
-description = "Steam on workspace 6, notifications silenced"
+name = "music"
+triggers = ["play some music", "music time"]
 steps = [
-  { tool = "hyprland.switch_workspace", args = { workspace = 6 } },
-  { tool = "notifications.set_dnd", args = { enabled = true } },
-  { tool = "apps.launch", args = { name = "steam" } },
-  { say = "Gaming mode. Notifications are silenced." },
+  { tool = "app_launch", args = { app = "spotify", workspace = 5 } },
+  { wait_ms = 3000 },
+  { tool = "media_play" },
+  { say = "Playing." },
 ]
+continue_on_error = true
 
 [[automation]]
-name = "work mode"
-triggers = ["focus mode"]
-description = "Notes on workspace 3, browser on workspace 4"
+name = "quiet"
+triggers = ["be quiet", "mute everything"]
 steps = [
-  { tool = "notifications.set_dnd", args = { enabled = false } },
-  { tool = "hyprland.switch_workspace", args = { workspace = 3 } },
-  { tool = "apps.launch", args = { name = "obsidian" } },
-  { wait_ms = 500 },
-  { tool = "hyprland.switch_workspace", args = { workspace = 4 } },
-  { tool = "apps.launch", args = { name = "browser" } },
-  { say = "Work mode ready." },
+  { tool = "media_pause" },
+  { tool = "audio_volume_mute" },
+  { say = "Muted." },
 ]
+continue_on_error = true

@@ -26,6 +26,10 @@ default-members = [
     "crates/arc-memory",
     "crates/arc-daemon",
     "crates/arc-cli",
+    # GTK4 layer-shell panel. In the default set so a plain `cargo build`
+    # compiles it: it was excluded while it did not build, which hid 15
+    # errors for a long time.
+    "crates/arc-ui",
 ]
 
 [workspace.package]

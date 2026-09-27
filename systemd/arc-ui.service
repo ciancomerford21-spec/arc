@@ -1,0 +1,16 @@
+[Unit]
+Description=Arc assistant panel
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/arc-ui
+Restart=on-failure
+RestartSec=2
+# The panel is decorative: a failure here must not disturb the daemon or voice.
+Nice=10
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

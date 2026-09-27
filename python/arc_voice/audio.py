@@ -14,6 +14,7 @@ import json
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 
 import numpy as np
@@ -172,48 +173,130 @@ class Microphone:
 
 
 class Player:
-    """Playback via ``pw-cat --playback``. ``play`` blocks until the samples
-    are handed off to PipeWire; use it from the speaker thread only."""
+    """Playback via ``pw-cat --playback``.
+
+    One ``pw-cat`` stream is opened for the lifetime of the player rather than
+    per clip: a fresh stream per sentence overlaps, because the new stream
+    starts before the old one has finished playing. ``play`` then blocks until
+    the audio has actually been consumed, so sentences run one after another
+    instead of on top of each other.
+    """
 
     def __init__(self, device: str | None):
         self.device = device or DEFAULT_OUTPUT
         self.playing = False
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+        self._play_lock = threading.Lock()
+        self._rate = 0
+        self._interrupted = False
 
-    def play(self, samples: np.ndarray, rate: int) -> bool:
-        """Write samples to the speaker; returns True if the user stopped playback."""
-        if not self.device or not samples.size:
-            return False
-        self.playing = True
-        try:
+    def _ensure_stream(self) -> subprocess.Popen:
+        """Open the playback stream if it isn't already running."""
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return self._proc
             exe = shutil.which("pw-cat") or shutil.which("pw-play")
             if not exe:
                 raise AudioError("pw-cat/pw-play not found (install pipewire)")
-            proc = subprocess.Popen(
-                [exe, "--playback", "--raw", "--rate", str(rate), "--channels", "1", "--format", "f32",
+            self._proc = subprocess.Popen(
+                [exe, "--playback", "--raw", "--rate", str(self._rate), "--channels", "1", "--format", "f32",
                  *_target_args(self.device), "-"],
-                stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+                stdin=subprocess.PIPE, bufsize=0,
             )
+            return self._proc
+
+    def play(self, samples: np.ndarray, rate: int) -> bool:
+        """Write samples to the speaker and block until they finish playing.
+
+        Returns True if the user stopped playback. Serialised against other
+        callers (the listening chime runs on its own thread), so two sounds
+        never talk over each other.
+        """
+        if not self.device or not samples.size:
+            return False
+        with self._play_lock:
+            return self._play_locked(samples, rate)
+
+    def _play_locked(self, samples: np.ndarray, rate: int) -> bool:
+        self.playing = True
+        try:
+            if rate != self._rate or self._proc is None or self._proc.poll() is not None:
+                # A new sample rate needs a new stream; drop the old one first
+                # so two streams are never live at once.
+                self._close_stream()
+                self._rate = rate
+            proc = self._ensure_stream()
             if proc.stdin is None:
                 raise AudioError("pw-cat stdin vanished")
-            bytes_written = proc.stdin.write((samples.astype(np.float32).tobytes()))
-            proc.stdin.close()
-            # Brief wait: if the user hit the stop key, the process may already be gone.
-            try:
-                proc.wait(timeout=0.2)
-            except subprocess.TimeoutExpired:
-                pass
-        except OSError as e:
+            # Write in chunks so a long sentence stays interruptible: a single
+            # large write() blocks until pw-cat drains it, which would delay
+            # stop() by the whole clip.
+            payload = memoryview(samples.astype(np.float32).tobytes())
+            chunk_bytes = SAMPLE_RATE * 4  # ~1 s of float32 mono
+            for off in range(0, len(payload), chunk_bytes):
+                if self._interrupted:
+                    self._close_stream()
+                    return True
+                try:
+                    proc.stdin.write(payload[off : off + chunk_bytes])
+                    proc.stdin.flush()
+                except (ValueError, OSError) as e:
+                    # stop() closed the stream underneath us — that's a normal
+                    # interruption, not a playback failure.
+                    if self._interrupted:
+                        return True
+                    raise AudioError(f"pw-cat stdin failed: {e}") from e
+            # pw-cat exits once it has played everything written to stdin, so
+            # the exit is the accurate "finished" signal. Wait for the
+            # duration (plus slack) so sentences don't overlap.
+            wait = samples.size / float(rate) + 0.35
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                if self._interrupted:
+                    self._close_stream()
+                    return True
+                time.sleep(0.02)
+            return self._interrupted
+        except (OSError, BrokenPipeError) as e:
             raise AudioError(f"pw-cat failed: {e}") from e
         finally:
             self.playing = False
-        return False
+
+    def _close_stream(self) -> None:
+        with self._lock:
+            proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except (OSError, BrokenPipeError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
 
     def stop(self) -> None:
-        try:
-            subprocess.run(["pw-cli", "destroy", f"device:{self.device}"], capture_output=True, timeout=2)
-        except Exception:
-            pass
+        """Cut playback off now: kill the stream, not the device.
+
+        The old implementation ran `pw-cli destroy device:<name>`, which takes
+        the whole output device offline and can silence other players.
+        """
+        self._interrupted = True
+        self._close_stream()
         self.playing = False
+
+    def close(self) -> None:
+        self._interrupted = False
+        self._close_stream()
 
 
 def chime(rising: bool) -> np.ndarray:

@@ -1,0 +1,20 @@
+[Unit]
+Description=Arc voice assistant daemon
+Documentation=file://%h/.local/share/arc/README.md
+# The local model is the fallback provider; start it alongside, but Arc works without it.
+Wants=arc-llm.service
+After=arc-llm.service pipewire.service wireplumber.service
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/arcd
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+# arcd needs the Wayland/Hyprland session environment (imported by Hyprland
+# via dbus-update-activation-environment / uwsm) to talk to hyprctl.
+
+[Install]
+WantedBy=graphical-session.target

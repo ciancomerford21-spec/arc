@@ -4,7 +4,7 @@
   "name": "Arc",
   "version": "0.1.0",
   "author": "Arc",
-  "description": "Arc voice assistant status. Click: talk. Right-click: open the Arc panel. Middle-click: stop speaking.",
+  "description": "Arc voice assistant status. Click: talk. Right-click: activity log. Middle-click: stop speaking.",
   "kinds": [
     "bar-widget"
   ],

@@ -5,7 +5,7 @@
 // down, reconnecting by itself). The process is restarted if it ever exits.
 //
 //   left click   toggle listening (push-to-talk)
-//   right click  open / close the Arc panel
+//   right click  open (or focus) a live Arc activity log in a terminal
 //   middle click stop speaking
 //
 // Settings (in shell.json, on the widget entry):
@@ -35,7 +35,7 @@ BarWidget {
   implicitHeight: button.implicitHeight
 
   function arc(args) {
-    if (root.bar) root.bar.run(root.bar.shellQuote(root.arcCommand) + " " + args)
+    Util.execArgv([root.arcCommand].concat(args))
   }
 
   function apply(line) {
@@ -78,11 +78,11 @@ BarWidget {
     fontSize: Style.font.caption
     active: root.busy
     dimmed: root.state === "offline"
-    tooltipText: root.tooltip + "\nClick: talk · Right-click: panel · Middle: stop speaking"
+    tooltipText: root.tooltip + "\nClick: talk · Right-click: activity · Middle: stop speaking"
     onPressed: function(b) {
-      if (b === Qt.RightButton) root.arc("panel --toggle")
-      else if (b === Qt.MiddleButton) root.arc("voice stop-speaking")
-      else root.arc("voice toggle")
+      if (b === Qt.RightButton) Util.execArgv(["omarchy-launch-or-focus-tui", "--app-id=org.omarchy.arc", root.arcCommand, "watch"])
+      else if (b === Qt.MiddleButton) root.arc(["voice", "stop-speaking"])
+      else root.arc(["voice", "toggle"])
     }
   }
 }

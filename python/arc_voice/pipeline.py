@@ -18,6 +18,7 @@ command directly, without a second capture.
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ from .engines import FRAME, SAMPLE_RATE, Transcript
 from .wake import WakeMatcher
 
 FRAME_MS = FRAME * 1000 // SAMPLE_RATE  # 32
+
+log = logging.getLogger("arc_voice.pipeline")
 
 
 class VadLike(Protocol):
@@ -176,6 +179,8 @@ class Pipeline:
         if voiced * FRAME_MS < self.t.min_segment_ms:
             return
         tr = self.stt.transcribe(np.concatenate(seg))
+        # Debug only: idle speech is often other people's conversation.
+        log.debug("heard (idle, %d ms): %r", len(seg) * FRAME_MS, tr.text)
         if not tr.text:
             return
         m = self.wake.match(tr.text)

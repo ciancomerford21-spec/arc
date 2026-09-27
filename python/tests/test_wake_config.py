@@ -19,6 +19,9 @@ M = WakeMatcher(["hey arc", "okay arc", "ok arc"], ["arc", "ark"])
         ("Arc, mute", "arc", "mute"),
         ("Um, hey Arc open firefox", "hey arc", "open firefox"),
         ("Hey Arc", "hey arc", ""),
+        # Real Moonshine output for "Hey Arc, what time is it?": name run into the next word.
+        ("Hey, article time, is it?", "hey article", "time, is it?"),
+        ("Okay, archer volume up", "ok archer", "volume up"),
     ],
 )
 def test_matches(text, phrase, command):
@@ -30,7 +33,10 @@ def test_matches(text, phrase, command):
 
 @pytest.mark.parametrize(
     "text",
-    ["", "lock the screen", "the arc of history", "hey there", "archive this", "search for arc welding"],
+    ["", "lock the screen", "the arc of history", "hey there", "archive this", "search for arc welding",
+     # Overheard conversation from a live session: must not wake.
+     "Take the light out", "I think I will now lecture them in.", "hey what time is it", "arctic weather is mad",
+     "ok are we going", "hey around five we leave", "okay artist mode"],
 )
 def test_no_match(text):
     assert M.match(text) is None

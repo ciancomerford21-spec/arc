@@ -49,6 +49,12 @@ class WakeMatcher:
             phrases.add((n,))
         # Longest first so "hey arc" wins over "arc".
         self.phrases = sorted(phrases, key=len, reverse=True)
+        self.names = name_set
+        # Greetings that start a wake phrase ("hey", "ok"): after one of these,
+        # a word that merely *starts* with the name also counts, because the
+        # recogniser often runs the name into the next word
+        # ("Hey Arc, what time..." -> "Hey, article time...").
+        self.greetings = {p[0] for p in phrases if len(p) == 2 and p[1] in name_set}
 
     def match(self, transcript: str) -> WakeMatch | None:
         """Return the match if ``transcript`` starts with a wake phrase."""
@@ -74,4 +80,26 @@ class WakeMatcher:
                     rest = ""
                 rest = rest.strip().lstrip(",.;:!?-– ").strip()
                 return WakeMatch(" ".join(p), rest)
+        # Greeting + a word run together with the name ("hey article ...").
+        if len(toks) >= 2 and toks[0] in self.greetings and self._merged_name(toks[1]):
+            merged = toks[1]
+            word_idx = flat[start + 1][0] + 1
+            rest = " ".join(words[word_idx:]).strip().lstrip(",.;:!?-– ").strip()
+            return WakeMatch(f"{toks[0]} {merged}", rest)
         return None
+
+    #: Everyday words that start like the name; never treated as "hey <name>…".
+    _NOT_NAME = {"are", "art", "arm", "arms", "area", "areas", "around", "arrive", "arrived", "arrange",
+                 "argue", "army", "arts", "artist", "ark"}
+
+    def _merged_name(self, word: str) -> bool:
+        """True if ``word`` looks like the name run into the next word.
+
+        Recognisers hear "Arc, what..." as "article", "archer", "arcwhat"...
+        Only called right after a greeting, so false wakes need
+        "hey"/"ok" followed by an uncommon ar- word.
+        """
+        if word in self._NOT_NAME or word in self.names:
+            return False
+        stems = {n[:2] for n in self.names if len(n) >= 3}
+        return len(word) >= 5 and any(word.startswith(s) for s in stems)

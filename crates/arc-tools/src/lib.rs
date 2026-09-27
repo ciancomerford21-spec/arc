@@ -185,6 +185,7 @@ impl Tools {
         self.register(Arc::new(Reboot));
         self.register(Arc::new(Shutdown));
         self.register(Arc::new(AppLaunch));
+        self.register(Arc::new(OpenUrl));
         self.register(Arc::new(NetworkStatus));
         self.register(Arc::new(PowerInfo));
         self.register(Arc::new(MonitorOverview));
@@ -743,6 +744,43 @@ impl Tool for AppLaunch {
     }
 }
 
+struct OpenUrl;
+#[async_trait]
+impl Tool for OpenUrl {
+    fn name(&self) -> &str {
+        "open_url"
+    }
+    fn description(&self) -> &str {
+        "Open a website in the user's default browser, e.g. \"github.com\" or \"https://www.google.com/search?q=...\". \
+         Use this for any request to open, visit or search a site (\"open GitHub\", \"google the weather\"). \
+         Optionally switch to a workspace first."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({"type": "object", "properties": {
+            "url": {"type": "string", "description": "Web address; https:// is added if missing"},
+            "workspace": {"type": "integer", "description": "Optional workspace number to switch to first"}
+        }, "required": ["url"]})
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        let url = s(v, "opened")?;
+        let host = url.split("://").nth(1).unwrap_or(&url).split('/').next().unwrap_or(&url).trim_start_matches("www.");
+        Some(format!("Opening {host}."))
+    }
+    async fn execute(&self, args: &JsonMap) -> ToolResult {
+        let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(ws) = args.get("workspace").and_then(|v| v.as_i64()) {
+            let Some(h) = try_hyprland() else { return ToolResult::Error("Hyprland not available".into()) };
+            if let Err(e) = h.dispatch(&Dispatch::FocusWorkspace(ws.to_string())).await {
+                return ToolResult::Error(format!("failed to switch to workspace {ws}: {e}"));
+            }
+        }
+        match arc_system::apps::open_url(url) {
+            Ok(u) => ToolResult::Ok(serde_json::json!({"opened": u})),
+            Err(e) => ToolResult::Error(e.to_string()),
+        }
+    }
+}
+
 struct WindowMove;
 #[async_trait]
 impl Tool for WindowMove {
@@ -1043,6 +1081,7 @@ mod tests {
             "reboot",
             "shutdown",
             "app_launch",
+            "open_url",
             "network_status",
             "power_info",
             "monitor_overview",
@@ -1101,7 +1140,7 @@ mod tests {
     #[test]
     fn specs_have_object_schemas() {
         let specs = Tools::new().specs();
-        assert_eq!(specs.len(), 24);
+        assert_eq!(specs.len(), 25);
         assert!(specs.iter().all(|s| s.parameters["type"] == "object"));
     }
 

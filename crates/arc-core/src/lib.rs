@@ -61,6 +61,7 @@ pub enum Route {
 }
 
 type Extract = Box<dyn Fn(&regex::Captures) -> JsonMap + Send + Sync>;
+type Guard = Box<dyn Fn(&regex::Captures) -> bool + Send + Sync>;
 
 /// A fixed-command grammar rule: regex → tool + optional param extraction.
 struct FixedRule {
@@ -68,12 +69,32 @@ struct FixedRule {
     tool: String,
     confidence: f32,
     extract: Option<Extract>,
+    /// Extra check after the regex matches; the rule is skipped when false.
+    guard: Option<Guard>,
 }
 
 impl FixedRule {
     fn new(pattern: &str, tool: &str, confidence: f32, extract: Option<Extract>) -> Result<Self, regex::Error> {
-        Ok(FixedRule { pattern: Regex::new(pattern)?, tool: tool.to_string(), confidence, extract })
+        Ok(FixedRule { pattern: Regex::new(pattern)?, tool: tool.to_string(), confidence, extract, guard: None })
     }
+
+    fn when(mut self, g: impl Fn(&regex::Captures) -> bool + Send + Sync + 'static) -> Self {
+        self.guard = Some(Box::new(g));
+        self
+    }
+}
+
+/// True if `prog` is an executable on PATH.
+fn on_path(prog: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if prog.is_empty() || prog.contains('/') {
+        return false;
+    }
+    std::env::var_os("PATH").is_some_and(|p| {
+        std::env::split_paths(&p).any(|d| {
+            std::fs::metadata(d.join(prog)).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+        })
+    })
 }
 
 /// Fixed-command router. Knows nothing about execution.
@@ -191,9 +212,11 @@ impl Router {
                 None,
             )?,
 
-            // Shell (lower confidence — needs security check)
+            // Shell: only when the first word is a real program ("run ls -la",
+            // "run htop"). "Run a speed test" / "run the shell command: …" is
+            // natural language and goes to the model instead.
             FixedRule::new(
-                r"(?i)^run\s+(.+)",
+                r"(?i)^(?:run|execute)\s+([a-z0-9_./-]+(?:\s.*)?)$",
                 "shell_exec",
                 0.8,
                 Some(Box::new(|caps| {
@@ -201,17 +224,12 @@ impl Router {
                     m.insert("command".into(), serde_json::json!(caps[1].trim()));
                     m
                 })),
-            )?,
-            FixedRule::new(
-                r"(?i)^execute\s+(.+)",
-                "shell_exec",
-                0.8,
-                Some(Box::new(|caps| {
-                    let mut m = HashMap::new();
-                    m.insert("command".into(), serde_json::json!(caps[1].trim()));
-                    m
-                })),
-            )?,
+            )?
+            .when(|caps| {
+                let first = caps[1].split_whitespace().next().unwrap_or("");
+                !["a", "an", "the", "my", "this", "that", "some", "command", "shell"].contains(&first.to_lowercase().as_str())
+                    && on_path(first)
+            }),
         ])
     }
 
@@ -230,6 +248,9 @@ impl Router {
         let text = Self::normalise(&input.text);
         for rule in &self.fixed_rules {
             if let Some(caps) = rule.pattern.captures(&text) {
+                if rule.guard.as_ref().is_some_and(|g| !g(&caps)) {
+                    continue;
+                }
                 let args = rule.extract.as_ref().map(|e| e(&caps)).unwrap_or_default();
                 return NluOutput {
                     tool_name: Some(rule.tool.clone()),
@@ -270,11 +291,17 @@ impl Reply {
 }
 
 /// Short spoken confirmations/refusals for the latest pending action.
+/// Only consulted while a confirmation is pending, so short words like "ok" are safe here.
 fn yes_no(text: &str) -> Option<bool> {
     let t = Router::normalise(text).to_lowercase();
-    match t.as_str() {
-        "yes" | "yeah" | "yep" | "confirm" | "do it" | "go ahead" | "yes do it" | "ok do it" => Some(true),
-        "no" | "nope" | "cancel" | "don't" | "do not" | "stop" | "never mind" | "nevermind" => Some(false),
+    let t = t.trim_end_matches(" please").trim_start_matches("yes ").trim();
+    match t {
+        "yes" | "yeah" | "yep" | "yup" | "sure" | "ok" | "okay" | "confirm" | "confirmed" | "do it" | "go ahead"
+        | "yes do it" | "ok do it" | "okay do it" | "approve" | "approved" | "allow" | "allow it" | "allowed"
+        | "you have my permission" | "you have permission" | "i give you permission" | "permission granted"
+        | "granted" | "that's fine" | "thats fine" | "go for it" => Some(true),
+        "no" | "nope" | "cancel" | "don't" | "dont" | "do not" | "stop" | "never mind" | "nevermind" | "deny"
+        | "denied" | "reject" | "no thanks" | "don't do it" => Some(false),
         _ => None,
     }
 }
@@ -450,7 +477,8 @@ fn system_prompt(cfg: &Config) -> String {
          Use the provided tools to act on the desktop; never claim you did something unless a tool \
          result confirms it. Some actions need the user's confirmation; when a tool result says so, \
          tell the user what you are waiting for. \
-         Prefer the dedicated tools (app_launch, window_move, workspace_goto, window_focus) over shell_exec. \
+         Prefer the dedicated tools (app_launch, open_url, window_move, workspace_goto, window_focus) over shell_exec; \
+         use open_url for websites and web searches. \
          If a tool fails, do not keep retrying variations or guessing other apps or commands: \
          at most one corrected retry, then briefly tell the user what went wrong. \
          Speech-to-text mishears words; if a request doesn't make sense, ask a short clarifying question \
@@ -611,6 +639,31 @@ mod tests {
         assert!(r.succeeded().is_empty());
         assert_eq!(r.actions[0].outcome, ActionOutcome::Denied);
         assert!(r.text.contains("won't run"));
+    }
+
+    #[test]
+    fn run_only_routes_real_programs_to_the_shell() {
+        let r = router();
+        let route = |t: &str| r.route(&NluInput { text: t.into(), source: InputSource::Voice, context: HashMap::new() });
+        let out = route("run ls -la");
+        assert_eq!(out.tool_name.as_deref(), Some("shell_exec"));
+        assert_eq!(out.args.get("command").and_then(|v| v.as_str()), Some("ls -la"));
+        for natural in ["run the shell command: echo hi", "run a speed test", "run notarealprogram123 now", "execute my plan"] {
+            assert_eq!(route(natural).route, Route::Ai, "{natural}");
+        }
+    }
+
+    #[test]
+    fn spoken_permission_phrases_are_understood() {
+        for y in ["yes", "Yes, please.", "You have my permission.", "ok", "Go ahead", "allow it", "permission granted", "yes do it"] {
+            assert_eq!(yes_no(y), Some(true), "{y}");
+        }
+        for n in ["no", "No thanks.", "cancel", "deny", "never mind"] {
+            assert_eq!(yes_no(n), Some(false), "{n}");
+        }
+        for other in ["open firefox", "how can I give you permission", "okay arc open files"] {
+            assert_eq!(yes_no(other), None, "{other}");
+        }
     }
 
     #[tokio::test]

@@ -362,6 +362,43 @@ pub async fn launch(query: &str) -> Result<Launched> {
     }
 }
 
+/// Normalise what the model passes ("github.com", "https://x.org/a") into an
+/// http(s) URL. Anything else (file:, javascript:, shell text) is refused.
+pub fn normalise_url(input: &str) -> Option<String> {
+    let s = input.trim();
+    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let lower = s.to_lowercase();
+    let url = if lower.starts_with("https://") || lower.starts_with("http://") {
+        s.to_string()
+    } else if lower.contains("://") || lower.starts_with("javascript:") || lower.starts_with("file:") || lower.starts_with("data:") {
+        return None;
+    } else {
+        format!("https://{s}")
+    };
+    // Host must look like a domain (or localhost).
+    let host = url.split("://").nth(1)?.split(['/', '?', '#']).next()?.split('@').last()?;
+    let host = host.split(':').next()?;
+    let ok = host == "localhost" || (host.contains('.') && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'));
+    ok.then_some(url)
+}
+
+/// Open a web page in the default browser (via Omarchy's launcher when present).
+pub fn open_url(input: &str) -> Result<String> {
+    let url = normalise_url(input).ok_or_else(|| SysError::Command {
+        what: "open_url".into(),
+        detail: format!("\"{input}\" is not a web address; pass something like github.com or https://…"),
+    })?;
+    let argv: Vec<String> = if which("omarchy-launch-browser").is_some() {
+        vec!["omarchy-launch-browser".into(), url.clone()]
+    } else {
+        vec!["xdg-open".into(), url.clone()]
+    };
+    spawn_detached(&argv)?;
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +472,16 @@ mod tests {
         let all = desktop_apps();
         if all.iter().any(|a| a.id == "code") {
             assert!(matches!(resolve("visual studio code"), Some(Resolved::Desktop(d)) if d.id == "code"));
+        }
+    }
+
+    #[test]
+    fn urls_are_normalised_and_unsafe_ones_refused() {
+        assert_eq!(normalise_url("github.com").as_deref(), Some("https://github.com"));
+        assert_eq!(normalise_url("https://www.google.com/search?q=arc").as_deref(), Some("https://www.google.com/search?q=arc"));
+        assert_eq!(normalise_url("http://localhost:8080/x").as_deref(), Some("http://localhost:8080/x"));
+        for bad in ["file:///etc/passwd", "javascript:alert(1)", "rm -rf ~", "", "github", "ftp://x.org", "a.com; ls"] {
+            assert_eq!(normalise_url(bad), None, "{bad}");
         }
     }
 }

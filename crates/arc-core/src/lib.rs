@@ -653,7 +653,7 @@ impl Assistant {
 }
 
 fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
-    // Kept deliberately short. With 30 tool schemas already in the prompt, a
+    // Kept deliberately short. With ~26 tool schemas already in the prompt, a
     // long ruleset makes the 2B start copying instructions back instead of
     // answering: asked "hello" it replied with the words of the prompt. The
     // measurements are in the commit message for this function.
@@ -666,7 +666,9 @@ fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
          when you *can* answer, and always use a tool or a fact you were given. Use the provided tools to act, and never claim an \
          action happened unless a tool result confirms it. If a tool needs \
          confirmation, say what you are waiting for. If a tool fails, say so once \
-         rather than retrying variations. 'Desktop' means workspace.",
+         rather than retrying variations. 'Desktop' means workspace. \
+         You cannot save facts yourself; if asked, say to run \
+         'arc memory remember <key> = <value>' in a terminal.",
         name = cfg.general.name
     );
     let title = cfg.personality.user_title.trim();
@@ -908,7 +910,7 @@ mod tests {
     #[test]
     fn prompt_stays_short() {
         // The whole reason this prompt is terse: a long one crowds out the
-        // 2B's attention when 30 tool schemas are also present.
+        // 2B's attention when ~26 tool schemas are also present.
         let words = system_prompt(&Config::default(), None).split_whitespace().count();
         assert!(words < 150, "system prompt is {words} words; keep it under 150");
     }

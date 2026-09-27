@@ -189,10 +189,13 @@ impl Tools {
     fn register_builtins(&mut self, shell: ShellExec, store: Store, search_url: String) {
         self.register(Arc::new(shell));
         self.register(Arc::new(WebSearch { template: search_url }));
-        self.register(Arc::new(MemoryRemember(store.clone())));
-        self.register(Arc::new(MemoryForget(store.clone())));
-        self.register(Arc::new(MemoryList(store.clone())));
-        self.register(Arc::new(MemorySearch(store)));
+        // NOTE: the four memory_* tools are deliberately NOT registered. Reading
+        // memory is unaffected: build_system_prompt injects facts and recent
+        // conversation on every request, independently of the tool list. What
+        // is lost is the model *writing* memory by voice, which `arc memory
+        // remember` does better anyway. The four schemas cost 23% of the tool
+        // prompt (~145 tokens) to teach a 2B a judgement it makes badly, and
+        // facts.json was still empty after all our testing.
         self.register(Arc::new(WorkspaceList));
         self.register(Arc::new(WorkspaceGoto));
         self.register(Arc::new(WindowList));
@@ -1411,81 +1414,45 @@ mod tests {
     #[test]
     fn specs_have_object_schemas() {
         let specs = Tools::new().specs();
-        // 25 built-in tools + 4 memory tools + web_search.
-        assert_eq!(specs.len(), 30);
+        // Asserted as a relationship, not a literal: the count moves whenever a
+        // tool is added or dropped, and a hardcoded number goes stale silently.
+        let names = Tools::new().all_names();
+        assert_eq!(specs.len(), names.len());
         assert!(specs.iter().all(|s| s.parameters["type"] == "object"));
+        // Guard the trim that motivated this: the model is a 2B, and prompt
+        // length is what breaks its tool selection. 26 built-ins, no memory
+        // tools. Raise this only with a measurement.
+        assert!(
+            specs.len() <= 26,
+            "tool list grew to {}; the 2B mis-selects under a long list",
+            specs.len()
+        );
     }
 
     #[test]
-    fn registry_has_the_four_memory_tools() {
+    fn memory_tools_are_not_offered_to_the_model() {
+        // Deliberate. The four memory_* schemas were 23% of the tool prompt
+        // (~145 tokens) spent teaching a 2B when to save a fact, and
+        // facts.json was still empty after all our testing. Reading memory is
+        // unaffected: build_system_prompt injects facts and recent
+        // conversation on every request, independently of this list.
+        // Writing memory is `arc memory remember` on the CLI.
         let names = Tools::new().all_names();
         for t in ["memory_remember", "memory_forget", "memory_list", "memory_search"] {
-            assert!(names.contains(&t.to_string()), "missing tool: {t}");
+            assert!(!names.contains(&t.to_string()), "{t} is back in the tool list");
         }
     }
 
-    #[tokio::test]
-    async fn memory_tools_report_when_disabled() {
-        // `Tools::new()` passes no store, so every memory tool must say so
-        // rather than pretending to work or panicking.
-        let t = Tools::new();
-        for (name, a) in [
-            ("memory_remember", args(&[("fact", "x")])),
-            ("memory_forget", args(&[("id", "x")])),
-            ("memory_list", JsonMap::new()),
-            ("memory_search", args(&[("query", "x")])),
-        ] {
-            let r = t.by_name(name).unwrap().execute(&a).await;
-            assert!(matches!(&r, ToolResult::Error(e) if e.contains("disabled")), "{name}: {r:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn memory_tools_work_against_a_real_store() {
-        let dir = std::env::temp_dir().join("arc_memory_tool_test");
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn memory_is_still_reachable_from_the_cli_path() {
+        // The cut removes the model's handle on memory, not memory itself: the
+        // store still loads, so prompt injection keeps working.
+        let dir = std::env::temp_dir().join("arc_memory_still_reads");
+        let _ = std::fs::remove_file(dir.join("facts.json"));
         let store = Arc::new(arc_memory::MemoryStore::new_in_dir(&dir));
-        let t = Tools::from_config_with_memory(&Config::default(), Some(store.clone())).unwrap();
-
-        let ToolResult::Ok(saved) = t
-            .by_name("memory_remember")
-            .unwrap()
-            .execute(&args(&[("fact", "The user drinks tea, not coffee")]))
-            .await
-        else { panic!("remember failed") };
-        let id = saved["id"].as_str().expect("id").to_string();
-        assert!(!id.is_empty());
-
-        let ToolResult::Ok(list) = t.by_name("memory_list").unwrap().execute(&JsonMap::new()).await else { panic!() };
-        assert_eq!(list["count"], 1);
-        assert!(list["facts"][0]["fact"].as_str().unwrap().contains("tea"));
-
-        let ToolResult::Ok(found) = t
-            .by_name("memory_search")
-            .unwrap()
-            .execute(&args(&[("query", "tea")]))
-            .await
-        else { panic!() };
-        assert_eq!(found["count"], 1);
-
-        let ToolResult::Ok(_) = t
-            .by_name("memory_forget")
-            .unwrap()
-            .execute(&args(&[("id", id.as_str())]))
-            .await
-        else { panic!("forget failed") };
-        let ToolResult::Ok(list) = t.by_name("memory_list").unwrap().execute(&JsonMap::new()).await else { panic!() };
-        assert_eq!(list["count"], 0);
-    }
-
-    #[tokio::test]
-    async fn memory_remember_rejects_a_blank_fact() {
-        let dir = std::env::temp_dir().join("arc_memory_tool_blank");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(arc_memory::MemoryStore::new_in_dir(&dir));
-        let t = Tools::from_config_with_memory(&Config::default(), Some(store)).unwrap();
-        let r = t.by_name("memory_remember").unwrap().execute(&args(&[("fact", "   ")])).await;
-        assert!(matches!(&r, ToolResult::Error(e) if e.contains("non-empty")));
+        store.remember("The user drinks tea".to_string(), vec![]);
+        let block = store.prompt_block(8, None);
+        assert!(block.contains("tea"), "facts no longer reach the prompt: {block}");
     }
 
     #[test]

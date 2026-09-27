@@ -224,6 +224,35 @@ fn try_hyprland() -> Option<Hyprland> {
     Hyprland::connect().ok()
 }
 
+/// Move the browser window to `ws` after opening a URL there.
+///
+/// `omarchy-launch-browser` hands the URL to the *running* browser, which
+/// opens a tab in whichever window already exists. That window stays on
+/// whatever workspace it was on, so "open youtube.com on workspace 4" would
+/// switch to 4, put YouTube in a tab on 3, and leave the user staring at an
+/// empty workspace with Arc claiming it worked.
+async fn follow_browser_to(ws: i64) -> Result<(), String> {
+    /// Chromium names a window per profile, e.g. "chrome-youtube.com__-Default",
+    /// so match on the browser, not the whole class.
+    const BROWSERS: [&str; 6] = ["chrom", "firefox", "brave", "zen", "librewolf", "vivaldi"];
+
+    let Some(h) = try_hyprland() else { return Err("Hyprland not available".into()) };
+    let clients = h.clients().await.map_err(|e| e.to_string())?;
+    let hit = clients
+        .iter()
+        .find(|c| BROWSERS.iter().any(|b| c.class.to_lowercase().contains(b)))
+        .ok_or("no browser window open yet")?;
+    let target = ws.to_string();
+    h.dispatch(&Dispatch::MoveToWorkspace {
+        window: WindowSel::Address(hit.address.clone()),
+        workspace: target,
+        // Already focused, so following costs nothing and keeps us on 4.
+        follow: true,
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Hyprland tools
 // ---------------------------------------------------------------------------
@@ -815,6 +844,13 @@ impl Tool for OpenUrl {
                 let mut out = serde_json::json!({"opened": u});
                 if let Some(ws) = workspace {
                     out["workspace"] = serde_json::json!(ws);
+                    // A running browser reuses its existing window, so the URL
+                    // became a tab on whatever workspace that window was already
+                    // on. Move it, or "open X on workspace 4" silently leaves the
+                    // page on 3.
+                    if let Err(e) = follow_browser_to(ws).await {
+                        tracing::debug!("open_url: could not move the browser: {e}");
+                    }
                 }
                 ToolResult::Ok(out)
             }

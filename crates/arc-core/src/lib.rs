@@ -314,9 +314,45 @@ impl Router {
         t.trim().to_string()
     }
 
+    /// Speech-to-text often runs the verb into the next word: "OpenYouTube.com
+    /// on Workspace 4", not "open youtube.com ...". Every fixed rule requires
+    /// whitespace after its verb, so a fused phrase missed the deterministic
+    /// path and went to the model, which would then claim it had opened the
+    /// site without calling any tool.
+    ///
+    /// Only a known verb followed immediately by a domain is split, and the
+    /// domain's first label is lowercased so "YouTube.com" becomes
+    /// "youtube.com". Nothing else is touched: "github.com" is already fine,
+    /// and app names like "openscad" are not in the verb list.
+    fn split_fused_verb(t: &str) -> String {
+        const VERBS: [&str; 7] = ["open", "visit", "browse", "goto", "load", "search", "google"];
+        let bytes = t.as_bytes();
+        for verb in VERBS {
+            if bytes.len() <= verb.len() || !t[..verb.len()].eq_ignore_ascii_case(verb) {
+                continue;
+            }
+            let rest = &t[verb.len()..];
+            // A dot is what separates a domain from an app name, so only split
+            // when the next character begins something that looks like a host.
+            if !rest.starts_with(|c: char| c.is_ascii_alphabetic()) || !rest.contains('.') {
+                continue;
+            }
+            let (label, tail) = match rest.split_once('.') {
+                Some(parts) => parts,
+                None => continue,
+            };
+            if label.is_empty() || !label.chars().all(|c| c.is_ascii_alphanumeric()) {
+                continue;
+            }
+            return format!("{verb} {}.{}", label.to_lowercase(), tail);
+        }
+        t.to_string()
+    }
+
     /// Match against the fixed grammar; `Route::Ai` when nothing matches.
     pub fn route(&self, input: &NluInput) -> NluOutput {
         let text = Self::normalise(&input.text);
+        let text = Self::split_fused_verb(&text);
         for rule in &self.fixed_rules {
             if let Some(caps) = rule.pattern.captures(&text) {
                 if rule.guard.as_ref().is_some_and(|g| !g(&caps)) {
@@ -699,6 +735,41 @@ mod tests {
             assert_eq!(out.tool_name.as_deref(), Some("open_url"), "{text}");
             assert_eq!(out.args.get("url").and_then(|v| v.as_str()), Some(want), "{text}");
         }
+    }
+
+    #[test]
+    fn fused_verb_from_speech_recognition_still_routes() {
+        // The regression, from the journal verbatim: the recogniser returned
+        // "OpenYouTube.com on Workspace 4" with no space after the verb. Every
+        // rule needs whitespace there, so this went to the model, which
+        // answered as though it had opened the site and called no tool at all.
+        let r = router();
+        let cases: [(&str, &str, Option<i64>); 3] = [
+            ("OpenYouTube.com on Workspace 4", "youtube.com", Some(4)),
+            ("OpenGithub.com on Workspace 3", "github.com", Some(3)),
+            ("OpenWikipedia.org", "wikipedia.org", None),
+        ];
+        for (text, host, ws) in cases {
+            let out = r.route(&NluInput::text(text, InputSource::Voice));
+            assert_eq!(out.route, Route::FixedCommand, "{text} must not reach the model");
+            assert_eq!(out.tool_name.as_deref(), Some("open_url"), "{text}");
+            assert_eq!(out.args.get("url").and_then(|v| v.as_str()), Some(host), "{text}");
+            assert_eq!(out.args.get("workspace").and_then(|v| v.as_i64()), ws, "{text}");
+        }
+    }
+
+    #[test]
+    fn fused_verb_split_does_not_eat_app_names() {
+        // "openscad" starts with a verb but is an app, and a split there would
+        // turn it into "open scad". Only a dot makes it a host.
+        for text in ["openscad", "loadedsheets", "openoffice", "browser"] {
+            assert_eq!(Router::split_fused_verb(text), text, "{text} was mangled");
+        }
+        // Already-spaced text is untouched.
+        assert_eq!(Router::split_fused_verb("open github.com"), "open github.com");
+        assert_eq!(Router::split_fused_verb("github.com"), "github.com");
+        // A domain with no verb is not split either.
+        assert_eq!(Router::split_fused_verb("YouTube.com"), "YouTube.com");
     }
 
     #[test]

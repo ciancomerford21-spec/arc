@@ -38,11 +38,11 @@ class Microphone:
         self._stopping = False
 
     def start(self) -> None:
-        exe = shutil.which("pw-record")
+        exe = shutil.which("pw-cat")
         if not exe:
-            raise AudioError("pw-record not found (install pipewire)")
+            raise AudioError("pw-cat not found (install pipewire)")
         cmd = [
-            exe, "--rate", str(SAMPLE_RATE), "--channels", "1", "--format", "f32",
+            exe, "--record", "--raw", "--rate", str(SAMPLE_RATE), "--channels", "1", "--format", "f32",
             "--latency", "32ms", "--media-role", "Communication",
             "-P", '{ media.name = "Arc voice" }', *_target_args(self.device), "-",
         ]
@@ -91,16 +91,18 @@ class Player:
 
     def play(self, samples: np.ndarray, sample_rate: int) -> bool:
         """Blocking. Returns True if playback was interrupted."""
-        exe = shutil.which("pw-play")
+        exe = shutil.which("pw-cat")
         if not exe:
-            raise AudioError("pw-play not found (install pipewire)")
+            raise AudioError("pw-cat not found (install pipewire)")
+        # --raw is required: without it PipeWire >= 1.4 treats "-" as a sound
+        # file (libsndfile), rejects headerless PCM and exits immediately.
         cmd = [
-            exe, "--rate", str(sample_rate), "--channels", "1", "--format", "f32",
+            exe, "--playback", "--raw", "--rate", str(sample_rate), "--channels", "1", "--format", "f32",
             "--media-role", "Assistant", "-P", '{ media.name = "Arc" }', *_target_args(self.device), "-",
         ]
         with self._lock:
             self._interrupted = False
-            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
             proc = self._proc
         try:
             assert proc.stdin
@@ -108,10 +110,13 @@ class Player:
             proc.stdin.close()
         except (BrokenPipeError, ValueError):
             pass
-        proc.wait()
+        _, err = proc.communicate()
         with self._lock:
             self._proc = None
-            return self._interrupted
+            interrupted = self._interrupted
+        if proc.returncode != 0 and not interrupted:
+            raise AudioError(f"playback failed ({proc.returncode}): {err.decode(errors='replace').strip()[:200]}")
+        return interrupted
 
     def stop(self) -> bool:
         with self._lock:

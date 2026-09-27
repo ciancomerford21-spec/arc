@@ -34,7 +34,7 @@ plugins=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins
 step() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 
 step "Checking prerequisites"
-for c in cargo pw-record pw-play; do command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }; done
+for c in cargo pw-cat; do command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }; done
 [[ -x $data/venv/bin/python ]] || { echo "missing voice venv: $data/venv (see README: voice setup)" >&2; exit 1; }
 "$root/scripts/fetch-models.sh" --verify >/dev/null || { echo "voice models missing: run scripts/fetch-models.sh" >&2; exit 1; }
 

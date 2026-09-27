@@ -166,11 +166,18 @@ _SENTENCE_END = re.compile(r"(?<!%\.)(?<=[.!?…])\s+(?=[A-Z0-9\"'(])")
 
 def split_sentences(text: str) -> list[str]:
     """Split a reply into sentences so the first can play while the rest render.
-    Very short fragments are merged into the previous sentence."""
+
+    Short fragments are merged into the previous sentence, so that a reply
+    ending "...at 4%. Anything else?" plays as two clips rather than three:
+    a one-clause aside does not benefit from its own round trip through the
+    TTS queue. The test is word count, not characters -- "Anything else?" is
+    13 characters but only two words, and a character count left it stranded
+    as its own clip while the near-identical "4%." was merged.
+    """
     parts = [p.strip() for p in _SENTENCE_END.split(text.strip()) if p.strip()]
     out: list[str] = []
     for p in parts:
-        if out and len(p) < 12:
+        if out and len(p.split()) <= 3:
             out[-1] = f"{out[-1]} {p}"
         else:
             out.append(p)

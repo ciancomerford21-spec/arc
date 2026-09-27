@@ -59,6 +59,20 @@ def _default_input_device() -> str:
         return DEFAULT_INPUT
 
 
+def _read_wav(path: str) -> tuple[np.ndarray, int]:
+    """Read a WAV file as mono float32 in [-1, 1], plus its sample rate."""
+    with wave.open(path, "rb") as w:
+        if w.getsampwidth() != 2:
+            raise SystemExit(f"--transcribe expects 16-bit PCM WAV, got {w.getsampwidth() * 8}-bit")
+        channels = w.getnchannels()
+        sr = w.getframerate()
+        raw = w.readframes(w.getnframes())
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
+    if channels > 1:
+        x = x.reshape(-1, channels).mean(axis=1)
+    return x, sr
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="arc-voice")
     ap.add_argument("--config", help="path to config.toml")

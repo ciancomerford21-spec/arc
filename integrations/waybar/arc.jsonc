@@ -1,0 +1,20 @@
+// Arc module for Waybar (secondary: Omarchy's own bar uses the
+// integrations/omarchy-bar/arc.status widget instead).
+//
+// Add "custom/arc" to one of your modules-left/center/right lists and merge
+// this object into ~/.config/waybar/config.jsonc. Styles: arc.css.
+//
+// Event-driven: `arc bar --waybar --follow` prints a new line only when Arc's
+// state changes, and reconnects on its own if arcd restarts.
+{
+  "custom/arc": {
+    "exec": "arc bar --waybar --follow",
+    "return-type": "json",
+    "restart-interval": 5,
+    "format": "{}",
+    "tooltip": true,
+    "on-click": "arc voice toggle",
+    "on-click-right": "arc panel --toggle",
+    "on-click-middle": "arc voice stop-speaking"
+  }
+}

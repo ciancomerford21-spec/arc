@@ -482,6 +482,12 @@ pub enum Event {
         state: AssistantState,
         detail: String,
     },
+    /// Complete bar status, pushed whenever it changes (state, voice health,
+    /// last command). Bar clients render this directly and never need to
+    /// query back, so fast state changes can't be missed or misreported.
+    Bar {
+        status: BarStatus,
+    },
     /// User input as understood (transcript or typed text).
     Heard {
         text: String,
@@ -522,6 +528,7 @@ impl Event {
     pub fn topic(&self) -> Topic {
         match self {
             Event::State { .. }
+            | Event::Bar { .. }
             | Event::Heard { .. }
             | Event::ToolStarted { .. }
             | Event::ToolFinished { .. }

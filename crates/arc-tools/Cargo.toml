@@ -7,3 +7,20 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arc-config = { workspace = true }
+arc-hyprland = { workspace = true }
+arc-proto = { workspace = true }
+arc-security = { workspace = true }
+arc-system = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+shlex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+tempfile = { workspace = true }

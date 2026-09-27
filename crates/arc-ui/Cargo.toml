@@ -1,9 +1,19 @@
 [package]
 name = "arc-ui"
-description = "Arc GTK4 overlay and status panel"
+description = "Arc GTK4 layer-shell panel"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 rust-version.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "arc-ui"
+path = "src/main.rs"
+
 [dependencies]
+gtk4 = "0.11"
+gtk4-layer-shell = "0.8"
+glib = "0.22"
+serde_json = "1"

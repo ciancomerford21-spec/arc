@@ -1,0 +1,37 @@
+/* Arc Waybar module. Import from ~/.config/waybar/style.css:
+ *   @import "arc.css";
+ * Classes come from `arc bar --waybar`: idle, voice-off, listening, thinking,
+ * executing, speaking, error, offline. Colors use GTK named colors so they
+ * follow the Waybar/Omarchy theme when it defines them. */
+
+#custom-arc {
+  padding: 0 8px;
+  transition: color 150ms ease-in-out;
+}
+
+#custom-arc.offline,
+#custom-arc.voice-off {
+  opacity: 0.45;
+}
+
+#custom-arc.listening {
+  color: @accent_color;
+  animation: arc-pulse 1.2s ease-in-out infinite;
+}
+
+#custom-arc.thinking,
+#custom-arc.executing {
+  color: @accent_color;
+}
+
+#custom-arc.speaking {
+  color: @success_color;
+}
+
+#custom-arc.error {
+  color: @error_color;
+}
+
+@keyframes arc-pulse {
+  50% { opacity: 0.55; }
+}

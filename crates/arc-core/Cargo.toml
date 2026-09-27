@@ -1,9 +1,21 @@
 [package]
 name = "arc-core"
-description = "Arc assistant core: router, NLU, conversation, memory, executor"
+description = "Arc assistant core: router, execution gate, agent loop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arc-ai = { workspace = true }
+arc-config = { workspace = true }
+arc-proto = { workspace = true }
+arc-security = { workspace = true }
+arc-tools = { workspace = true }
+async-trait = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

@@ -1,9 +1,24 @@
 [package]
 name = "arc-system"
-description = "System information: CPU, memory, GPU, processes, audio, network"
+description = "System integration for Arc: resources, processes, audio, media (MPRIS), notifications, apps, network, power"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+zbus = { workspace = true }
+sysinfo = { workspace = true }
+strsim = { workspace = true }
+libc = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

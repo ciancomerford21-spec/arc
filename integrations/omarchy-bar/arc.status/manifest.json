@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "arc.status",
+  "name": "Arc",
+  "version": "0.1.0",
+  "author": "Arc",
+  "description": "Arc voice assistant status. Click: talk. Right-click: open the Arc panel. Middle-click: stop speaking.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Arc assistant",
+    "description": "Arc state (idle / listening / thinking / speaking); click to talk",
+    "category": "Assistant",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

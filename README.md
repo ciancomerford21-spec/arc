@@ -120,13 +120,11 @@ Qwen3.5-2B is fast enough for voice, but it is a small model and the tool list
 is long. Two things follow from that, both deliberate:
 
 - **Known commands bypass the model.** "open wikipedia.org" opens the site
-  directly; "google world war two" opens a results page. A dot or a TLD is
-  required, so "open spotify" is still treated as an app request. Anything that
-  asks for an answer ("search X and tell me about it") goes to the model
-  instead, because there is no fetch tool to satisfy it.
+  directly. A dot or a TLD is required, so "open spotify" is still
+  treated as an app request. Anything that asks for an answer ("search X and tell me about it")
+  goes to the model instead, because there is no fetch tool to satisfy it.
 - **The system prompt is short.** A 2B cannot hold a persona alongside 30 tool
   schemas without losing factual accuracy, so there is no wit or style prompt.
-  `personality` was removed rather than left in the config doing nothing.
 
 ## Voice
 
@@ -138,9 +136,6 @@ Under `[voice]`, all local:
 | `tts_engine` | `kokoro` (also `piper`, `espeak`, `none`) |
 | `tts_voice` | `kokoro-en-v0_19` — a model *directory*, not an `.onnx` filename |
 | `tts_speaker` | `af_bella` |
-
-Kokoro is the default in the float build, which benchmarks around 2.8× faster
-than the quantized one on a Ryzen 5 1600 despite the larger file.
 
 ## Troubleshooting
 

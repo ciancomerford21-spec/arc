@@ -120,14 +120,45 @@ class Microphone:
         need = FRAME * 4
         buf = b""
         while True:
-            chunk = self._proc.stdout.read(need - len(buf))
+            try:
+                chunk = self._proc.stdout.read(need - len(buf))
+            except (ValueError, OSError) as e:
+                # The pipe died (process gone, or fd closed underneath us).
+                if not self._stopping:
+                    self._on_error(f"microphone stream failed: {e}")
+                return
             if not chunk:
-                break
+                if self._stopping:
+                    return
+                # Clean EOF from pw-cat: it exited. Surface it instead of
+                # dying silently, otherwise the service keeps reporting
+                # "ready" while hearing nothing.
+                code = self._proc.poll()
+                detail = ""
+                if code is not None and code != 0:
+                    # pw-cat's last stderr line usually names the real problem
+                    # (device busy, stream suspended, driver gone).
+                    try:
+                        err = ""
+                        if self._proc.stderr is not None:
+                            err = self._proc.stderr.read().decode(errors="replace").strip()
+                    except (ValueError, OSError):
+                        err = ""
+                    if err:
+                        detail = f": {err.splitlines()[-1]}"
+                    self._on_error(f"microphone stream ended unexpectedly (pw-cat exit {code}){detail}")
+                else:
+                    self._on_error("microphone stream ended unexpectedly")
+                return
             buf += chunk
             if len(buf) < need:
                 continue
             self._on_frame(np.frombuffer(buf[:need], dtype=np.float32).copy())
             buf = buf[need:]
+
+    def is_alive(self) -> bool:
+        """False once the capture process has exited (so it can be restarted)."""
+        return self._proc is not None and self._proc.poll() is None
 
     def stop(self) -> None:
         if self._proc is None:

@@ -791,18 +791,33 @@ impl Tool for OpenUrl {
     fn summarize(&self, v: &Json) -> Option<String> {
         let url = s(v, "opened")?;
         let host = url.split("://").nth(1).unwrap_or(&url).split('/').next().unwrap_or(&url).trim_start_matches("www.");
-        Some(format!("Opening {host}."))
+        // Say where it went, but keep it to one short clause. The user asked
+        // for a site, not a status report, and the model used to volunteer the
+        // whole URL back.
+        match v.get("workspace").and_then(|w| w.as_i64()) {
+            Some(ws) => Some(format!("Opening {host} on workspace {ws}.")),
+            None => Some(format!("Opening {host}.")),
+        }
     }
     async fn execute(&self, args: &JsonMap) -> ToolResult {
         let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        if let Some(ws) = args.get("workspace").and_then(|v| v.as_i64()) {
+        let workspace = args.get("workspace").and_then(|v| v.as_i64());
+        if let Some(ws) = workspace {
             let Some(h) = try_hyprland() else { return ToolResult::Error("Hyprland not available".into()) };
             if let Err(e) = h.dispatch(&Dispatch::FocusWorkspace(ws.to_string())).await {
                 return ToolResult::Error(format!("failed to switch to workspace {ws}: {e}"));
             }
         }
         match arc_system::apps::open_url(url) {
-            Ok(u) => ToolResult::Ok(serde_json::json!({"opened": u})),
+            // Echo the workspace back so summarize can mention it; without this
+            // the switch happened but the reply implied it did not.
+            Ok(u) => {
+                let mut out = serde_json::json!({"opened": u});
+                if let Some(ws) = workspace {
+                    out["workspace"] = serde_json::json!(ws);
+                }
+                ToolResult::Ok(out)
+            }
             Err(e) => ToolResult::Error(e.to_string()),
         }
     }
@@ -1457,6 +1472,27 @@ mod tests {
         let ToolResult::Ok(v) = tool.execute(&JsonMap::new()).await else { panic!() };
         let s = tool.summarize(&v).unwrap();
         assert!(s.ends_with('.') && !s.contains('{'), "{s}");
+    }
+
+    #[test]
+    fn open_url_says_the_host_not_the_whole_url() {
+        // The complaint: Arc said "https://youtube.com has been opened in your
+        // default browser on Workspace 3". The scheme must never be spoken, and
+        // the workspace is worth one short clause when one was asked for.
+        let t = Tools::new();
+        let tool = t.by_name("open_url").unwrap();
+
+        let plain = serde_json::json!({"opened": "https://github.com"});
+        assert_eq!(tool.summarize(&plain).unwrap(), "Opening github.com.");
+
+        let ws = serde_json::json!({"opened": "https://youtube.com", "workspace": 3});
+        assert_eq!(tool.summarize(&ws).unwrap(), "Opening youtube.com on workspace 3.");
+
+        for v in [plain, ws] {
+            let said = tool.summarize(&v).unwrap();
+            assert!(!said.contains("https://"), "spoke the scheme: {said}");
+            assert!(!said.contains("://"), "spoke the URL: {said}");
+        }
     }
 
     #[test]

@@ -225,9 +225,13 @@ impl Router {
             //
             // The scheme is optional but must be matched, otherwise
             // "open https://github.com" falls through to the model, which is
-            // exactly the case the deterministic path exists to avoid.
+            // exactly the case the deterministic path exists to avoid. An
+            // optional "on/in workspace N" is captured into the tool's own
+            // workspace argument, for the same reason: the model otherwise
+            // narrates the raw URL back ("https://youtube.com has been
+            // opened in your default browser on Workspace 3").
             FixedRule::new(
-                r"(?i)^(?:open|visit|browse|go\s+to|show\s+me|load|take\s+me\s+to)\s+(?:the\s+|the\s+website\s+|website\s+)?((?:https?://)?(?:www\.)?[a-z0-9][a-z0-9.-]*(?:\.[a-z]{2,})(?:/\S*)?)$",
+                r"(?i)^(?:open|visit|browse|go\s+to|show\s+me|load|take\s+me\s+to)\s+(?:the\s+|the\s+website\s+|website\s+)?((?:https?://)?(?:www\.)?[a-z0-9][a-z0-9.-]*(?:\.[a-z]{2,})(?:/\S*)?)(?:\s+(?:on|in|to)\s+(?:my\s+|the\s+)?workspace\s+(\d+))?$",
                 "open_url",
                 1.0,
                 Some(Box::new(|caps| {
@@ -240,6 +244,11 @@ impl Router {
                         .trim_start_matches("http://")
                         .trim_start_matches("www.");
                     m.insert("url".into(), serde_json::json!(host));
+                    if let Some(ws) = caps.get(2).map(|m| m.as_str().trim()) {
+                        if let Ok(n) = ws.parse::<i64>() {
+                            m.insert("workspace".into(), serde_json::json!(n));
+                        }
+                    }
                     m
                 })),
             )?,
@@ -366,6 +375,56 @@ fn yes_no(text: &str) -> Option<bool> {
         | "denied" | "reject" | "no thanks" | "don't do it" => Some(false),
         _ => None,
     }
+}
+
+/// A URL read aloud is noise: "https://youtube.com has been opened in your
+/// default browser" says less than "Opening YouTube" and takes longer to say.
+///
+/// The fixed router already says the bare host, so this only fires on replies
+/// the 2B wrote itself. It rewrites the spoken form to the host and leaves
+/// everything else alone. A host is kept when it is a recognisable word
+/// ("youtube.com" -> "YouTube"); otherwise it falls back to the first label,
+/// because "the website news.ycombinator.com is open" is no better than the
+/// URL and there is no good spoken name for it.
+fn tame_spoken_url(text: String) -> String {
+    if !text.contains("://") {
+        return text;
+    }
+    let re = regex::Regex::new(r"(?i)\b(?:https?://)?(?:www\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:/[^\s]*)?")
+        .expect("static url pattern");
+    re.replace_all(&text, |c: &regex::Captures| {
+        let host = &c[1];
+        let label = host.split('.').next().unwrap_or(host);
+        // Brands are spelled oddly. "Youtube" is wrong and the whole point of
+        // this is to sound natural, so the common ones are listed rather than
+        // title-cased.
+        let known = match label.to_lowercase().as_str() {
+            "youtube" => Some("YouTube"),
+            "github" => Some("GitHub"),
+            "reddit" => Some("Reddit"),
+            "wikipedia" => Some("Wikipedia"),
+            "stackoverflow" => Some("Stack Overflow"),
+            "linkedin" => Some("LinkedIn"),
+            _ => None,
+        };
+        if let Some(k) = known {
+            return k.to_string();
+        }
+        // A single-letter or numeric label is not a word, and a two-label host
+        // like news.ycombinator.com has no good spoken name; keep the host.
+        if label.len() < 2
+            || label.chars().all(|ch| ch.is_ascii_digit())
+            || host.split('.').count() > 2
+        {
+            return host.to_string();
+        }
+        let mut c = label.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => host.to_string(),
+        }
+    })
+    .into_owned()
 }
 
 fn summarise(tools: &Tools, tool: &str, result: &ToolResult) -> String {
@@ -510,7 +569,7 @@ impl Assistant {
         match agent.ask(&history, &input.text).await {
             Ok(r) => {
                 let (text, actions, pending) = match r {
-                    AgentReply::Answer { text, actions } => (text, actions, None),
+                    AgentReply::Answer { text, actions } => (tame_spoken_url(text), actions, None),
                     AgentReply::NeedsConfirmation { text, pending, actions } => (text, actions, Some(pending)),
                 };
                 let mut h = self.history.lock().unwrap();
@@ -640,6 +699,72 @@ mod tests {
             assert_eq!(out.tool_name.as_deref(), Some("open_url"), "{text}");
             assert_eq!(out.args.get("url").and_then(|v| v.as_str()), Some(want), "{text}");
         }
+    }
+
+    #[test]
+    fn site_with_workspace_opens_without_the_model() {
+        // The regression: "open youtube.com on workspace 3" fell through to
+        // the model, which opened it and then narrated the raw URL back with
+        // the workspace appended.
+        //
+        // The host must carry a dot. A bare "open youtube" stays an app
+        // request, because "open spotify" has to launch the app, and only the
+        // model can tell those apart.
+        let r = router();
+        for (text, host, ws) in [
+            ("open youtube.com on workspace 3", "youtube.com", 3),
+            ("open github.com in workspace 2", "github.com", 2),
+            ("visit news.ycombinator.com to workspace 5", "news.ycombinator.com", 5),
+            ("open https://youtube.com on workspace 3", "youtube.com", 3),
+        ] {
+            let out = r.route(&NluInput::text(text, InputSource::Voice));
+            assert_eq!(out.route, Route::FixedCommand, "{text} must not reach the model");
+            assert_eq!(out.tool_name.as_deref(), Some("open_url"), "{text}");
+            assert_eq!(out.args.get("url").and_then(|v| v.as_str()), Some(host), "{text}");
+            assert_eq!(out.args.get("workspace").and_then(|v| v.as_i64()), Some(ws), "{text}");
+        }
+    }
+
+    #[test]
+    fn bare_app_names_still_go_to_the_model() {
+        // The workspace clause must not make "open spotify on workspace 2"
+        // look like a URL. A dot is what separates the two.
+        let r = router();
+        for text in ["open spotify", "open youtube", "open spotify on workspace 2"] {
+            let out = r.route(&NluInput::text(text, InputSource::Voice));
+            assert_ne!(out.tool_name.as_deref(), Some("open_url"), "{text} was treated as a URL");
+        }
+    }
+
+    #[test]
+    fn spoken_url_is_tamed() {
+        // What the 2B used to say, and what the user should hear instead.
+        assert_eq!(
+            tame_spoken_url("The website https://youtube.com has been opened in your default browser on Workspace 3.".into()),
+            "The website YouTube has been opened in your default browser on Workspace 3."
+        );
+        assert_eq!(
+            tame_spoken_url("Opening https://github.com now.".into()),
+            "Opening GitHub now."
+        );
+        // No URL, no change.
+        assert_eq!(tame_spoken_url("Opening github.com.".into()), "Opening github.com.");
+        // A numeric host has no spoken name; keep it rather than mangle it.
+        assert_eq!(tame_spoken_url("Went to https://192.168.1.1".into()), "Went to 192.168.1.1");
+        // Paths and queries go; the site is what matters.
+        assert_eq!(
+            tame_spoken_url("See https://en.wikipedia.org/wiki/Rust for details.".into()),
+            "See en.wikipedia.org for details."
+        );
+    }
+
+    #[test]
+    fn site_without_workspace_omits_the_argument() {
+        // The optional group must not inject a null workspace, which would
+        // make open_url try to switch to workspace 0.
+        let r = router();
+        let out = r.route(&NluInput::text("open github.com", InputSource::Voice));
+        assert!(out.args.get("workspace").is_none(), "got {:?}", out.args);
     }
 
     #[test]

@@ -222,7 +222,14 @@ pub enum VoiceCommand {
     /// Change activation mode at runtime.
     SetMode { mode: VoiceMode },
     /// Speak text.
-    Speak { text: String, utterance_id: String },
+    Speak {
+        text: String,
+        utterance_id: String,
+        /// Start listening (no wake word) once this finishes playing, e.g.
+        /// after Arc asks a question or for confirmation.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        listen_after: bool,
+    },
     /// Stop any speech in progress.
     StopSpeaking,
     /// Re-read configuration.

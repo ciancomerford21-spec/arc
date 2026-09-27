@@ -186,8 +186,15 @@ impl Daemon {
 
     /// Ask the voice service (via the VoiceControl topic) to speak text.
     pub fn speak(&self, text: &str) -> String {
+        self.speak_opts(text, false)
+    }
+
+    /// Speak, optionally listening for an answer straight afterwards.
+    pub fn speak_opts(&self, text: &str, listen_after: bool) -> String {
         let id = self.next_utterance_id();
-        self.emit(Event::VoiceControl { command: VoiceCommand::Speak { text: text.into(), utterance_id: id.clone() } });
+        self.emit(Event::VoiceControl {
+            command: VoiceCommand::Speak { text: text.into(), utterance_id: id.clone(), listen_after },
+        });
         id
     }
 

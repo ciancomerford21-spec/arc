@@ -178,7 +178,8 @@ fn on_report(daemon: &Arc<Daemon>, line: &str) {
             tokio::spawn(async move {
                 let r = d.ask(&text, InputSource::Voice).await;
                 if d.config.voice.speak_replies && !r.reply.is_empty() {
-                    d.speak(&r.reply);
+                    let listen = d.config.voice.follow_up && expects_answer(&r.reply, r.pending.is_some());
+                    d.speak_opts(&r.reply, listen);
                 }
             });
         }
@@ -186,5 +187,63 @@ fn on_report(daemon: &Arc<Daemon>, line: &str) {
         VoiceReport::SpeakingFinished { .. } => daemon.set_state(AssistantState::Idle, ""),
         VoiceReport::Error { component, message } => daemon.record_error(&format!("voice.{component}"), &message),
         VoiceReport::Health { .. } => unreachable!(),
+    }
+}
+
+/// Should Arc listen for an answer after speaking `reply`?
+///
+/// Yes when an action is waiting for confirmation, or when the reply ends in
+/// a question ("Which app did you mean?"). Rhetorical sign-offs like "Anything
+/// else?" or "Let me know if you need anything." don't count, otherwise Arc
+/// would open the mic after nearly every reply.
+pub fn expects_answer(reply: &str, pending_confirmation: bool) -> bool {
+    if pending_confirmation {
+        return true;
+    }
+    let last = reply
+        .trim()
+        .rsplit(['.', '!', '\n'])
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !last.ends_with('?') {
+        return false;
+    }
+    const SIGN_OFFS: &[&str] = &[
+        "anything else?",
+        "is there anything else",
+        "can i help with anything else",
+        "can i help you with anything else",
+        "what else can i do",
+        "need anything else",
+        "how can i help",
+        "how can i assist",
+        "what would you like me to do",
+        "what can i do for you",
+    ];
+    !SIGN_OFFS.iter().any(|s| last.contains(s))
+}
+
+#[cfg(test)]
+mod follow_up_tests {
+    use super::expects_answer;
+
+    #[test]
+    fn listens_after_real_questions_and_confirmations() {
+        assert!(expects_answer("I need your confirmation to run chromium --version.", true));
+        assert!(expects_answer("I couldn't find Thunar. Which app did you mean?", false));
+        assert!(expects_answer("Do you want me to open the file manager?", false));
+        assert!(expects_answer("This will run `foo`. Confirm?", false));
+    }
+
+    #[test]
+    fn does_not_listen_after_statements_or_sign_offs() {
+        assert!(!expects_answer("Switched to workspace 3.", false));
+        assert!(!expects_answer("It's 3:03 PM.", false));
+        assert!(!expects_answer("Done. Anything else?", false));
+        assert!(!expects_answer("Opened GitHub. Is there anything else I can help with?", false));
+        assert!(!expects_answer("Got it. What would you like me to do?", false));
+        assert!(!expects_answer("", false));
     }
 }

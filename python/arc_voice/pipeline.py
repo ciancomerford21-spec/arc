@@ -81,6 +81,8 @@ class Pipeline:
         self._heard = False
         self._level_every = 3  # ~100 ms
         self._level_count = 0
+        #: Per-capture override of no_speech_timeout_s (follow-ups).
+        self._timeout_s: float | None = None
         #: Set by the service while TTS plays; idle segments are then only
         #: checked for the wake phrase (barge-in), never used as commands.
         self.speaking = False
@@ -92,7 +94,9 @@ class Pipeline:
         if self.state == "idle":
             self._reset_segment()
 
-    def start_listening(self) -> None:
+    def start_listening(self, timeout_s: float | None = None) -> None:
+        """Begin a command capture. ``timeout_s`` overrides how long to wait for
+        speech to start (follow-ups use a shorter window)."""
         if self.state == "listening":
             return
         self.state = "listening"
@@ -100,6 +104,7 @@ class Pipeline:
         self._frames = 0
         self._silence = 0
         self._heard = self._in_speech
+        self._timeout_s = timeout_s
         self.emit({"report": "listening_started"})
 
     def stop_listening(self) -> None:
@@ -141,7 +146,8 @@ class Pipeline:
         else:
             self._silence += 1
         self._in_speech = speech
-        if not self._heard and self._frames >= self.t.frames(self.t.no_speech_timeout_s * 1000):
+        timeout_s = self._timeout_s if self._timeout_s is not None else self.t.no_speech_timeout_s
+        if not self._heard and self._frames >= self.t.frames(timeout_s * 1000):
             self._to_idle()
             self.emit({"report": "no_speech"})
         elif self._heard and self._silence >= self.t.frames(self.t.end_silence_ms):

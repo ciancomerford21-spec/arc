@@ -99,6 +99,19 @@ def test_no_speech_timeout(vad_factory, stt):
     assert p.state == "idle"
 
 
+def test_follow_up_timeout_override_is_per_capture(vad_factory, stt):
+    p, reports = make(vad_factory, stt, mode="wake_word", no_speech_timeout_s=10.0)
+    p.start_listening(timeout_s=1.0)
+    rs = run(p, silence(1.5), reports)
+    assert [r["report"] for r in rs] == ["listening_started", "no_speech"]
+    # The next normal capture uses the configured timeout again.
+    reports.clear()
+    p.start_listening()
+    rs = run(p, silence(1.5), reports)
+    assert [r["report"] for r in rs if r["report"] != "level"] == ["listening_started"]
+    assert p.state == "listening"
+
+
 def test_levels_emitted_while_listening(vad_factory, stt, say):
     p, reports = make(vad_factory, stt, mode="push_to_talk")
     p.start_listening()

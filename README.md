@@ -29,6 +29,9 @@ Everything is per-user; no root. `scripts/uninstall.sh` removes it again
 - **Terminal:** `arc ask "open firefox"`, `arc status`, `arc watch`, `arc tools`.
 - **Risky actions** (power, deleting files, shell commands outside the allow-list) ask first:
   answer "yes"/"no" out loud, or `arc confirm` / `arc reject`.
+- **Follow-ups:** when Arc asks you something (a confirmation or a question), it listens for
+  about 5 seconds afterwards; just answer, no "Hey Arc" needed. Turn off with `follow_up = false`
+  under `[voice]`.
 
 ## Language model
 

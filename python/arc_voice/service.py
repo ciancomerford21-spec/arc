@@ -44,6 +44,10 @@ def disabled() -> dict:
     return {"status": "disabled", "detail": ""}
 
 
+#: Seconds to wait for an answer after Arc asks something, before giving up quietly.
+FOLLOW_UP_TIMEOUT_S = 5.0
+
+
 class Service:
     def __init__(self, cfg: VoiceConfig, out: IO[str] = sys.stdout, use_audio: bool = True):
         self.cfg = cfg
@@ -51,7 +55,7 @@ class Service:
         self._out_lock = threading.Lock()
         self._frames: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=200)
         self._ctl: queue.Queue[tuple[str, dict]] = queue.Queue()
-        self._speech: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        self._speech: queue.Queue[tuple[str, str, bool] | None] = queue.Queue()
         self.use_audio = use_audio
         self.health: dict[str, dict] = {}
         self.vad = self.stt = self.tts = None
@@ -186,7 +190,10 @@ class Service:
         if action == "start_listening":
             if self.player.playing:
                 self.player.stop()
-            p.start_listening()
+            if cmd.get("follow_up"):
+                p.start_listening(timeout_s=FOLLOW_UP_TIMEOUT_S)
+            else:
+                p.start_listening()
         elif action == "stop_listening":
             p.stop_listening()
         elif action == "toggle_listening":
@@ -210,7 +217,7 @@ class Service:
             item = self._speech.get()
             if item is None:
                 break
-            text, uid = item
+            text, uid, listen_after = item
             if self.tts is None:
                 self.emit({"report": "speaking_finished", "utterance_id": uid, "interrupted": True})
                 continue
@@ -232,6 +239,15 @@ class Service:
                 if self.pipeline:
                     self.pipeline.speaking = False
             self.emit({"report": "speaking_finished", "utterance_id": uid, "interrupted": interrupted})
+            # Arc asked something: open the mic for the answer, no wake word needed.
+            # Skipped if the user cut the speech off or more speech is queued
+            # (the answer would be heard over Arc still talking).
+            if listen_after and not interrupted and not self._more_speech_queued():
+                self._ctl.put(("start_listening", {"follow_up": True}))
+
+    def _more_speech_queued(self) -> bool:
+        with self._speech.mutex:
+            return any(item is not None for item in self._speech.queue)
 
     def _stop_speaking(self) -> None:
         while True:
@@ -253,8 +269,9 @@ class Service:
         elif action == "speak":
             text = str(cmd.get("text", "")).strip()
             uid = str(cmd.get("utterance_id", ""))
+            listen_after = bool(cmd.get("listen_after", False)) and self.cfg.follow_up
             if text:
-                self._speech.put((text, uid))
+                self._speech.put((text, uid, listen_after))
         elif action == "stop_speaking":
             self._stop_speaking()
         elif action == "reload":

@@ -133,6 +133,15 @@ impl Tools {
         cfg: &Config,
         store: Option<Arc<arc_memory::MemoryStore>>,
     ) -> Result<Self, String> {
+        Self::build(cfg, store, cfg.web.search_url.clone())
+    }
+
+    /// Full constructor: memory store and the web-search URL template.
+    pub fn build(
+        cfg: &Config,
+        store: Option<Arc<arc_memory::MemoryStore>>,
+        search_url: String,
+    ) -> Result<Self, String> {
         let sensitive: Vec<String> = cfg
             .files
             .sensitive_paths
@@ -142,7 +151,11 @@ impl Tools {
         let analyzer = ShellAnalyzer::new(&cfg.permissions.shell, &sensitive)
             .map_err(|e| format!("invalid permissions.shell regex: {e}"))?;
         let mut t = Tools { by_name: HashMap::new() };
-        t.register_builtins(ShellExec { analyzer, policy: cfg.permissions.shell.clone() }, store);
+        t.register_builtins(
+            ShellExec { analyzer, policy: cfg.permissions.shell.clone() },
+            store,
+            search_url,
+        );
         Ok(t)
     }
 
@@ -173,8 +186,9 @@ impl Tools {
         self.by_name.keys().cloned().collect()
     }
 
-    fn register_builtins(&mut self, shell: ShellExec, store: Store) {
+    fn register_builtins(&mut self, shell: ShellExec, store: Store, search_url: String) {
         self.register(Arc::new(shell));
+        self.register(Arc::new(WebSearch { template: search_url }));
         self.register(Arc::new(MemoryRemember(store.clone())));
         self.register(Arc::new(MemoryForget(store.clone())));
         self.register(Arc::new(MemoryList(store.clone())));
@@ -1060,6 +1074,59 @@ fn not_available() -> ToolResult {
     ToolResult::Error("memory is disabled (no memory store configured)".into())
 }
 
+struct WebSearch {
+    template: String,
+}
+
+#[async_trait]
+impl Tool for WebSearch {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+    fn description(&self) -> &str {
+        "Search the web in the user's browser. Use this for a question or a phrase that \
+         is not a web address (\"world war two\", \"rust tokio docs\"). To open a specific \
+         site, use open_url instead. This only opens the results page; it does not read \
+         or summarise anything, so never claim to know what a page says."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({"type": "object", "properties": {
+            "query": {"type": "string", "description": "What to search for"},
+            "workspace": {"type": "integer", "description": "Optional workspace number to switch to first"}
+        }, "required": ["query"]})
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        s(v, "query").map(|q| format!("Searching for {q}."))
+    }
+    async fn execute(&self, args: &JsonMap) -> ToolResult {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if query.is_empty() {
+            return ToolResult::Error("web_search: need a 'query'".into());
+        }
+        if let Some(ws) = args.get("workspace").and_then(|v| v.as_i64()) {
+            let Some(h) = try_hyprland() else { return ToolResult::Error("Hyprland not available".into()) };
+            if let Err(e) = h.dispatch(&Dispatch::FocusWorkspace(ws.to_string())).await {
+                return ToolResult::Error(format!("failed to switch to workspace {ws}: {e}"));
+            }
+        }
+        // Percent-encode the query so spaces and punctuation survive the URL.
+        let encoded: String = query
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let url = self.template.replace("{query}", &encoded);
+        match arc_system::apps::open_url(&url) {
+            Ok(u) => ToolResult::Ok(serde_json::json!({"opened": u, "query": query})),
+            Err(e) => ToolResult::Error(e.to_string()),
+        }
+    }
+}
+
 struct MonitorOverview;
 #[async_trait]
 impl Tool for MonitorOverview {
@@ -1293,8 +1360,8 @@ mod tests {
     #[test]
     fn specs_have_object_schemas() {
         let specs = Tools::new().specs();
-        // 25 built-in tools + 4 memory tools.
-        assert_eq!(specs.len(), 29);
+        // 25 built-in tools + 4 memory tools + web_search.
+        assert_eq!(specs.len(), 30);
         assert!(specs.iter().all(|s| s.parameters["type"] == "object"));
     }
 

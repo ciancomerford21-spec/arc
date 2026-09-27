@@ -91,8 +91,10 @@ pub enum PersonalityStyle {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Personality {
+    /// Unused. A 2B model cannot hold a persona alongside 30 tool schemas
+    /// without losing factual accuracy, so no prompt is built from this.
     pub style: PersonalityStyle,
-    /// Probability (0-1) of adding a light remark where one fits.
+    /// Unused; see `style`. Kept so existing config files still parse.
     pub wit: f32,
     /// Extra instructions appended to the language-model system prompt.
     pub custom_prompt: String,

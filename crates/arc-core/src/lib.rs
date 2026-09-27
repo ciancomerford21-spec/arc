@@ -218,15 +218,28 @@ impl Router {
             // Websites. "open wikipedia" and "go to news.ycombinator.com" are
             // deterministic, so they never reach the model: a model asked to
             // "open X" tends to also answer X, when the user only wanted the
-            // page opened. A phrase with spaces ("google world war two") has
-            // no host in it, so it becomes a search instead.
+            // page opened, and it narrates the raw URL back
+            // ("https://github.com has been opened..."). A phrase with spaces
+            // ("google world war two") has no host in it, so it becomes a
+            // search instead.
+            //
+            // The scheme is optional but must be matched, otherwise
+            // "open https://github.com" falls through to the model, which is
+            // exactly the case the deterministic path exists to avoid.
             FixedRule::new(
-                r"(?i)^(?:open|visit|browse|go\s+to|show\s+me|load|take\s+me\s+to)\s+(?:the\s+|the\s+website\s+|website\s+)?([a-z0-9][a-z0-9.-]*(?:\.[a-z]{2,})(?:/\S*)?)$",
+                r"(?i)^(?:open|visit|browse|go\s+to|show\s+me|load|take\s+me\s+to)\s+(?:the\s+|the\s+website\s+|website\s+)?((?:https?://)?(?:www\.)?[a-z0-9][a-z0-9.-]*(?:\.[a-z]{2,})(?:/\S*)?)$",
                 "open_url",
                 1.0,
                 Some(Box::new(|caps| {
                     let mut m = HashMap::new();
-                    m.insert("url".into(), serde_json::json!(caps[1].trim()));
+                    // Strip the scheme and a leading www so xdg-open gets a
+                    // bare host; open_url adds https:// back itself.
+                    let host = caps[1]
+                        .trim()
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .trim_start_matches("www.");
+                    m.insert("url".into(), serde_json::json!(host));
                     m
                 })),
             )?,
@@ -607,6 +620,26 @@ mod tests {
         assert_eq!(out.route, Route::FixedCommand, "must not reach the model");
         assert_eq!(out.tool_name.as_deref(), Some("open_url"));
         assert_eq!(out.args.get("url").and_then(|v| v.as_str()), Some("wikipedia.org"));
+    }
+
+    #[test]
+    fn site_with_scheme_opens_without_the_model() {
+        // The regression: "open https://github.com" missed the host rule
+        // because the pattern required the host to start alphanumeric, so it
+        // reached the 2B, which replied "The website https://github.com has
+        // been opened in your default browser" and spoke the raw URL aloud.
+        let r = router();
+        for (text, want) in [
+            ("open https://github.com", "github.com"),
+            ("open http://github.com", "github.com"),
+            ("open https://www.github.com", "github.com"),
+            ("visit https://en.wikipedia.org/wiki/Rust", "en.wikipedia.org/wiki/Rust"),
+        ] {
+            let out = r.route(&NluInput::text(text, InputSource::Voice));
+            assert_eq!(out.route, Route::FixedCommand, "{text} must not reach the model");
+            assert_eq!(out.tool_name.as_deref(), Some("open_url"), "{text}");
+            assert_eq!(out.args.get("url").and_then(|v| v.as_str()), Some(want), "{text}");
+        }
     }
 
     #[test]

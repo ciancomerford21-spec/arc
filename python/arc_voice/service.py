@@ -25,7 +25,7 @@ import numpy as np
 from . import __version__
 from .audio import AudioError, Microphone, Player
 from .config import VoiceConfig
-from .engines import EngineUnavailable, Stt, Tts, Vad, chime
+from .engines import EngineUnavailable, Stt, Tts, Vad, chime, split_sentences
 from .pipeline import Pipeline, Timing
 from .wake import WakeMatcher
 
@@ -63,6 +63,8 @@ class Service:
         self.mic: Microphone | None = None
         self.player = Player(cfg.output_device)
         self._stop = threading.Event()
+        #: Set to abandon the reply currently being rendered/played.
+        self._cancel_speech = threading.Event()
 
     # -- output ---------------------------------------------------------
 
@@ -79,6 +81,7 @@ class Service:
         if kind == "listening_started" and self.cfg.chime:
             self._chime(True)
         if kind == "wake_detected" and self.player.playing and self.cfg.barge_in:
+            self._cancel_speech.set()
             self.player.stop()
         self.emit(r)
 
@@ -100,7 +103,7 @@ class Service:
                 self.health[name] = unavailable(str(e))
         try:
             self.tts = Tts(cfg)
-            self.health["tts"] = ok(cfg.tts_voice)
+            self.health["tts"] = ok(f"loaded {cfg.tts_engine} voice: {cfg.tts_voice}")
         except EngineUnavailable as e:
             self.health["tts"] = disabled() if cfg.tts_engine == "none" else unavailable(str(e))
         except Exception as e:  # noqa: BLE001
@@ -189,6 +192,7 @@ class Service:
             return
         if action == "start_listening":
             if self.player.playing:
+                self._cancel_speech.set()
                 self.player.stop()
             if cmd.get("follow_up"):
                 p.start_listening(timeout_s=FOLLOW_UP_TIMEOUT_S)
@@ -198,6 +202,7 @@ class Service:
             p.stop_listening()
         elif action == "toggle_listening":
             if self.player.playing and p.state != "listening":
+                self._cancel_speech.set()
                 self.player.stop()
             p.toggle_listening()
         elif action == "cancel_listening":
@@ -221,29 +226,66 @@ class Service:
             if self.tts is None:
                 self.emit({"report": "speaking_finished", "utterance_id": uid, "interrupted": True})
                 continue
-            try:
-                sp = self.tts.synthesize(text)
-            except Exception as e:  # noqa: BLE001
-                self.emit({"report": "error", "component": "tts", "message": str(e)})
-                self.emit({"report": "speaking_finished", "utterance_id": uid, "interrupted": True})
-                continue
-            self.emit({"report": "speaking_started", "utterance_id": uid})
-            if self.pipeline:
-                self.pipeline.speaking = True
-            interrupted = True
-            try:
-                interrupted = self.player.play(sp.samples, sp.sample_rate) if self.use_audio else False
-            except AudioError as e:
-                self.emit({"report": "error", "component": "tts", "message": str(e)})
-            finally:
-                if self.pipeline:
-                    self.pipeline.speaking = False
+            interrupted = self._speak_streamed(text, uid)
             self.emit({"report": "speaking_finished", "utterance_id": uid, "interrupted": interrupted})
             # Arc asked something: open the mic for the answer, no wake word needed.
             # Skipped if the user cut the speech off or more speech is queued
             # (the answer would be heard over Arc still talking).
             if listen_after and not interrupted and not self._more_speech_queued():
                 self._ctl.put(("start_listening", {"follow_up": True}))
+
+    def _speak_streamed(self, text: str, uid: str) -> bool:
+        """Speak ``text`` sentence by sentence: sentence N+1 is rendered on a
+        background thread while sentence N plays, so long replies start
+        promptly and flow without gaps. Returns True if interrupted/failed."""
+        sentences = split_sentences(text) or [text]
+        self._cancel_speech.clear()
+        rendered: queue.Queue = queue.Queue(maxsize=2)
+
+        def render() -> None:
+            for s in sentences:
+                if self._cancel_speech.is_set():
+                    break
+                try:
+                    rendered.put(self.tts.synthesize(s))
+                except Exception as e:  # noqa: BLE001
+                    rendered.put(e)
+                    return
+            rendered.put(None)
+
+        threading.Thread(target=render, name="tts-render", daemon=True).start()
+        started = False
+        interrupted = False
+        try:
+            while True:
+                sp = rendered.get()
+                if sp is None:
+                    break
+                if isinstance(sp, Exception):
+                    self.emit({"report": "error", "component": "tts", "message": str(sp)})
+                    interrupted = True
+                    break
+                if self._cancel_speech.is_set():
+                    interrupted = True
+                    break
+                if not started:
+                    started = True
+                    self.emit({"report": "speaking_started", "utterance_id": uid})
+                    if self.pipeline:
+                        self.pipeline.speaking = True
+                try:
+                    if self.use_audio and self.player.play(sp.samples, sp.sample_rate):
+                        interrupted = True
+                        break
+                except AudioError as e:
+                    self.emit({"report": "error", "component": "tts", "message": str(e)})
+                    interrupted = True
+                    break
+        finally:
+            self._cancel_speech.set()  # stop the renderer if we bailed early
+            if self.pipeline:
+                self.pipeline.speaking = False
+        return interrupted
 
     def _more_speech_queued(self) -> bool:
         with self._speech.mutex:
@@ -257,6 +299,7 @@ class Service:
                 break
             if item is not None:
                 self.emit({"report": "speaking_finished", "utterance_id": item[1], "interrupted": True})
+        self._cancel_speech.set()
         self.player.stop()
 
     # -- commands (main thread) -----------------------------------------

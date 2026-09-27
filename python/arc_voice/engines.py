@@ -8,6 +8,7 @@ per-component health instead of crashing.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -139,23 +140,77 @@ class Speech:
     sample_rate: int
 
 
+#: Kokoro v0.19 voice names -> speaker ids (af/am = American, bf/bm = British).
+KOKORO_V019_SPEAKERS = {
+    "af": 0, "af_bella": 1, "af_nicole": 2, "af_sarah": 3, "af_sky": 4, "am_adam": 5,
+    "am_michael": 6, "bf_emma": 7, "bf_isabella": 8, "bm_george": 9, "bm_lewis": 10,
+}
+
+
+def kokoro_speaker_id(speaker: str) -> int:
+    s = speaker.strip().lower()
+    if not s:
+        return 0
+    if s.isdigit():
+        return int(s)
+    if s not in KOKORO_V019_SPEAKERS:
+        raise EngineUnavailable(f"unknown kokoro voice {speaker!r}; one of: {', '.join(KOKORO_V019_SPEAKERS)}")
+    return KOKORO_V019_SPEAKERS[s]
+
+
+_SENTENCE_END = re.compile(r"(?<!%\.)(?<=[.!?…])\s+(?=[A-Z0-9\"'(])")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split a reply into sentences so the first can play while the rest render.
+    Very short fragments are merged into the previous sentence."""
+    parts = [p.strip() for p in _SENTENCE_END.split(text.strip()) if p.strip()]
+    out: list[str] = []
+    for p in parts:
+        if out and len(p) < 12:
+            out[-1] = f"{out[-1]} {p}"
+        else:
+            out.append(p)
+    return out
+
+
 class Tts:
-    """Piper TTS. ``deterministic=True`` disables VITS sampling noise so the
-    same text always yields identical audio (used by tests; slightly flatter
-    prosody, so the service keeps the model defaults)."""
+    """Text to speech via sherpa-onnx.
+
+    * ``piper``: fast VITS voices (one speaker per model).
+    * ``kokoro``: much more natural, conversational prosody; several voices per
+      model, picked with ``tts_speaker``. Slower (~0.5x real time here), so the
+      service renders sentence by sentence and plays each as soon as it's ready.
+
+    ``deterministic=True`` disables VITS sampling noise (tests only).
+    """
 
     def __init__(self, cfg: VoiceConfig, deterministic: bool = False):
         if cfg.tts_engine == "none":
             raise EngineUnavailable("text-to-speech is disabled (voice.tts_engine = none)")
-        if cfg.tts_engine != "piper":
+        if cfg.tts_engine not in ("piper", "kokoro"):
             raise EngineUnavailable(f"tts_engine {cfg.tts_engine!r} is not supported by the voice service yet")
         so = _import_sherpa()
         d = _need(resolve_model(cfg.tts_voice), "TTS voice")
         onnx = sorted(p for p in d.glob("*.onnx"))
         if not onnx:
             raise EngineUnavailable(f"no .onnx voice file in {d}")
-        c = so.OfflineTtsConfig(
-            model=so.OfflineTtsModelConfig(
+        self.sid = 0
+        if cfg.tts_engine == "kokoro":
+            # Prefer the float model: on CPUs without VNNI the int8 build is ~4x slower.
+            model = next((p for p in onnx if ".int8." not in p.name), onnx[0])
+            self.sid = kokoro_speaker_id(cfg.tts_speaker)
+            model_cfg = so.OfflineTtsModelConfig(
+                kokoro=so.OfflineTtsKokoroModelConfig(
+                    model=str(model),
+                    voices=str(_need(d / "voices.bin", "Kokoro voices")),
+                    tokens=str(_need(d / "tokens.txt", "TTS tokens")),
+                    data_dir=str(_need(d / "espeak-ng-data", "espeak-ng data")),
+                ),
+                num_threads=max(1, min(6, (os.cpu_count() or 2) // 2)),
+            )
+        else:
+            model_cfg = so.OfflineTtsModelConfig(
                 vits=so.OfflineTtsVitsModelConfig(
                     model=str(onnx[0]),
                     tokens=str(_need(d / "tokens.txt", "TTS tokens")),
@@ -163,15 +218,14 @@ class Tts:
                     **({"noise_scale": 0.0, "noise_scale_w": 0.0} if deterministic else {}),
                 ),
                 num_threads=_threads(),
-            ),
-            max_num_sentences=1,
-        )
-        self._tts = so.OfflineTts(c)
+            )
+        self._tts = so.OfflineTts(so.OfflineTtsConfig(model=model_cfg, max_num_sentences=1))
+        self.engine = cfg.tts_engine
         self.rate = cfg.speech_rate
         self.volume = cfg.volume
 
     def synthesize(self, text: str) -> Speech:
-        g = self._tts.generate(text, sid=0, speed=self.rate)
+        g = self._tts.generate(text, sid=self.sid, speed=self.rate)
         samples = np.asarray(g.samples, dtype=np.float32) * self.volume
         return Speech(samples, g.sample_rate)
 

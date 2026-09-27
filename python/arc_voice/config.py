@@ -57,8 +57,9 @@ class VoiceConfig:
     kws_threshold: float = 0.25
     stt_engine: str = "moonshine"  # moonshine | whisper | voxtype
     stt_model: str = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
-    tts_engine: str = "piper"  # piper | espeak | none
-    tts_voice: str = "vits-piper-en_GB-alan-medium"
+    tts_engine: str = "piper"  # piper | kokoro | espeak | none
+    tts_voice: str = "vits-piper-en_GB-jenny_dioco-medium"
+    tts_speaker: str = ""  # kokoro voice name ("bf_emma") or id; "" = first
     barge_in: bool = True
     preload: bool = True
     follow_up: bool = True
@@ -78,11 +79,14 @@ class VoiceConfig:
         return cfg
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "VoiceConfig":
-        path = path or config_file()
-        if not path.exists():
+    def load(cls, path=None):
+        p = path
+        if isinstance(p, str):
+            p = Path(p)
+        p = p or cls.config_file()
+        if not p.exists():
             return cls()
-        with path.open("rb") as f:
+        with p.open("rb") as f:
             return cls.from_toml(tomllib.load(f))
 
     def validate(self) -> None:

@@ -12,7 +12,7 @@
 #   ~/.config/systemd/user/{arcd,arc-llm}.service
 #   ~/.config/omarchy/plugins/arc.status        bar widget
 #   ~/.config/arc/config.toml                   only created if missing
-set -euo pipefail
+set -euo pipefailq
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 profile=release bar=1

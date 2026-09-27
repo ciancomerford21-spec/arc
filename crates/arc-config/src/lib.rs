@@ -238,6 +238,9 @@ pub enum SttEngine {
 #[serde(rename_all = "snake_case")]
 pub enum TtsEngine {
     Piper,
+    /// Kokoro-82M: much more natural prosody; several voices per model
+    /// (`tts_speaker`). Needs ~0.5x real time on a 6-core CPU.
+    Kokoro,
     Espeak,
     None,
 }
@@ -289,6 +292,9 @@ pub struct Voice {
     pub stt_model: String,
     pub tts_engine: TtsEngine,
     pub tts_voice: String,
+    /// Speaker within a multi-voice model (Kokoro): a name such as
+    /// "bf_emma" or a numeric id. Empty = the model's first voice.
+    pub tts_speaker: String,
     /// Allow the wake word to interrupt Arc while it is speaking.
     pub barge_in: bool,
     /// Keep models loaded (faster first response, ~300 MB RAM).
@@ -323,7 +329,8 @@ impl Default for Voice {
             stt_engine: SttEngine::Moonshine,
             stt_model: "sherpa-onnx-moonshine-base-en-quantized-2026-02-27".into(),
             tts_engine: TtsEngine::Piper,
-            tts_voice: "vits-piper-en_GB-alan-medium".into(),
+            tts_voice: "vits-piper-en_GB-jenny_dioco-medium".into(),
+            tts_speaker: String::new(),
             barge_in: true,
             preload: true,
             follow_up: true,

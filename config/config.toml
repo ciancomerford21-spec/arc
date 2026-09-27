@@ -115,9 +115,17 @@ kws_threshold = 0.25
 stt_engine = "moonshine"
 # Model directory under ~/.local/share/arc/models (or absolute).
 stt_model = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
-# piper | espeak | none
-tts_engine = "piper"
-tts_voice = "vits-piper-en_GB-jenny_dioco-medium"
+# piper | kokoro | espeak | none
+tts_engine = "kokoro"
+# A model *directory* under ~/.local/share/arc/models; the service picks the
+# best .onnx inside it. Use the float "kokoro-en-v0_19", not the int8 build:
+# on a 6-core Ryzen the int8 model measured 2.8x slower (0.45x vs 1.28x
+# realtime). Piper voices still work by naming one here, e.g.
+# "vits-piper-en_GB-jenny_dioco-medium".
+tts_voice = "kokoro-en-v0_19"
+# Which Kokoro voice: af_bella, af_heart, am_michael, bf_emma, bf_isabella,
+# bm_george, bm_lewis. Ignored by piper, which is one voice per model.
+tts_speaker = "af_bella"
 # Saying the wake word while Arc talks interrupts it.
 barge_in = true
 # Keep speech models in memory (faster, about 300 MB RAM).

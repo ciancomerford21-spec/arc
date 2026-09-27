@@ -2,8 +2,9 @@
 
 Model-backed tests use the real models in ``$ARC_DATA_DIR/models`` (default
 ``~/.local/share/arc/models``) and are skipped when they are missing.
-Utterances are synthesised with the Piper voice and resampled to 16 kHz,
-which makes the STT/VAD tests deterministic without shipping audio files.
+Utterances are synthesised with the configured TTS voice (Kokoro by default)
+and resampled to 16 kHz, which makes the STT/VAD tests deterministic without
+shipping audio files.
 """
 
 from __future__ import annotations

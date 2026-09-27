@@ -57,9 +57,9 @@ class VoiceConfig:
     kws_threshold: float = 0.25
     stt_engine: str = "moonshine"  # moonshine | whisper | voxtype
     stt_model: str = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
-    tts_engine: str = "piper"  # piper | kokoro | espeak | none
-    tts_voice: str = "vits-piper-en_GB-jenny_dioco-medium"
-    tts_speaker: str = ""  # kokoro voice name ("bf_emma") or id; "" = first
+    tts_engine: str = "kokoro"  # piper | kokoro | espeak | none
+    tts_voice: str = "kokoro-en-v0_19"
+    tts_speaker: str = "af_bella"  # kokoro voice name ("bf_emma") or id; "" = first
     barge_in: bool = True
     preload: bool = True
     follow_up: bool = True

@@ -29,9 +29,10 @@ MANIFEST=(
 sherpa-onnx-moonshine-base-en-quantized-2026-02-27/encoder_model.ort=7c66495948d0d08ec1af454cd4b5514862ae6511e94712a60e6d83eaec8dc8cf \
 sherpa-onnx-moonshine-base-en-quantized-2026-02-27/decoder_model_merged.ort=d9d7b333af34bc552580576ddcf248a1c6c839e0d3b43b09afb9376ed009899d \
 sherpa-onnx-moonshine-base-en-quantized-2026-02-27/tokens.txt=2870d843e14c1e187bf1913a521562a63b53933814bd7f2145120468f494a049"
-"vits-piper-en_GB-alan-medium|$BASE/tts-models/vits-piper-en_GB-alan-medium.tar.bz2|tar|\
-vits-piper-en_GB-alan-medium/en_GB-alan-medium.onnx=d907c48857000940104a9ad3248a94617df917d1a525c9495490fdbf87fd54b2 \
-vits-piper-en_GB-alan-medium/tokens.txt=87c8ef66eae5473ed0cc0366b3964c736ca6c5f676c979522ea31234e47430b9"
+"kokoro-en-v0_19|$BASE/tts-models/kokoro-en-v0_19.tar.bz2|tar|\
+kokoro-en-v0_19/model.onnx=10ff414106a038ce7e9e0126c6461e4dc8a86efaa89dc91d2009d69fe635e339 \
+kokoro-en-v0_19/tokens.txt=4f31c71282d14af4e926cd12462078fe9d20d00c589e63fe2750a8f56d6d7f7b \
+kokoro-en-v0_19/voices.bin=a372c67b056ef0b695c375d39b99630d23fb07ad4c8d87aa32a19a62fca523ad"
 )
 
 say() { printf '%s\n' "$*" >&2; }

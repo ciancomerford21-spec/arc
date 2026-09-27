@@ -169,6 +169,7 @@ impl Tools {
         self.register(Arc::new(WorkspaceGoto));
         self.register(Arc::new(WindowList));
         self.register(Arc::new(WindowFocus));
+        self.register(Arc::new(WindowMove));
         self.register(Arc::new(AudioVolumeSet));
         self.register(Arc::new(AudioVolumeMute));
         self.register(Arc::new(AudioVolumeUnmute));
@@ -711,23 +712,100 @@ impl Tool for AppLaunch {
         "app_launch"
     }
     fn description(&self) -> &str {
-        "Launch or focus an application"
+        "Open an installed application by the name the user said (e.g. \"files\", \"VS Code\", \"terminal\", \"foot\"). \
+         Resolves names against installed apps itself and focuses the app if it is already open, so pass the \
+         user's words as-is and call it once. To open it on a specific workspace, pass `workspace`."
     }
     fn parameters(&self) -> Json {
-        serde_json::json!({"type": "object", "properties": {"app": {"type": "string", "description": "Application name or window class"}, "command": {"type": "string", "description": "Optional launch command"}}, "required": ["app"]})
+        serde_json::json!({"type": "object", "properties": {
+            "app": {"type": "string", "description": "App name as the user said it"},
+            "workspace": {"type": "integer", "description": "Optional workspace number to switch to first"}
+        }, "required": ["app"]})
     }
     fn summarize(&self, v: &Json) -> Option<String> {
         s(v, "result").map(|r| format!("{}.", r.trim_end_matches('.')))
     }
     async fn execute(&self, args: &JsonMap) -> ToolResult {
-        let pattern = args.get("app").and_then(|v| v.as_str()).unwrap_or("");
-        let command = args.get("command").and_then(|v| v.as_str()).map(|s| s.to_string());
-        if pattern.is_empty() {
+        let app = args.get("app").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if app.is_empty() {
             return ToolResult::Error("app_launch: need 'app' argument".into());
         }
-        match arc_system::apps::launch(pattern, command.as_deref()).await {
-            Ok(msg) => ToolResult::Ok(serde_json::json!({"result": msg})),
-            Err(e) => ToolResult::Error(format!("failed to launch {pattern}: {e}")),
+        if let Some(ws) = args.get("workspace").and_then(|v| v.as_i64()) {
+            let Some(h) = try_hyprland() else { return ToolResult::Error("Hyprland not available".into()) };
+            if let Err(e) = h.dispatch(&Dispatch::FocusWorkspace(ws.to_string())).await {
+                return ToolResult::Error(format!("failed to switch to workspace {ws}: {e}"));
+            }
+        }
+        match arc_system::apps::launch(&app).await {
+            Ok(l) => ToolResult::Ok(serde_json::json!({"result": l.sentence()})),
+            Err(e) => ToolResult::Error(e.to_string()),
+        }
+    }
+}
+
+struct WindowMove;
+#[async_trait]
+impl Tool for WindowMove {
+    fn name(&self) -> &str {
+        "window_move"
+    }
+    fn description(&self) -> &str {
+        "Move a window to another workspace. Identify the window by app name/class (e.g. \"code\", \"firefox\") \
+         or by address from window_list; omit both to move the focused window."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({"type": "object", "properties": {
+            "workspace": {"type": "integer", "description": "Target workspace number"},
+            "app": {"type": "string", "description": "App name or window class, e.g. \"code\""},
+            "address": {"type": "string", "description": "Window address from window_list"},
+            "follow": {"type": "boolean", "description": "Also switch to that workspace (default false)"}
+        }, "required": ["workspace"]})
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        Some(format!("Moved {} to workspace {}.", s(v, "window")?, v.get("workspace")?))
+    }
+    async fn execute(&self, args: &JsonMap) -> ToolResult {
+        let Some(ws) = args.get("workspace").and_then(|v| v.as_i64()) else {
+            return ToolResult::Error("window_move: need 'workspace'".into());
+        };
+        let follow = args.get("follow").and_then(|v| v.as_bool()).unwrap_or(false);
+        let Some(h) = try_hyprland() else { return ToolResult::Error("Hyprland not available".into()) };
+        let (sel, label) = if let Some(a) = args.get("address").and_then(|v| v.as_str()) {
+            (WindowSel::Address(a.to_string()), a.to_string())
+        } else if let Some(app) = args.get("app").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            let clients = match h.clients().await {
+                Ok(c) => c,
+                Err(e) => return ToolResult::Error(format!("failed to list windows: {e}")),
+            };
+            let want = app.to_lowercase().replace(' ', "");
+            // Match class/title directly, or via the app's resolved desktop entry.
+            let alt = match arc_system::apps::resolve(app) {
+                Some(arc_system::apps::Resolved::Desktop(d)) => vec![d.exe.to_lowercase(), d.id.to_lowercase(), d.wm_class.to_lowercase()],
+                Some(arc_system::apps::Resolved::Exe(e)) => vec![e.to_lowercase()],
+                _ => vec![],
+            };
+            let hit = clients.iter().find(|c| {
+                let class = c.class.to_lowercase();
+                class == want || alt.iter().any(|a| !a.is_empty() && &class == a) || class.contains(&want)
+                    || c.title.to_lowercase().replace(' ', "").contains(&want)
+            });
+            match hit {
+                Some(c) => (WindowSel::Address(c.address.clone()), c.class.clone()),
+                None => {
+                    let open: Vec<&str> = clients.iter().map(|c| c.class.as_str()).collect();
+                    return ToolResult::Error(format!(
+                        "no open window matches \"{app}\". Open windows: {}. Don't guess; ask the user.",
+                        open.join(", ")
+                    ));
+                }
+            }
+        } else {
+            (WindowSel::Active, "the window".to_string())
+        };
+        let d = Dispatch::MoveToWorkspace { window: sel, workspace: ws.to_string(), follow };
+        match h.dispatch(&d).await {
+            Ok(_) => ToolResult::Ok(serde_json::json!({"window": label, "workspace": ws})),
+            Err(e) => ToolResult::Error(format!("failed to move window: {e}")),
         }
     }
 }
@@ -949,6 +1027,7 @@ mod tests {
             "workspace_goto",
             "window_list",
             "window_focus",
+            "window_move",
             "audio_volume_set",
             "audio_volume_mute",
             "audio_volume_unmute",
@@ -1022,7 +1101,7 @@ mod tests {
     #[test]
     fn specs_have_object_schemas() {
         let specs = Tools::new().specs();
-        assert_eq!(specs.len(), 23);
+        assert_eq!(specs.len(), 24);
         assert!(specs.iter().all(|s| s.parameters["type"] == "object"));
     }
 

@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 zbus = { workspace = true }
 sysinfo = { workspace = true }
 strsim = { workspace = true }
+shlex = { workspace = true }
 libc = { workspace = true }
 anyhow = { workspace = true }
 

@@ -449,7 +449,12 @@ fn system_prompt(cfg: &Config) -> String {
          Replies may be spoken aloud: no markdown, no lists unless asked. \
          Use the provided tools to act on the desktop; never claim you did something unless a tool \
          result confirms it. Some actions need the user's confirmation; when a tool result says so, \
-         tell the user what you are waiting for.",
+         tell the user what you are waiting for. \
+         Prefer the dedicated tools (app_launch, window_move, workspace_goto, window_focus) over shell_exec. \
+         If a tool fails, do not keep retrying variations or guessing other apps or commands: \
+         at most one corrected retry, then briefly tell the user what went wrong. \
+         Speech-to-text mishears words; if a request doesn't make sense, ask a short clarifying question \
+         instead of acting. 'Desktop' means workspace.",
         name = cfg.general.name
     );
     if !cfg.personality.custom_prompt.trim().is_empty() {

@@ -72,11 +72,24 @@ impl Agent {
         msgs.extend_from_slice(history);
         msgs.push(AiMessage::user(user));
         let mut actions = vec![];
+        let mut failures = 0u32;
 
         for _ in 0..self.max_rounds {
             let r = self.providers.complete(&msgs, &tools).await?;
             if r.tool_calls.is_empty() {
                 return Ok(AgentReply::Answer { text: r.content, actions });
+            }
+            // Two rounds of failed calls in a row: stop letting the model guess
+            // and have it explain instead (one final call, no tools).
+            if failures >= 2 {
+                msgs.push(AiMessage::assistant(r.content.clone(), vec![]));
+                msgs.push(AiMessage::user(
+                    "[system] Stop calling tools. In one short spoken sentence, tell the user what failed and \
+                     what they could say instead.",
+                ));
+                let r = self.providers.complete(&msgs, &[]).await?;
+                let text = if r.content.trim().is_empty() { "Sorry, I couldn't do that.".into() } else { r.content };
+                return Ok(AgentReply::Answer { text, actions });
             }
             msgs.push(AiMessage::assistant(r.content.clone(), r.tool_calls.clone()));
             let mut held: Option<PendingConfirmation> = None;
@@ -110,6 +123,12 @@ impl Agent {
                 };
                 return Ok(AgentReply::NeedsConfirmation { text, pending, actions });
             }
+            let round_failed = actions
+                .iter()
+                .rev()
+                .take(r.tool_calls.len())
+                .all(|a| !matches!(a.outcome, arc_proto::ActionOutcome::Success));
+            failures = if round_failed { failures + 1 } else { 0 };
         }
         Ok(AgentReply::Answer {
             text: "I stopped after too many steps without finishing. Try asking more specifically.".into(),
@@ -204,5 +223,22 @@ mod tests {
         let AgentReply::Answer { text, .. } = a.ask(&[], "x").await.unwrap() else { panic!() };
         assert!(text.contains("too many steps"));
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_stop_early_with_explanation() {
+        // The model keeps calling a tool that fails; after two failed rounds it must
+        // be asked (without tools) to explain instead of burning every round.
+        let failing = || AiResult { content: String::new(), tool_calls: vec![call("f", "no_such_tool")] };
+        let (a, seen) = agent(
+            vec![failing(), failing(), failing(), AiResult { content: "That app isn't installed.".into(), tool_calls: vec![] }],
+            8,
+        );
+        let AgentReply::Answer { text, actions } = a.ask(&[], "open thunar").await.unwrap() else { panic!() };
+        assert_eq!(text, "That app isn't installed.");
+        assert_eq!(actions.len(), 2, "only two failed rounds executed");
+        assert_eq!(seen.lock().unwrap().len(), 4);
+        let last = seen.lock().unwrap().last().unwrap().clone();
+        assert!(last.last().unwrap().content.contains("Stop calling tools"));
     }
 }

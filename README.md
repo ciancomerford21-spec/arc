@@ -3,6 +3,10 @@
 A local-first voice assistant for Omarchy (Hyprland). Say **"Hey Arc, …"** and it
 controls your desktop, apps, audio, media and system, or just talks.
 
+Nothing leaves the machine. The AI, the speech recognition and the speech
+synthesis are all local by default, and the default configuration has no cloud
+fallback and no cloud phrasing.
+
 ## Install
 
 ```bash
@@ -19,13 +23,17 @@ Everything is per-user; no root. `scripts/uninstall.sh` removes it again
 | Config | `~/.config/arc/config.toml` |
 | API keys | `~/.config/arc/secrets.env` (mode 600, `NAME=value` lines) |
 | Voice venv, models, llama.cpp | `~/.local/share/arc/` |
+| Memory store | `~/.local/share/arc/memory/` |
 | Services | `arcd.service`, `arc-llm.service` (systemd user units) |
 | Bar widget | `~/.config/omarchy/plugins/arc.status` |
 
 ## Using it
 
-- **Voice:** "Hey Arc, what time is it?", "Hey Arc, switch to workspace 3", "Okay Arc, volume 30".
-- **Bar icon:** click to talk, right-click for a live activity log, middle-click to stop speaking.
+- **Voice:** "Hey Arc, switch to workspace 3", "Hey Arc, volume 30".
+- **Bar icon:** left-click opens the panel (live transcript, pending
+  confirmation), right-click starts push-to-talk, middle-click stops speaking.
+- **Panel keys:** `y` / `n` answer a confirmation, `c` clears the transcript,
+  `Esc` closes, `Tab` hands the keyboard back to your window.
 - **Terminal:** `arc ask "open firefox"`, `arc status`, `arc watch`, `arc tools`.
 - **Risky actions** (power, deleting files, shell commands outside the allow-list) ask first:
   answer "yes"/"no" out loud, or `arc confirm` / `arc reject`.
@@ -64,8 +72,10 @@ restarts:
 
 On every reply Arc prepends a `MEMORIZED FACTS` and `RECENT CONVERSATION`
 block to the system prompt, so it can answer "what did I just tell you?" and
-"what editor do I use?" in a session where you never said them. The transcript
-block is capped at the last 24 turns, so the prompt stays bounded.
+"what editor do I use?" in a session where you never said them. Recalled
+content is labelled as unverified history, so Arc does not treat an old
+assistant claim as a current fact. The transcript block is capped at the last
+24 turns (`MAX_TURNS_IN_PROMPT`), so the prompt stays bounded.
 
 You rarely need the CLI, but it's there:
 
@@ -85,13 +95,52 @@ store somewhere else.
 
 ## Language model
 
-Set in `[ai]` of the config: `provider` is tried first, `fallback` if it fails.
+Local by default. `arc-llm.service` runs llama.cpp against the model named in
+`[ai.local]` and the daemon talks to it over `http://127.0.0.1:8765/v1`.
 
-- `openai`: any OpenAI-compatible API. Configured for Groq by default via `[ai.openai]`;
-  the key is read from `GROQ_API_KEY` in the environment or `secrets.env`.
-- `local`: llama.cpp on this machine (`arc-llm.service`, model in `[ai.local]`).
-  Nothing leaves the PC. The installer only enables the service if the config uses it.
-- `anthropic`, `none` (built-in commands only).
+The shipped defaults are `provider = "local"`, `fallback = "none"` and
+`phrasing = "none"`, with Qwen3.5-2B (Q4_K_M) and 30 tools. The same 2B model
+picks tools, reasons and words the final reply.
+
+Cloud providers are still implemented if you want them — set `provider` in
+`[ai]` to one of these:
+
+- `openai`: any OpenAI-compatible API. `[ai.openai]` holds the endpoint and
+  model; the key is read from the variable named in `api_key_env`.
+- `anthropic`: the Messages API.
+- `local`, `none` (built-in commands only).
+
+`phrasing` optionally routes only the final spoken sentence to a second model,
+leaving tool selection and reasoning local. It is off by default, and the
+installer only enables `arc-llm.service` when the config uses `local`.
+
+### A note on the 2B model
+
+Qwen3.5-2B is fast enough for voice, but it is a small model and the tool list
+is long. Two things follow from that, both deliberate:
+
+- **Known commands bypass the model.** "open wikipedia.org" opens the site
+  directly; "google world war two" opens a results page. A dot or a TLD is
+  required, so "open spotify" is still treated as an app request. Anything that
+  asks for an answer ("search X and tell me about it") goes to the model
+  instead, because there is no fetch tool to satisfy it.
+- **The system prompt is short.** A 2B cannot hold a persona alongside 30 tool
+  schemas without losing factual accuracy, so there is no wit or style prompt.
+  `personality` was removed rather than left in the config doing nothing.
+
+## Voice
+
+Under `[voice]`, all local:
+
+| Setting | Default |
+|---|---|
+| `stt_engine` / `stt_model` | `moonshine`, `sherpa-onnx-moonshine-base-en-quantized-2026-02-27` |
+| `tts_engine` | `kokoro` (also `piper`, `espeak`, `none`) |
+| `tts_voice` | `kokoro-en-v0_19` — a model *directory*, not an `.onnx` filename |
+| `tts_speaker` | `af_bella` |
+
+Kokoro is the default in the float build, which benchmarks around 2.8× faster
+than the quantized one on a Ryzen 5 1600 despite the larger file.
 
 ## Troubleshooting
 
@@ -102,13 +151,57 @@ arc status                            # component health
 ARC_VOICE_DEBUG=1 arcd                # log every transcript the mic hears (privacy: includes nearby talk)
 ```
 
+`arc status` reports `voice.tts` as `ok` once the model *loads*. It does not
+play a test clip, so it will happily say `ok` while nothing is audible. If Arc
+is silent, check for a playback process directly:
+
+```bash
+ps -eo args | grep "pw-cat --playback"   # present only while Arc is speaking
+```
+
+If that never appears, the running sidecar is executing stale Python. Restart
+it — `scripts/deploy-voice.sh` overwrites the package in
+`~/.local/share/arc/python/` and Python does not reload modules in a live
+process:
+
+```bash
+systemctl --user restart arcd
+```
+
 If the wake word isn't picked up, run with `ARC_VOICE_DEBUG=1` and look at how
 the recogniser spells "Arc"; add that spelling to `name_variants` under `[general]`.
+
+## Omarchy integration
+
+The bar widget is a normal third-party Omarchy plugin, so it can be removed
+without touching anything else:
+
+```bash
+rm -rf ~/.config/omarchy/plugins/arc.status
+omarchy-shell shell rescanPlugins
+```
+
+Its source is `integrations/omarchy-bar/arc.status/`, and `install.sh` copies
+it into place. Arc's services stay systemd units: the shell can crash and
+restart without taking your voice assistant down, and the assistant keeps
+talking when the shell is gone.
+
+`integrations/waybar/` holds an older Waybar status bar for people not running
+Omarchy. It is not installed by `scripts/install.sh`.
 
 ## Development
 
 ```bash
-cargo test -- --test-threads=1
-~/.local/share/arc/venv/bin/python -m pytest python/tests
-scripts/voice-live.sh                 # live mic test on a private socket
+cargo test                             # 198 tests
+~/.local/share/arc/venv/bin/python -m pytest python/tests   # 67 tests
+scripts/voice-live.sh                  # live mic test on a private socket
+scripts/daemon-smoke.sh                # exercise the daemon end to end
 ```
+
+The workspace is eleven crates: `arc-proto`, `arc-config`, `arc-security`,
+`arc-hyprland`, `arc-system`, `arc-tools`, `arc-ai`, `arc-core`, `arc-memory`,
+`arc-daemon`, `arc-cli`.
+
+A test asserts that the shipped `config/config.toml` matches the code defaults
+and that it contains no key the code does not recognise, so a setting that
+stops being read fails the build rather than sitting there quietly.

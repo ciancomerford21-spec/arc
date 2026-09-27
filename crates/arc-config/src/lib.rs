@@ -45,7 +45,6 @@ pub struct Config {
     pub voice: Voice,
     pub ui: Ui,
     pub bar: Bar,
-    pub hotkeys: Hotkeys,
     pub permissions: Permissions,
     pub apps: Apps,
     pub files: Files,
@@ -63,8 +62,6 @@ pub struct General {
     /// Names the assistant answers to at the start of an utterance, as the
     /// speech recogniser tends to spell them ("arc", "ark").
     pub name_variants: Vec<String>,
-    /// Conversation context (for "close that", follow-ups) expires after this.
-    pub conversation_timeout_s: u64,
 }
 
 impl Default for General {
@@ -72,30 +69,12 @@ impl Default for General {
         Self {
             name: "Arc".into(),
             name_variants: vec!["arc".into(), "ark".into()],
-            conversation_timeout_s: 300,
         }
     }
 }
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PersonalityStyle {
-    /// Short, calm, factual. Occasional dry wit.
-    Concise,
-    /// Same brevity, more frequent dry remarks.
-    Witty,
-    /// Strictly professional, no remarks.
-    Formal,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Personality {
-    /// Unused. A 2B model cannot hold a persona alongside 30 tool schemas
-    /// without losing factual accuracy, so no prompt is built from this.
-    pub style: PersonalityStyle,
-    /// Unused; see `style`. Kept so existing config files still parse.
-    pub wit: f32,
     /// Extra instructions appended to the language-model system prompt.
     pub custom_prompt: String,
     /// How Arc addresses the user ("" = no form of address).
@@ -105,8 +84,6 @@ pub struct Personality {
 impl Default for Personality {
     fn default() -> Self {
         Self {
-            style: PersonalityStyle::Concise,
-            wit: 0.25,
             custom_prompt: String::new(),
             user_title: String::new(),
         }
@@ -137,12 +114,6 @@ pub struct Ai {
     pub timeout_s: u64,
     /// Maximum model→tool→model rounds per request.
     pub max_tool_rounds: u32,
-    /// Include a compact desktop snapshot (workspace, windows) in prompts.
-    pub send_desktop_context: bool,
-    /// Include remembered facts in prompts.
-    pub send_memory: bool,
-    /// Send a warm-up request at start so the first real request is fast.
-    pub warm_up: bool,
     /// Model used only to word the final spoken reply. "none" (the default)
     /// means the tool-calling model also writes the reply, as before.
     pub phrasing: ProviderKind,
@@ -163,9 +134,6 @@ impl Default for Ai {
             max_tokens: 400,
             timeout_s: 45,
             max_tool_rounds: 4,
-            send_desktop_context: true,
-            send_memory: true,
-            warm_up: true,
             phrasing: ProviderKind::None,
             phrasing_enabled: false,
             local: LocalAi::default(),
@@ -348,16 +316,6 @@ impl Default for Voice {
         }
     }
 }
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UiTheme {
-    /// Follow the active Omarchy theme (live).
-    Omarchy,
-    Dark,
-    Light,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UiPosition {
@@ -369,34 +327,21 @@ pub enum UiPosition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Ui {
-    pub theme: UiTheme,
     /// Accent colour override ("" = theme accent).
     pub accent: String,
     /// Background opacity (0.5 - 1.0).
     pub opacity: f32,
     pub position: UiPosition,
-    /// Pop up the overlay automatically while Arc listens/thinks/speaks.
-    pub auto_show: bool,
-    /// Hide the overlay this long after the last reply (0 = never).
-    pub auto_hide_s: u32,
-    pub show_waveform: bool,
     pub width: u32,
-    /// Font family for the UI ("" = GTK default).
-    pub font: String,
 }
 
 impl Default for Ui {
     fn default() -> Self {
         Self {
-            theme: UiTheme::Omarchy,
             accent: String::new(),
             opacity: 0.92,
             position: UiPosition::Top,
-            auto_show: true,
-            auto_hide_s: 7,
-            show_waveform: true,
             width: 560,
-            font: String::new(),
         }
     }
 }
@@ -406,34 +351,15 @@ impl Default for Ui {
 pub struct Bar {
     /// Write status for the Omarchy bar widget / Waybar module.
     pub enabled: bool,
-    /// Include CPU and RAM in the bar tooltip (samples /proc every 5 s).
-    pub show_resources: bool,
-    pub show_workspace: bool,
 }
 
 impl Default for Bar {
     fn default() -> Self {
-        Self { enabled: true, show_resources: true, show_workspace: true }
+        Self { enabled: true }
     }
 }
 
-/// Hyprland keybindings written to ~/.config/hypr/arc.lua by the installer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct Hotkeys {
-    /// Tap to talk (listens until you stop speaking; tap again to stop).
-    pub talk: String,
-    /// Toggle the Arc panel.
-    pub panel: String,
-    /// Stop speaking / cancel.
-    pub cancel: String,
-}
 
-impl Default for Hotkeys {
-    fn default() -> Self {
-        Self { talk: "SUPER + A".into(), panel: "SUPER CTRL ALT + A".into(), cancel: "SUPER ALT + A".into() }
-    }
-}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -507,18 +433,6 @@ pub struct Apps {
     /// Spoken name → desktop id, executable, or role ("browser", "terminal",
     /// "editor", "files"). Roles resolve through the system defaults.
     pub aliases: BTreeMap<String, String>,
-    /// Focus an already-open window instead of launching a second instance.
-    pub focus_existing: bool,
-    /// Apps that always open a new instance.
-    pub always_new: Vec<String>,
-    /// Seconds to wait for a launched app's window before reporting failure.
-    pub launch_timeout_s: u64,
-    /// Directories searched by "open my <name> project".
-    pub project_dirs: Vec<String>,
-    /// How projects open: "editor", "terminal", "files", or a command with {path}.
-    pub project_open_with: String,
-    /// Move windows to the target workspace without following them.
-    pub move_silently: bool,
 }
 
 impl Default for Apps {
@@ -536,12 +450,6 @@ impl Default for Apps {
         aliases.insert("task manager".into(), "btop".into());
         Self {
             aliases,
-            focus_existing: true,
-            always_new: vec!["kitty".into(), "alacritty".into(), "foot".into(), "ghostty".into()],
-            launch_timeout_s: 12,
-            project_dirs: vec!["~/Projects".into(), "~/Work".into(), "~/Documents".into(), "~".into()],
-            project_open_with: "editor".into(),
-            move_silently: true,
         }
     }
 }
@@ -553,10 +461,6 @@ pub struct Files {
     pub allowed_roots: Vec<String>,
     /// Never read, list, move or open these (also hidden from search results).
     pub sensitive_paths: Vec<String>,
-    /// Delete moves to the trash; permanent deletion is always "dangerous".
-    pub use_trash: bool,
-    pub max_search_results: usize,
-    pub max_search_depth: usize,
 }
 
 impl Default for Files {
@@ -578,9 +482,6 @@ impl Default for Files {
                 "~/.netrc".into(),
                 "~/.hermes/.env".into(),
             ],
-            use_trash: true,
-            max_search_results: 50,
-            max_search_depth: 6,
         }
     }
 }
@@ -590,15 +491,11 @@ impl Default for Files {
 pub struct Web {
     /// Search URL opened in the browser; `{query}` is replaced (URL-encoded).
     pub search_url: String,
-    /// Allow Arc to fetch search result snippets to answer questions
-    /// (sends the query to DuckDuckGo).
-    pub allow_lookup: bool,
-    pub lookup_results: usize,
 }
 
 impl Default for Web {
     fn default() -> Self {
-        Self { search_url: "https://duckduckgo.com/?q={query}".into(), allow_lookup: true, lookup_results: 5 }
+        Self { search_url: "https://duckduckgo.com/?q={query}".into() }
     }
 }
 
@@ -606,15 +503,11 @@ impl Default for Web {
 #[serde(default)]
 pub struct Memory {
     pub enabled: bool,
-    /// Refuse to store things that look like passwords, keys or card numbers.
-    pub block_sensitive: bool,
-    /// Max remembered facts included in prompts.
-    pub max_prompt_entries: usize,
 }
 
 impl Default for Memory {
     fn default() -> Self {
-        Self { enabled: true, block_sensitive: true, max_prompt_entries: 40 }
+        Self { enabled: true }
     }
 }
 
@@ -626,13 +519,11 @@ pub struct Logging {
     /// Log full model requests/responses (may include window titles and
     /// file names; never includes API keys).
     pub log_ai_payloads: bool,
-    /// Log files kept (one per day).
-    pub keep_days: usize,
 }
 
 impl Default for Logging {
     fn default() -> Self {
-        Self { level: "info".into(), log_ai_payloads: false, keep_days: 7 }
+        Self { level: "info".into(), log_ai_payloads: false }
     }
 }
 
@@ -737,7 +628,6 @@ pub fn validate(c: &Config) -> Result<Vec<String>, ConfigError> {
     range("voice.max_utterance_s", c.voice.max_utterance_s, 2.0, 60.0);
     range("voice.no_speech_timeout_s", c.voice.no_speech_timeout_s, 1.0, 30.0);
     range("ai.temperature", c.ai.temperature, 0.0, 2.0);
-    range("personality.wit", c.personality.wit, 0.0, 1.0);
     range("ui.opacity", c.ui.opacity, 0.5, 1.0);
     if !(150..=5000).contains(&c.voice.end_silence_ms) {
         errors.push(format!("voice.end_silence_ms = {} is outside 150..=5000", c.voice.end_silence_ms));

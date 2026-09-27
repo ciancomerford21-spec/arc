@@ -14,17 +14,6 @@ name = "Arc"
 # How the speech recogniser spells the name at the start of an utterance.
 name_variants = ["arc", "ark"]
 # Follow-ups like "close that" refer to the previous request for this long.
-conversation_timeout_s = 300
-
-[personality]
-# concise | witty | formal
-style = "concise"
-# Chance (0-1) of a light remark where one fits. Information always comes first.
-wit = 0.25
-# Extra instructions for the language model, e.g. "Use metric units."
-custom_prompt = ""
-# How Arc addresses you ("" = it doesn't).
-user_title = ""
 
 [ai]
 # local | openai | anthropic | none
@@ -41,11 +30,8 @@ timeout_s = 45
 # Maximum model -> tool -> model rounds for one request.
 max_tool_rounds = 4
 # Send a compact desktop snapshot (workspace, window titles) with requests.
-send_desktop_context = true
 # Send remembered facts (see `arc memory`) with requests.
-send_memory = true
 # Load the model when Arc starts so the first request is fast.
-warm_up = true
 
 # Rewrite the final reply with a second, more conversational model before it
 # is spoken. The primary model above still does all the tool calling and
@@ -138,36 +124,20 @@ voice_confirm_dangerous = false
 
 [ui]
 # omarchy (follow the current Omarchy theme) | dark | light
-theme = "omarchy"
 # Accent override, e.g. "#7aa2f7" ("" = theme accent).
 accent = ""
 opacity = 0.92
 # top | center | bottom
 position = "top"
 # Show the overlay while Arc listens, thinks or speaks.
-auto_show = true
 # Hide it this many seconds after the last reply (0 = keep open).
-auto_hide_s = 7
-show_waveform = true
 width = 560
 # Font family ("" = GTK default).
-font = ""
 
 [bar]
 # Publish status for the Omarchy bar widget / Waybar module.
 enabled = true
 # CPU and RAM in the tooltip (sampled every 5 s while enabled).
-show_resources = true
-show_workspace = true
-
-[hotkeys]
-# Written to ~/.config/hypr/arc.lua by `arc setup hyprland` (and the installer).
-# Tap to talk; hold to talk until you release.
-talk = "SUPER + A"
-# Show or hide the Arc panel.
-panel = "SUPER CTRL ALT + A"
-# Stop speaking / cancel listening.
-cancel = "SUPER ALT + A"
 
 [permissions]
 # Lowest risk level that needs your confirmation: safe | caution | dangerous
@@ -196,17 +166,11 @@ max_output_bytes = 16384
 
 [apps]
 # Focus an open window of the app instead of starting a second one.
-focus_existing = true
 # Apps that always open a new instance.
-always_new = ["kitty", "alacritty", "foot", "ghostty"]
 # Seconds to wait for a launched app's window before reporting a problem.
-launch_timeout_s = 12
 # Searched by "open my <name> project".
-project_dirs = ["~/Projects", "~/Work", "~/Documents", "~"]
 # editor | terminal | files | a command containing {path}
-project_open_with = "editor"
 # Move windows to other workspaces without following them.
-move_silently = true
 
 [apps.aliases]
 # Spoken name = desktop id, command, or role:browser/terminal/editor/files
@@ -241,24 +205,17 @@ sensitive_paths = [
   "~/.hermes/.env",
 ]
 # "Delete" moves to the trash. Permanent deletion is always DANGEROUS.
-use_trash = true
-max_search_results = 50
-max_search_depth = 6
 
 [web]
 # Opened in your browser for "search the web for ...".
 search_url = "https://duckduckgo.com/?q={query}"
 # Let Arc fetch search snippets to answer questions itself (sends the query
 # to DuckDuckGo; nothing else leaves the machine).
-allow_lookup = true
-lookup_results = 5
 
 [memory]
 enabled = true
 # Refuse to remember things that look like passwords, keys or card numbers.
-block_sensitive = true
 # Remembered facts included with each language-model request.
-max_prompt_entries = 40
 
 [logging]
 # error | warn | info | debug | trace (or a tracing filter like "arc_core=debug,info")
@@ -266,7 +223,6 @@ level = "info"
 # Log full language-model requests/responses (window titles, file names).
 log_ai_payloads = false
 # Daily log files kept in ~/.local/state/arc/logs.
-keep_days = 7
 
 [tools]
 # Tools to disable: exact names ("shell.run") or categories ("files.*").

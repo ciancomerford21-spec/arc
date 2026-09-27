@@ -9,7 +9,7 @@
 #   ~/.local/bin/{arc,arcd}                     binaries
 #   ~/.local/share/arc/python/arc_voice         voice sidecar (venv + models already in ~/.local/share/arc)
 #   ~/.local/share/arc/bin/arc-llm              llama-server launcher
-#   ~/.config/systemd/user/{arcd,arc-llm,arc-ui}.service
+#   ~/.config/systemd/user/{arcd,arc-llm}.service
 #   ~/.config/omarchy/plugins/arc.status        bar widget
 #   ~/.config/arc/config.toml                   only created if missing
 set -euo pipefailq
@@ -39,30 +39,15 @@ for c in cargo pw-cat; do command -v "$c" >/dev/null || { echo "missing: $c" >&2
 "$root/scripts/fetch-models.sh" --verify >/dev/null || { echo "voice models missing: run scripts/fetch-models.sh" >&2; exit 1; }
 
 step "Building ($profile)"
-# The GTK panel is optional: it needs gtk4 and gtk4-layer-shell, which are a
-# much heavier dependency than the daemon, so a missing system GTK must not
-# fail the whole install.
-build_ui=1
-if ! pkg-config --exists gtk4 2>/dev/null; then
-    echo "  gtk4 not found; skipping the arc-ui panel" >&2
-    build_ui=0
-fi
-pkgs="-p arc-daemon -p arc-cli"
-[[ $build_ui == 1 ]] && pkgs="$pkgs -p arc-ui"
 if [[ $profile == release ]]; then
-    # shellcheck disable=SC2086
-    cargo build --release --manifest-path "$root/Cargo.toml" $pkgs
+    cargo build --release --manifest-path "$root/Cargo.toml" -p arc-daemon -p arc-cli
 else
-    # shellcheck disable=SC2086
-    cargo build --manifest-path "$root/Cargo.toml" $pkgs
+    cargo build --manifest-path "$root/Cargo.toml" -p arc-daemon -p arc-cli
 fi
 
 step "Installing files"
 install -Dm755 "$root/target/$profile/arcd" "$bin/arcd"
 install -Dm755 "$root/target/$profile/arc" "$bin/arc"
-if [[ $build_ui == 1 ]]; then
-    install -Dm755 "$root/target/$profile/arc-ui" "$bin/arc-ui"
-fi
 install -Dm755 "$root/scripts/arc-llm.sh" "$data/bin/arc-llm"
 rm -rf "$data/python/arc_voice"
 mkdir -p "$data/python"
@@ -81,9 +66,6 @@ fi
 
 install -Dm644 "$root/systemd/arcd.service" "$units/arcd.service"
 install -Dm644 "$root/systemd/arc-llm.service" "$units/arc-llm.service"
-if [[ $build_ui == 1 ]]; then
-    install -Dm644 "$root/systemd/arc-ui.service" "$units/arc-ui.service"
-fi
 
 step "Starting services"
 systemctl --user daemon-reload
@@ -95,11 +77,6 @@ else
 fi
 systemctl --user enable arcd.service
 systemctl --user restart arcd.service
-if [[ $build_ui == 1 ]]; then
-    systemctl --user enable --now arc-ui.service
-else
-    echo "   panel not built; arc-ui.service not installed"
-fi
 
 for _ in $(seq 40); do "$bin/arc" ping >/dev/null 2>&1 && break; sleep 0.25; done
 "$bin/arc" ping || { echo "arcd did not come up; see: journalctl --user -u arcd -e" >&2; exit 1; }

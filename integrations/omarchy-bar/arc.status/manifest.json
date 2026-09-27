@@ -4,18 +4,39 @@
   "name": "Arc",
   "version": "0.1.0",
   "author": "Arc",
-  "description": "Arc voice assistant status. Click: talk. Right-click: activity log. Middle-click: stop speaking.",
+  "description": "Arc voice assistant. Click: open the panel (live transcript and confirmations). Right-click: talk. Middle-click: stop speaking.",
   "kinds": [
     "bar-widget"
   ],
   "entryPoints": {
-    "barWidget": "BarWidget.qml"
+    "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Arc assistant",
-    "description": "Arc state (idle / listening / thinking / speaking); click to talk",
+    "description": "Arc state, live transcript, and confirmation for held actions",
     "category": "Assistant",
     "allowMultiple": false,
-    "defaultSection": "right"
+    "defaultSection": "right",
+    "defaults": {
+      "hideWhenOffline": false,
+      "historyLines": 40
+    },
+    "schema": [
+      {
+        "key": "hideWhenOffline",
+        "type": "boolean",
+        "label": "Hide when the daemon is offline",
+        "defaultValue": false
+      },
+      {
+        "key": "historyLines",
+        "type": "integer",
+        "label": "Transcript lines to keep",
+        "min": 4,
+        "max": 200,
+        "step": 4,
+        "defaultValue": 40
+      }
+    ]
   }
 }

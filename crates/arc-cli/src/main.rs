@@ -72,7 +72,7 @@ enum Cmd {
         #[arg(trailing_var_arg = true)]
         arg: Vec<String>,
     },
-    /// Show / hide the Arc panel (starts `arc-ui` if it isn't running).
+    /// Show the Arc panel (the Omarchy bar widget's popover).
     Panel {
         #[arg(long)]
         toggle: bool,
@@ -162,6 +162,15 @@ fn offline_bar(waybar_fmt: bool) -> Value {
 /// allowed: the user is at the keyboard).
 fn resolve_latest(conn: &mut Conn, approve: bool) -> Result<Value> {
     conn.call(json!({"type": "ask", "text": if approve { "yes" } else { "no" }, "source": "ui"}))
+}
+
+/// Is `name` an executable on PATH? Used to pick a shell entry point without
+/// assuming which of them is installed.
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
 }
 
 fn main() -> Result<()> {
@@ -357,22 +366,35 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Panel { toggle } => {
-            // arc-ui is a single-instance GApplication: launching it again
-            // activates the running instance, which toggles visibility.
-            let ui = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("arc-ui")))
-                .filter(|p| p.exists())
-                .unwrap_or_else(|| PathBuf::from("arc-ui"));
-            let mut cmd = std::process::Command::new(&ui);
-            if toggle {
-                cmd.arg("--toggle");
+            // The panel is the Omarchy bar widget's popover, not a separate
+            // process: `omarchy-launch-or-focus-tui` brings up the shell's own
+            // surface. With no widget running there is nothing to show, so say
+            // so rather than spawning a binary that no longer exists.
+            let _ = toggle;
+            let candidates = [
+                "omarchy-launch-or-focus-tui",
+                "quickshell",
+            ];
+            let mut launched = false;
+            for exe in candidates {
+                if which(exe).is_none() {
+                    continue;
+                }
+                let mut cmd = std::process::Command::new(exe);
+                if exe == "omarchy-launch-or-focus-tui" {
+                    cmd.args(["--", "qs", "-c", "arc.panel"]);
+                }
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .with_context(|| format!("cannot start {exe}"))?;
+                launched = true;
+                break;
             }
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .with_context(|| format!("cannot start {}", ui.display()))?;
+            if !launched {
+                eprintln!("the Arc panel is part of the Omarchy bar widget; is the shell running?");
+            }
         }
     }
     Ok(())

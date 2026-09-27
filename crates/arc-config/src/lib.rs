@@ -141,6 +141,12 @@ pub struct Ai {
     pub send_memory: bool,
     /// Send a warm-up request at start so the first real request is fast.
     pub warm_up: bool,
+    /// Model used only to word the final spoken reply. "none" (the default)
+    /// means the tool-calling model also writes the reply, as before.
+    pub phrasing: ProviderKind,
+    /// Rewrites the final reply before it is spoken. Off means replies are
+    /// passed through untouched, which costs nothing.
+    pub phrasing_enabled: bool,
     pub local: LocalAi,
     pub openai: RemoteAi,
     pub anthropic: RemoteAi,
@@ -158,6 +164,8 @@ impl Default for Ai {
             send_desktop_context: true,
             send_memory: true,
             warm_up: true,
+            phrasing: ProviderKind::None,
+            phrasing_enabled: false,
             local: LocalAi::default(),
             openai: RemoteAi {
                 base_url: "https://api.openai.com/v1".into(),

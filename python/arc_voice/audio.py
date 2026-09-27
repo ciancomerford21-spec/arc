@@ -201,7 +201,10 @@ class Player:
                 raise AudioError("pw-cat/pw-play not found (install pipewire)")
             self._proc = subprocess.Popen(
                 [exe, "--playback", "--raw", "--rate", str(self._rate), "--channels", "1", "--format", "f32",
-                 *_target_args(self.device), "-"],
+                 # A small latency is essential: with pw-cat's default buffer,
+                 # the next sentence is queued into PipeWire while the current
+                 # one is still draining, and the two play over each other.
+                 "--latency", "40ms", *_target_args(self.device), "-"],
                 stdin=subprocess.PIPE, bufsize=0,
             )
             return self._proc
@@ -247,18 +250,20 @@ class Player:
                     if self._interrupted:
                         return True
                     raise AudioError(f"pw-cat stdin failed: {e}") from e
-            # pw-cat exits once it has played everything written to stdin, so
-            # the exit is the accurate "finished" signal. Wait for the
-            # duration (plus slack) so sentences don't overlap.
-            wait = samples.size / float(rate) + 0.35
-            deadline = time.monotonic() + wait
+            # pw-cat keeps running while its stdin is open (we reuse the stream
+            # across sentences), so waiting for it to exit would never work.
+            # Instead wait for the clip's own duration: the samples are
+            # written before we get here, and PipeWire plays them at real-time
+            # rate, so duration + a small drain margin is the finish line.
+            # The margin is deliberately small — a large one leaves audible
+            # dead air between sentences, which reads as a stutter.
+            limit = samples.size / float(rate) + 0.12
+            deadline = time.monotonic() + limit
             while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    break
                 if self._interrupted:
                     self._close_stream()
                     return True
-                time.sleep(0.02)
+                time.sleep(0.01)
             return self._interrupted
         except (OSError, BrokenPipeError) as e:
             raise AudioError(f"pw-cat failed: {e}") from e

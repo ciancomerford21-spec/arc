@@ -47,6 +47,15 @@ send_memory = true
 # Load the model when Arc starts so the first request is fast.
 warm_up = true
 
+# Rewrite the final reply with a second, more conversational model before it
+# is spoken. The primary model above still does all the tool calling and
+# system work; this only words the result. Off by default — it costs one
+# extra request per reply.
+#   phrasing = "openai"    # local | openai | anthropic | none
+#   phrasing_enabled = false
+phrasing = "none"
+phrasing_enabled = false
+
 [ai.local]
 endpoint = "http://127.0.0.1:8765/v1"
 model = "Qwen3.5-2B (Q4_K_M)"

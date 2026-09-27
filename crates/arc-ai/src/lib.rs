@@ -382,15 +382,62 @@ impl Provider for AnthropicProvider {
 pub struct ProviderSet {
     primary: Box<dyn Provider>,
     fallback: Option<Box<dyn Provider>>,
+    /// Optional model used only to word the final spoken reply, once the
+    /// tool-calling model has finished acting. Lets a cheap local model do
+    /// system work while a stronger model does the talking.
+    phrasing: Option<Box<dyn Provider>>,
 }
 
 impl ProviderSet {
     pub fn new(primary: Box<dyn Provider>, fallback: Option<Box<dyn Provider>>) -> Self {
-        Self { primary, fallback }
+        Self { primary, fallback, phrasing: None }
+    }
+
+    /// Attach a separate model for final replies.
+    pub fn with_phrasing(mut self, phrasing: Box<dyn Provider>) -> Self {
+        self.phrasing = Some(phrasing);
+        self
     }
 
     pub fn primary_name(&self) -> &str {
         self.primary.name()
+    }
+
+    /// Name of the phrasing model, if one is configured.
+    pub fn phrasing_name(&self) -> Option<&str> {
+        self.phrasing.as_ref().map(|p| p.name())
+    }
+
+    /// Word a final reply with the phrasing model, falling back to the
+    /// tool-calling model's own answer if that fails.
+    ///
+    /// `result` is what the acting model produced; it is passed through
+    /// unchanged when there is nothing to improve, so a failure here never
+    /// costs the user their answer.
+    pub async fn phrase(&self, messages: &[AiMessage], result: &str) -> String {
+        let Some(phraser) = &self.phrasing else {
+            return result.to_string();
+        };
+        // Nothing to reword: an empty or very short answer is usually an
+        // error path ("Cancelled.") that should be spoken verbatim.
+        if result.trim().is_empty() || result.chars().count() < 12 {
+            return result.to_string();
+        }
+        let mut msgs = messages.to_vec();
+        msgs.push(AiMessage::assistant(result.to_string(), vec![]));
+        msgs.push(AiMessage::user(
+            "[system] That reply was produced by an assistant acting on a Linux desktop, and it will be \
+             SPOKEN ALOUD. Rewrite it as natural spoken English in one or two short sentences: no markdown, \
+             no lists, no tool names, no filler like 'Certainly' or 'It looks like'. Keep every fact and \
+             any question exactly as it is. Reply with the rewritten text only.",
+        ));
+        match phraser.complete(&msgs, &[]).await {
+            Ok(r) if !r.content.trim().is_empty() => r.content.trim().to_string(),
+            Ok(_) | Err(_) => {
+                tracing::warn!(provider = %phraser.name(), "phrasing model failed; using the raw reply");
+                result.to_string()
+            }
+        }
     }
 
     pub async fn complete(&self, messages: &[AiMessage], tools: &[ToolDef]) -> Result<AiResult, AiError> {
@@ -472,7 +519,24 @@ pub fn from_config(config: &arc_config::Ai) -> Result<ProviderSet, AiError> {
         k if k == config.provider => None,
         k => Some(make(k)?),
     };
-    Ok(ProviderSet { primary, fallback })
+    // The phrasing model may double as the primary (e.g. local does the tools
+    // and the same strong cloud model does the talking), so reuse it rather
+    // than opening a second connection.
+    let phrasing = if !config.phrasing_enabled || config.phrasing == ProviderKind::None {
+        None
+    } else if config.phrasing == config.provider {
+        tracing::info!("phrasing model is the primary; reusing the primary connection");
+        None
+    } else {
+        match make(config.phrasing) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(error = %e, "phrasing model unavailable; replies will not be reworded");
+                None
+            }
+        }
+    };
+    Ok(ProviderSet { primary, fallback, phrasing })
 }
 
 // ---------------------------------------------------------------------------

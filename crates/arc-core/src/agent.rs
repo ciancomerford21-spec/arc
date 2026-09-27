@@ -77,7 +77,11 @@ impl Agent {
         for _ in 0..self.max_rounds {
             let r = self.providers.complete(&msgs, &tools).await?;
             if r.tool_calls.is_empty() {
-                return Ok(AgentReply::Answer { text: r.content, actions });
+                // Reword only a real answer. Confirmation prompts are built
+                // below and spoken verbatim, and a failed round should not be
+                // dressed up before the user is told what went wrong.
+                let text = self.providers.phrase(&msgs, &r.content).await;
+                return Ok(AgentReply::Answer { text, actions });
             }
             // Two rounds of failed calls in a row: stop letting the model guess
             // and have it explain instead (one final call, no tools).
@@ -170,10 +174,112 @@ mod tests {
     }
 
     fn agent(replies: Vec<AiResult>, rounds: u32) -> (Agent, Arc<Mutex<Vec<Vec<AiMessage>>>>) {
+        agent_with(replies, rounds, None)
+    }
+
+    fn agent_with(
+        replies: Vec<AiResult>,
+        rounds: u32,
+        phrasing: Option<Box<dyn Provider>>,
+    ) -> (Agent, Arc<Mutex<Vec<Vec<AiMessage>>>>) {
         let seen = Arc::new(Mutex::new(vec![]));
         let p = Scripted { replies: Mutex::new(replies), seen: seen.clone() };
         let gate = Arc::new(Gate::new(Arc::new(Tools::new()), &Config::default()));
-        (Agent::new(ProviderSet::new(Box::new(p), None), gate, "sys".into(), rounds), seen)
+        let set = ProviderSet::new(Box::new(p), None);
+        let set = match phrasing {
+            Some(ph) => set.with_phrasing(ph),
+            None => set,
+        };
+        (Agent::new(set, gate, "sys".into(), rounds), seen)
+    }
+
+    /// A phrasing provider that always returns the same rewrite.
+    struct Fixed(&'static str);
+
+    #[async_trait]
+    impl Provider for Fixed {
+        fn name(&self) -> &str {
+            "phraser"
+        }
+        async fn complete(&self, _: &[AiMessage], _: &[ToolDef]) -> Result<AiResult, AiError> {
+            Ok(AiResult { content: self.0.into(), tool_calls: vec![] })
+        }
+    }
+
+    /// A phrasing provider that always fails, to check the answer survives.
+    struct Broken;
+
+    #[async_trait]
+    impl Provider for Broken {
+        fn name(&self) -> &str {
+            "broken"
+        }
+        async fn complete(&self, _: &[AiMessage], _: &[ToolDef]) -> Result<AiResult, AiError> {
+            Err(AiError::Network("down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn final_answer_is_reworded_by_the_phrasing_model() {
+        let (a, _) = agent_with(
+            vec![AiResult { content: "Volume has been set to 40 percent successfully.".into(), tool_calls: vec![] }],
+            4,
+            Some(Box::new(Fixed("Set it to forty."))),
+        );
+        let AgentReply::Answer { text, .. } = a.ask(&[], "set volume 40").await.unwrap() else { panic!() };
+        assert_eq!(text, "Set it to forty.");
+    }
+
+    #[tokio::test]
+    async fn phrasing_failure_keeps_the_original_answer() {
+        // The phraser is an enhancement; losing it must never lose the reply.
+        let (a, _) = agent_with(
+            vec![AiResult { content: "Memory usage is at sixty two percent.".into(), tool_calls: vec![] }],
+            4,
+            Some(Box::new(Broken)),
+        );
+        let AgentReply::Answer { text, .. } = a.ask(&[], "memory?").await.unwrap() else { panic!() };
+        assert_eq!(text, "Memory usage is at sixty two percent.");
+    }
+
+    #[tokio::test]
+    async fn short_replies_are_not_reworded() {
+        // "Cancelled." and similar are built elsewhere or are error paths;
+        // rewording them would be noise.
+        let (a, _) = agent_with(
+            vec![AiResult { content: "Done.".into(), tool_calls: vec![] }],
+            4,
+            Some(Box::new(Fixed("something else entirely"))),
+        );
+        let AgentReply::Answer { text, .. } = a.ask(&[], "mute").await.unwrap() else { panic!() };
+        assert_eq!(text, "Done.");
+    }
+
+    #[tokio::test]
+    async fn confirmation_prompts_are_not_reworded() {
+        // The prompt must name the exact action; a rewrite could drop it.
+        let (a, _) = agent_with(
+            vec![AiResult { content: String::new(), tool_calls: vec![call("c1", "reboot")] }],
+            4,
+            Some(Box::new(Fixed("Should I restart now?"))),
+        );
+        let AgentReply::NeedsConfirmation { text, pending, .. } = a.ask(&[], "reboot").await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(pending.tool, "reboot");
+        assert!(text.contains("confirmation"), "{text}");
+        assert!(!text.contains("restart now"), "confirmation text was reworded");
+    }
+
+    #[tokio::test]
+    async fn no_phrasing_model_means_no_extra_call() {
+        let (a, seen) = agent(
+            vec![AiResult { content: "A perfectly ordinary answer.".into(), tool_calls: vec![] }],
+            4,
+        );
+        let AgentReply::Answer { text, .. } = a.ask(&[], "hello").await.unwrap() else { panic!() };
+        assert_eq!(text, "A perfectly ordinary answer.");
+        assert_eq!(seen.lock().unwrap().len(), 1, "phrasing added a request");
     }
 
     #[tokio::test]

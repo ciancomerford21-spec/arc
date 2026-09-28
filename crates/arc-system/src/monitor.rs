@@ -15,7 +15,7 @@ use crate::Result;
 use crate::which;
 use serde::Serialize;
 use std::time::Duration;
-use sysinfo::{Disks, System, Cpu};
+use sysinfo::{Cpu, Disks, System};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Overview {
@@ -140,41 +140,40 @@ fn load_avg() -> Option<[f64; 3]> {
 /// NVIDIA GPU stats via `nvidia-smi --format=json` (optional).
 pub fn gpu_nvidia() -> Option<Gpu> {
     let bin = which("nvidia-smi")?;
-    let out = std::process::Command::new(bin)
-        .args(["--format=json"])
-        .output()
-        .ok()?;
+    let out = std::process::Command::new(bin).args(["--format=json"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str::<NvidiaSmiJson>(&text).ok().and_then(|j| {
         let gpu = j.gpu.first()?;
-        let util = gpu.get("utilization")
+        let util = gpu
+            .get("utilization")
             .and_then(|u| u.get("utilization.gpu [%]"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok());
-        let mem_used = gpu.get("fb_memory_usage")
+        let mem_used = gpu
+            .get("fb_memory_usage")
             .and_then(|m| m.get("used [MiB]"))
             .and_then(|v| v.as_str())
             .and_then(|s| (s.parse::<f64>().ok()).map(|m| (m * 1024.0 * 1024.0) as u64));
-        let mem_total = gpu.get("fb_memory_usage")
+        let mem_total = gpu
+            .get("fb_memory_usage")
             .and_then(|m| m.get("total [MiB]"))
             .and_then(|v| v.as_str())
             .and_then(|s| (s.parse::<f64>().ok()).map(|m| (m * 1024.0 * 1024.0) as u64));
-        let temp = gpu.get("temperature")
+        let temp = gpu
+            .get("temperature")
             .and_then(|t| t.get("gpu_temp"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok());
-        let power = gpu.get("power_readings")
+        let power = gpu
+            .get("power_readings")
             .and_then(|p| p.get("power_draw [W]"))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok());
         Some(Gpu {
-            name: gpu.get("product_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("NVIDIA GPU")
-                .to_string(),
+            name: gpu.get("product_name").and_then(|v| v.as_str()).unwrap_or("NVIDIA GPU").to_string(),
             utilization_percent: util,
             memory_used_bytes: mem_used,
             memory_total_bytes: mem_total,
@@ -191,18 +190,21 @@ struct NvidiaSmiJson {
 
 fn disk_list() -> Vec<Disk> {
     let disks = Disks::new_with_refreshed_list();
-    disks.iter().map(|d| Disk {
-        mount: d.name().to_string_lossy().to_string(),
-        fs_type: d.file_system().to_string_lossy().to_string(),
-        total_bytes: d.total_space(),
-        available_bytes: d.available_space(),
-        used_bytes: d.total_space().saturating_sub(d.available_space()),
-        used_percent: if d.total_space() > 0 {
-            100.0 * (d.total_space() - d.available_space()) as f64 / d.total_space() as f64
-        } else {
-            0.0
-        },
-    }).collect()
+    disks
+        .iter()
+        .map(|d| Disk {
+            mount: d.name().to_string_lossy().to_string(),
+            fs_type: d.file_system().to_string_lossy().to_string(),
+            total_bytes: d.total_space(),
+            available_bytes: d.available_space(),
+            used_bytes: d.total_space().saturating_sub(d.available_space()),
+            used_percent: if d.total_space() > 0 {
+                100.0 * (d.total_space() - d.available_space()) as f64 / d.total_space() as f64
+            } else {
+                0.0
+            },
+        })
+        .collect()
 }
 
 /// Top RAM consumers, sorted by memory.
@@ -251,8 +253,7 @@ pub async fn top_cpu(top: usize) -> Result<Vec<ProcessInfo>> {
         })
         .collect();
 
-    items.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent)
-        .unwrap_or(std::cmp::Ordering::Equal));
+    items.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal));
     Ok(items.into_iter().take(top).collect())
 }
 

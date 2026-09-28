@@ -249,7 +249,8 @@ fn voice_service_round_trip() {
         std::thread::sleep(Duration::from_millis(200));
     };
     assert_eq!(status["voice_mode"], "push_to_talk");
-    let comp = |n: &str| status["components"].as_array().unwrap().iter().find(|c| c["name"] == n).cloned().unwrap();
+    let comp =
+        |n: &str| status["components"].as_array().unwrap().iter().find(|c| c["name"] == n).cloned().unwrap();
     assert_eq!(comp("voice.stt")["status"], "ok");
     assert_eq!(comp("voice.mic")["status"], "disabled");
 

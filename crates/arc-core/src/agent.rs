@@ -55,10 +55,12 @@ impl Agent {
         Self { providers, gate, system_prompt, max_rounds: max_rounds.max(1) }
     }
 
-    fn tool_defs(&self) -> Vec<ToolDef> {
+    /// The tool schemas to send for this utterance. See
+    /// `Tools::select_specs` for why this is not the full list.
+    fn tool_defs_for(&self, utterance: &str) -> Vec<ToolDef> {
         self.gate
             .tools()
-            .specs()
+            .select_specs(utterance)
             .into_iter()
             .map(|s| ToolDef { name: s.name, description: s.description, parameters: s.parameters })
             .collect()
@@ -66,7 +68,7 @@ impl Agent {
 
     /// Answer `user` given prior `history` (without system prompt).
     pub async fn ask(&self, history: &[AiMessage], user: &str) -> Result<AgentReply, AiError> {
-        let tools = self.tool_defs();
+        let tools = self.tool_defs_for(user);
         let mut msgs = Vec::with_capacity(history.len() + 2);
         msgs.push(AiMessage::system(self.system_prompt.clone()));
         msgs.extend_from_slice(history);
@@ -92,7 +94,8 @@ impl Agent {
                      what they could say instead.",
                 ));
                 let r = self.providers.complete(&msgs, &[]).await?;
-                let text = if r.content.trim().is_empty() { "Sorry, I couldn't do that.".into() } else { r.content };
+                let text =
+                    if r.content.trim().is_empty() { "Sorry, I couldn't do that.".into() } else { r.content };
                 return Ok(AgentReply::Answer { text, actions });
             }
             msgs.push(AiMessage::assistant(r.content.clone(), r.tool_calls.clone()));
@@ -144,9 +147,9 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arc_proto::ActionOutcome;
     use arc_ai::{AiResult, Provider, ToolCall};
     use arc_config::Config;
+    use arc_proto::ActionOutcome;
     use arc_tools::Tools;
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -165,7 +168,11 @@ mod tests {
         async fn complete(&self, m: &[AiMessage], _: &[ToolDef]) -> Result<AiResult, AiError> {
             self.seen.lock().unwrap().push(m.to_vec());
             let mut r = self.replies.lock().unwrap();
-            if r.is_empty() { Ok(AiResult { content: "loop".into(), tool_calls: vec![call("x", "network_status")] }) } else { Ok(r.remove(0)) }
+            if r.is_empty() {
+                Ok(AiResult { content: "loop".into(), tool_calls: vec![call("x", "network_status")] })
+            } else {
+                Ok(r.remove(0))
+            }
         }
     }
 
@@ -222,7 +229,10 @@ mod tests {
     #[tokio::test]
     async fn final_answer_is_reworded_by_the_phrasing_model() {
         let (a, _) = agent_with(
-            vec![AiResult { content: "Volume has been set to 40 percent successfully.".into(), tool_calls: vec![] }],
+            vec![AiResult {
+                content: "Volume has been set to 40 percent successfully.".into(),
+                tool_calls: vec![],
+            }],
             4,
             Some(Box::new(Fixed("Set it to forty."))),
         );
@@ -273,10 +283,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_phrasing_model_means_no_extra_call() {
-        let (a, seen) = agent(
-            vec![AiResult { content: "A perfectly ordinary answer.".into(), tool_calls: vec![] }],
-            4,
-        );
+        let (a, seen) =
+            agent(vec![AiResult { content: "A perfectly ordinary answer.".into(), tool_calls: vec![] }], 4);
         let AgentReply::Answer { text, .. } = a.ask(&[], "hello").await.unwrap() else { panic!() };
         assert_eq!(text, "A perfectly ordinary answer.");
         assert_eq!(seen.lock().unwrap().len(), 1, "phrasing added a request");
@@ -310,10 +318,14 @@ mod tests {
     #[tokio::test]
     async fn model_cannot_reboot_without_confirmation() {
         let (a, seen) = agent(
-            vec![AiResult { content: String::new(), tool_calls: vec![call("c1", "reboot"), call("c2", "shutdown")] }],
+            vec![AiResult {
+                content: String::new(),
+                tool_calls: vec![call("c1", "reboot"), call("c2", "shutdown")],
+            }],
             4,
         );
-        let AgentReply::NeedsConfirmation { pending, actions, .. } = a.ask(&[], "restart").await.unwrap() else {
+        let AgentReply::NeedsConfirmation { pending, actions, .. } = a.ask(&[], "restart").await.unwrap()
+        else {
             panic!("expected confirmation")
         };
         assert_eq!(pending.tool, "reboot");
@@ -337,7 +349,12 @@ mod tests {
         // be asked (without tools) to explain instead of burning every round.
         let failing = || AiResult { content: String::new(), tool_calls: vec![call("f", "no_such_tool")] };
         let (a, seen) = agent(
-            vec![failing(), failing(), failing(), AiResult { content: "That app isn't installed.".into(), tool_calls: vec![] }],
+            vec![
+                failing(),
+                failing(),
+                failing(),
+                AiResult { content: "That app isn't installed.".into(), tool_calls: vec![] },
+            ],
             8,
         );
         let AgentReply::Answer { text, actions } = a.ask(&[], "open thunar").await.unwrap() else { panic!() };

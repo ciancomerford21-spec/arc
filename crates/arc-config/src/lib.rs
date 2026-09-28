@@ -52,6 +52,7 @@ pub struct Config {
     pub memory: Memory,
     pub logging: Logging,
     pub tools: Tools,
+    pub code: Code,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -66,10 +67,7 @@ pub struct General {
 
 impl Default for General {
     fn default() -> Self {
-        Self {
-            name: "Arc".into(),
-            name_variants: vec!["arc".into(), "ark".into()],
-        }
+        Self { name: "Arc".into(), name_variants: vec!["arc".into(), "ark".into()] }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,7 +82,24 @@ pub struct Personality {
 impl Default for Personality {
     fn default() -> Self {
         Self {
-            custom_prompt: String::new(),
+            // Arc has a personality by default, not an empty slot. It used
+            // to be empty so the shipped config and Config::default() agreed;
+            // now the shipped config carries the real voice and the default
+            // follows it, so a fresh install sounds like Arc too.
+            custom_prompt: r#"Relaxed, confident, a bit wry. You're a very capable friend who happens to live on this machine, not a corporate assistant. Use contractions: "yeah", "yep", "nope", "I'll", "that's". Never say "Certainly", "I would be happy to", or "The requested operation has completed". Say "Done." or "Yeah, give me a second." and mean it.
+
+Humor when it fits, never forced: dry observations, mild sarcasm, the occasional joke. Don't quip on every line -- a joke in every reply is just noise. Match the user's mood. If they're frustrated, acknowledge it plainly and move on to the fix. If something works first try, you can note your mild disappointment.
+
+Be short for simple actions ("Done.", "Opening Firefox."), and go longer when there's actually something to say: a real explanation, a useful connection, a couple of options. Don't pad to look smart.
+
+Never narrate step by step. Don't announce "I will now open the terminal" before doing it. Do the thing, then say what happened: "Found it, the dependency was outdated. Updated, tests pass."
+
+When something fails, say what happened, what you think caused it, and what you're doing next -- in that order, briefly. When you're unsure, say so casually ("not sure yet, let me check") instead of hedging into mush. Never invent a fact to sound confident, and never claim an action happened unless a tool confirmed it.
+
+Refer to things by context: "the project", "that window", "the other branch" should resolve from the conversation. Ask only when guessing would be worse than asking.
+
+Never fake feelings, never over-explain what you're about to do, never stack on emojis, and never be sarcastic at the user's expense.
+"#.to_string().to_string(),
             user_title: String::new(),
         }
     }
@@ -99,6 +114,11 @@ pub enum ProviderKind {
     Openai,
     /// Anthropic Messages API.
     Anthropic,
+    /// Hermes's local OpenAI-compatible proxy (`hermes proxy start`), which
+    /// forwards to whichever provider the user is signed in to. Separate from
+    /// `Openai` so the proxy can be the fallback while `openai` keeps serving
+    /// an API-key provider for phrasing.
+    Hermes,
     /// No language model: deterministic commands only.
     None,
 }
@@ -123,6 +143,8 @@ pub struct Ai {
     pub local: LocalAi,
     pub openai: RemoteAi,
     pub anthropic: RemoteAi,
+    /// Endpoint for the Hermes proxy fallback (`hermes proxy start`).
+    pub hermes: RemoteAi,
 }
 
 impl Default for Ai {
@@ -130,13 +152,20 @@ impl Default for Ai {
         Self {
             provider: ProviderKind::Local,
             fallback: ProviderKind::None,
-            temperature: 0.2,
+            temperature: 0.0,
             max_tokens: 400,
             timeout_s: 45,
             max_tool_rounds: 4,
             phrasing: ProviderKind::None,
             phrasing_enabled: false,
             local: LocalAi::default(),
+            // The proxy ignores the bearer: `hermes proxy start` attaches the
+            // user's own Portal credentials. Any non-empty value works.
+            hermes: RemoteAi {
+                base_url: "http://127.0.0.1:8645/v1".into(),
+                model: "hermes".into(),
+                api_key_env: "ARC_HERMES_PROXY_KEY".into(),
+            },
             openai: RemoteAi {
                 base_url: "https://api.openai.com/v1".into(),
                 model: "gpt-4.1-mini".into(),
@@ -329,10 +358,7 @@ pub struct Ui {
 
 impl Default for Ui {
     fn default() -> Self {
-        Self {
-            position: UiPosition::Top,
-            width: 560,
-        }
+        Self { position: UiPosition::Top, width: 560 }
     }
 }
 
@@ -349,8 +375,6 @@ impl Default for Bar {
     }
 }
 
-
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolPolicy {
@@ -360,6 +384,51 @@ pub enum ToolPolicy {
     Confirm,
     /// Never run.
     Deny,
+}
+
+/// Hands a coding task to Hermes as a subprocess (`hermes chat -q`).
+///
+/// Arc does not write code itself. The model here calls one tool, that tool
+/// spawns Hermes in a bounded working directory, and Hermes does the work with
+/// the same tool access this agent has. The reason it is a subprocess and not
+/// a prompt on the local model: a 2B asked to write a whole project produces
+/// plausible-looking files that do not compile, and it has no way to iterate
+/// on a build failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Code {
+    /// Master switch. Off means the `code` tool refuses to run.
+    pub enabled: bool,
+    /// Hermes executable. `hermes` is resolved on PATH.
+    pub binary: String,
+    /// The only directory tree a task may touch. Tasks are told to stay here
+    /// and the working directory is pinned to it.
+    pub workspace: String,
+    /// Hard wall-clock limit for one task, in seconds. Hermes is given a
+    /// matching instruction and Arc kills the process at the limit.
+    pub timeout_s: u64,
+    /// Cap on captured output, so a runaway build cannot flood the prompt.
+    pub max_output_bytes: usize,
+    /// Reasoning effort passed to Hermes for a task.
+    pub reasoning: String,
+    /// Wall-clock budget handed to Hermes as --run-budget. Same ceiling as
+    /// `timeout_s`, but stated to the agent as well as enforced by Arc, so it
+    /// can wrap up rather than be killed mid-write.
+    pub run_budget_s: u64,
+}
+
+impl Default for Code {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary: "hermes".into(),
+            workspace: "~/Projects".into(),
+            timeout_s: 900,
+            max_output_bytes: 16384,
+            reasoning: "medium".into(),
+            run_budget_s: 840,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -438,9 +507,7 @@ impl Default for Apps {
         aliases.insert("vscode".into(), "code".into());
         aliases.insert("system monitor".into(), "btop".into());
         aliases.insert("task manager".into(), "btop".into());
-        Self {
-            aliases,
-        }
+        Self { aliases }
     }
 }
 

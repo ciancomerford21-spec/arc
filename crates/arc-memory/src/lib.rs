@@ -81,10 +81,7 @@ impl MemoryStore {
     pub fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         if path.extension() == Some("json".as_ref()) {
-            let sessions = path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("sessions.json");
+            let sessions = path.parent().unwrap_or_else(|| Path::new(".")).join("sessions.json");
             Self::with_paths(path.to_path_buf(), sessions)
         } else {
             Self::new_in_dir(path)
@@ -129,13 +126,7 @@ impl MemoryStore {
             *c += 1;
             *c
         };
-        let entry = MemoryEntry {
-            id: uuid(),
-            fact,
-            tags,
-            remembered_at: now_iso(),
-            seq,
-        };
+        let entry = MemoryEntry { id: uuid(), fact, tags, remembered_at: now_iso(), seq };
         entries.push(entry.clone());
         drop(entries);
         self.persist_from_locked();
@@ -183,9 +174,7 @@ impl MemoryStore {
                 if terms.is_empty() {
                     true
                 } else {
-                    lower_terms
-                        .iter()
-                        .all(|t| e.fact.to_lowercase().contains(t.as_str()))
+                    lower_terms.iter().all(|t| e.fact.to_lowercase().contains(t.as_str()))
                 }
             })
             .cloned()
@@ -205,6 +194,17 @@ impl MemoryStore {
             for t in s.turns.iter().rev() {
                 if turns.len() >= MAX_TURNS_IN_PROMPT {
                     break;
+                }
+                // Never replay a refusal back to the model. Measured on the
+                // 2B: after Arc once answered "I don't have access to your
+                // network status", that line sat in the recalled history and
+                // the model copied it verbatim on the next "am I on wifi" --
+                // with network_status right there in the tool list, and with
+                // a prompt that explicitly said to ignore its own earlier
+                // replies. Telling the model not to imitate a pattern does not
+                // work; removing the pattern does.
+                if t.role == SessionTurnRole::Assistant && is_refusal(&t.text) {
+                    continue;
                 }
                 turns.push(t);
             }
@@ -233,11 +233,7 @@ impl MemoryStore {
     }
 
     /// Write one turn into the most recent session.
-    pub fn append_turn(
-        &self,
-        role: SessionTurnRole,
-        text: String,
-    ) -> SessionSummary {
+    pub fn append_turn(&self, role: SessionTurnRole, text: String) -> SessionSummary {
         let mut sessions = self.sessions_lock();
         let seq = {
             let mut c = self.session_counter.lock().expect("session counter poisoned");
@@ -245,13 +241,7 @@ impl MemoryStore {
             *c
         };
         let created_at = now_iso();
-        let turn = SessionTurn {
-            seq,
-            role,
-            text,
-            tags: vec![],
-            created_at: created_at.clone(),
-        };
+        let turn = SessionTurn { seq, role, text, tags: vec![], created_at: created_at.clone() };
         if let Some(last) = sessions.last_mut() {
             last.turns.push(turn);
             let updated_at = created_at.clone();
@@ -288,10 +278,7 @@ impl MemoryStore {
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::write(
-            &self.path,
-            serde_json::to_string_pretty(&*entries).unwrap_or_default(),
-        );
+        let _ = fs::write(&self.path, serde_json::to_string_pretty(&*entries).unwrap_or_default());
     }
 
     fn persist_sessions_from_locked(&self) {
@@ -299,10 +286,7 @@ impl MemoryStore {
         if let Some(parent) = self.sessions_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::write(
-            &self.sessions_path,
-            serde_json::to_string_pretty(&*sessions).unwrap_or_default(),
-        );
+        let _ = fs::write(&self.sessions_path, serde_json::to_string_pretty(&*sessions).unwrap_or_default());
     }
 
     /// Search a session by id, returning the most recent N turns that match
@@ -315,8 +299,7 @@ impl MemoryStore {
     ) -> Option<Vec<SessionTurn>> {
         let sessions = self.sessions_lock();
         let session = sessions.iter().find(|s| s.id == session_id)?;
-        let lower_terms: Vec<String> =
-            terms.iter().map(|t| t.to_lowercase()).collect();
+        let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
         let mut matched: Vec<SessionTurn> = session
             .turns
             .iter()
@@ -325,9 +308,7 @@ impl MemoryStore {
                 if terms.is_empty() {
                     true
                 } else {
-                    lower_terms
-                        .iter()
-                        .all(|term| t.text.to_lowercase().contains(term.as_str()))
+                    lower_terms.iter().all(|term| t.text.to_lowercase().contains(term.as_str()))
                 }
             })
             .take(limit)
@@ -337,11 +318,7 @@ impl MemoryStore {
         Some(matched)
     }
 
-    pub fn prompt_block(
-        &self,
-        max_entries: usize,
-        filter: Option<Vec<&str>>,
-    ) -> String {
+    pub fn prompt_block(&self, max_entries: usize, filter: Option<Vec<&str>>) -> String {
         let candidates = match filter {
             Some(terms) => self.search(terms),
             None => self.list(),
@@ -355,11 +332,7 @@ impl MemoryStore {
             &candidates
         };
         let lines: Vec<String> = kept.iter().map(|e| format!("- {}", e.fact)).collect();
-        format!(
-            "MEMORIZED FACTS ({} known):\n{}\n",
-            kept.len(),
-            lines.join("\n")
-        )
+        format!("MEMORIZED FACTS ({} known):\n{}\n", kept.len(), lines.join("\n"))
     }
 }
 
@@ -377,11 +350,7 @@ fn uuid() -> String {
 
 fn fast_random() -> [u8; 8] {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let mut t =
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+    let mut t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
     // cheap xorshift
     t ^= t << 7;
     t ^= t >> 9;
@@ -391,11 +360,7 @@ fn fast_random() -> [u8; 8] {
 
 fn now_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs =
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     unix_to_iso(secs)
 }
 
@@ -424,20 +389,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
         days -= n;
         year += 1;
     }
-    let month_days = [
-        31,
-        if is_leap(year) { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
+    let month_days = [31, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month = 1u64;
     for &md in &month_days {
         if days < md {
@@ -476,17 +428,126 @@ fn load_sessions(path: &Path) -> (Vec<SessionSummary>, u64) {
     }
     match fs::read_to_string(path) {
         Ok(text) => {
-            let v: Vec<SessionSummary> =
-                serde_json::from_str(&text).unwrap_or_else(|_| vec![]);
-            let n = v
-                .iter()
-                .flat_map(|s| s.turns.iter().map(|t| t.seq))
-                .max()
-                .unwrap_or(0);
+            let v: Vec<SessionSummary> = serde_json::from_str(&text).unwrap_or_else(|_| vec![]);
+            let n = v.iter().flat_map(|s| s.turns.iter().map(|t| t.seq)).max().unwrap_or(0);
             (v, n)
         }
         Err(_) => (vec![], 0),
     }
+}
+
+/// True when a stored assistant turn is a refusal -- an "I can't do that"
+/// answer rather than an answer.
+///
+/// Matched structurally, not from a phrase list. The phrase-list version
+/// missed exactly the refusals that mattered: Arc says "I can’t confirm your
+/// Wi-Fi status", "I can’t confirm your volume", "I can’t identify the song",
+/// and none of those were on the list, so they sat in the recalled history
+/// being copied back verbatim.
+///
+/// Only refusals are filtered, and only on the assistant side. A user turn
+/// asking for something Arc cannot do is exactly the context worth keeping,
+/// and every other assistant reply is a real answer to learn the shape of.
+fn is_refusal(text: &str) -> bool {
+    let t = text
+        .trim()
+        .to_lowercase()
+        // Spoken answers come back with the curly U+2019 ("I can’t"), so
+        // straight-quoted patterns match nothing at all. The first version of
+        // this function was useless in production while passing every test,
+        // because every test used a straight quote.
+        .replace(['’', '`', '´'], "'");
+
+    // Drop leading politeness so "Sorry, I can't ..." and "Unfortunately, I'm
+    // not able to ..." match too. Only ever removes whole words, and never
+    // steps over an "I" -- otherwise it would eat into the reply itself.
+    const HEDGES: &[&str] = &[
+        "sorry",
+        "unfortunately",
+        "regrettably",
+        "sadly",
+        "afraid",
+        "hmm",
+        "well",
+        "actually",
+        "to be honest",
+        "honestly",
+        "right now",
+        "at the moment",
+    ];
+    let mut body = t.as_str();
+    loop {
+        let trimmed = body.trim_start_matches(|c: char| !c.is_alphanumeric());
+        let Some(hedge) = HEDGES.iter().find(|h| {
+            trimmed.len() > h.len()
+                && trimmed.starts_with(**h)
+                && !trimmed[h.len()..].starts_with(char::is_alphanumeric)
+        }) else {
+            break;
+        };
+        body = trimmed[hedge.len()..].trim_start();
+    }
+    let body = body.trim_start_matches(|c: char| !c.is_alphanumeric() && c != 'i');
+
+    // Refusals that do not open with a first-person "I".
+    const PHRASES: &[&str] = &[
+        "no tool for",
+        "not available to me",
+        "unable to access",
+        "no access to your",
+        "isn't something i can",
+        "is not something i can",
+        "i'm afraid i can",
+        "i am afraid i can",
+        "i have no way to",
+    ];
+    if PHRASES.iter().any(|p| body.contains(p)) {
+        return true;
+    }
+
+    // "I can't ..." / "I cannot ..." / "I'm not able to ...". The subject is
+    // always Arc, so an opening one of these is a refusal whatever follows.
+    const INABILITY: &[&str] = &[
+        "i can't",
+        "i cannot",
+        "i can not",
+        "i'm unable to",
+        "i am unable to",
+        "i'm not able to",
+        "i am not able to",
+        "i won't",
+        "i wont",
+    ];
+    if INABILITY.iter().any(|p| body.starts_with(p)) {
+        return true;
+    }
+
+    // "I don't have access to ...". These need an ability noun alongside the
+    // "don't", so a real answer that merely says "I don't know much about it,
+    // but ..." is not thrown away.
+    const ABILITY_NOUN: &[&str] = &[
+        "access",
+        "ability",
+        "way to",
+        "tool for",
+        "tools for",
+        "information about",
+        "details on",
+        "record of",
+        "visibility into",
+        "permission to",
+        // Bare "I don't know ..." with nothing else is a refusal too, and was
+        // missed until a test caught it.
+        "know what",
+        "know which",
+        "know how",
+        "know if",
+        "know about",
+    ];
+    if !(body.contains("i don't") || body.contains("i do not")) {
+        return false;
+    }
+    ABILITY_NOUN.iter().any(|n| body.contains(n))
 }
 
 #[cfg(test)]
@@ -622,6 +683,41 @@ mod tests {
         store.remember("I use Arch Linux".into(), vec![]);
         for q in ["arch", "ARCH", "linux"] {
             assert_eq!(store.search(vec![q]).len(), 1, "{q}");
+        }
+    }
+
+    #[test]
+    fn refusals_are_never_replayed_into_the_prompt() {
+        // The last four are the exact strings Arc produced in production and
+        // then failed to filter -- they are in this test because a phrase list
+        // built from imagined refusals missed every real one.
+        for r in [
+            "I don't have access to your network status.",
+            "I can't check your memory.",
+            "I cannot tell you the song.",
+            "i don't know what that is",
+            "I can’t check your network status.",
+            "I don’t have access to your memory.",
+            "I can’t identify the song without knowing which player is running it.",
+            "I can’t confirm your Wi-Fi status.",
+            "I can’t confirm your volume.",
+            "I can’t fix your tiredness, but I can switch you to a more comfortable workspace.",
+            "Sorry, I can't help with that.",
+            "Unfortunately, I'm not able to browse the web right now.",
+        ] {
+            assert!(is_refusal(r), "should be filtered: {r}");
+        }
+    }
+
+    #[test]
+    fn real_answers_are_still_replayed() {
+        for a in [
+            "Paris.",
+            "This machine has no battery; it's running on mains power.",
+            "Switched to workspace four. What would you like to do on this workspace?",
+            "You're welcome.",
+        ] {
+            assert!(!is_refusal(a), "must not be filtered: {a}");
         }
     }
 }

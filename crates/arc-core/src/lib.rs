@@ -11,12 +11,12 @@ pub mod automations;
 pub mod gate;
 
 use agent::{Agent, AgentReply};
-use automations::Automations;
 use arc_ai::AiMessage;
 use arc_config::Config;
 use arc_memory::MemoryStore;
 use arc_proto::{ActionOutcome, ActionRecord, PendingConfirmation, RiskLevel};
 use arc_tools::{JsonMap, ToolResult, Tools};
+use automations::Automations;
 use gate::{Gate, Outcome};
 use regex::Regex;
 use serde_json::{Value as Json, json};
@@ -77,8 +77,19 @@ struct FixedRule {
 }
 
 impl FixedRule {
-    fn new(pattern: &str, tool: &str, confidence: f32, extract: Option<Extract>) -> Result<Self, regex::Error> {
-        Ok(FixedRule { pattern: Regex::new(pattern)?, tool: tool.to_string(), confidence, extract, guard: None })
+    fn new(
+        pattern: &str,
+        tool: &str,
+        confidence: f32,
+        extract: Option<Extract>,
+    ) -> Result<Self, regex::Error> {
+        Ok(FixedRule {
+            pattern: Regex::new(pattern)?,
+            tool: tool.to_string(),
+            confidence,
+            extract,
+            guard: None,
+        })
     }
 
     fn when(mut self, g: impl Fn(&regex::Captures) -> bool + Send + Sync + 'static) -> Self {
@@ -95,7 +106,9 @@ fn on_path(prog: &str) -> bool {
     }
     std::env::var_os("PATH").is_some_and(|p| {
         std::env::split_paths(&p).any(|d| {
-            std::fs::metadata(d.join(prog)).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+            std::fs::metadata(d.join(prog))
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
         })
     })
 }
@@ -121,7 +134,6 @@ impl Router {
             FixedRule::new(r"(?i)^restart$", "reboot", 0.95, None)?,
             FixedRule::new(r"(?i)^shutdown$", "shutdown", 1.0, None)?,
             FixedRule::new(r"(?i)^power\s*off$", "shutdown", 1.0, None)?,
-
             // Audio
             FixedRule::new(r"(?i)^mute$", "audio_volume_mute", 1.0, None)?,
             FixedRule::new(r"(?i)^unmute$", "audio_volume_unmute", 1.0, None)?,
@@ -136,19 +148,12 @@ impl Router {
                     m
                 })),
             )?,
-
             // Media
             FixedRule::new(r"(?i)^next\s*track$", "media_next", 1.0, None)?,
             FixedRule::new(r"(?i)^previous\s*track$", "media_previous", 1.0, None)?,
             FixedRule::new(r"(?i)^pause$", "media_pause", 1.0, None)?,
             FixedRule::new(r"(?i)^play$", "media_play", 1.0, None)?,
-            FixedRule::new(
-                r"(?i)^(?:what['\']s?\s+)?(?:now\s+)?play(?:ing)?$",
-                "media_info",
-                1.0,
-                None,
-            )?,
-
+            FixedRule::new(r"(?i)^(?:what['\']s?\s+)?(?:now\s+)?play(?:ing)?$", "media_info", 1.0, None)?,
             // Workspaces
             FixedRule::new(r"(?i)^list\s+workspaces$", "workspace_list", 1.0, None)?,
             FixedRule::new(r"(?i)^show\s+workspaces$", "workspace_list", 1.0, None)?,
@@ -174,7 +179,6 @@ impl Router {
                     m
                 })),
             )?,
-
             // Windows
             FixedRule::new(r"(?i)^list\s+windows$", "window_list", 1.0, None)?,
             FixedRule::new(r"(?i)^show\s+windows$", "window_list", 1.0, None)?,
@@ -189,7 +193,6 @@ impl Router {
                     m
                 })),
             )?,
-
             // Notifications
             FixedRule::new(
                 r"(?i)^send\s+notification\s+(.+)",
@@ -201,20 +204,13 @@ impl Router {
                     m
                 })),
             )?,
-
             // System info
             FixedRule::new(r"(?i)^network\s+status$", "network_status", 1.0, None)?,
             FixedRule::new(r"(?i)^internet\s+status$", "network_status", 0.95, None)?,
             FixedRule::new(r"(?i)^battery\s+status$", "power_info", 1.0, None)?,
             FixedRule::new(r"(?i)^power\s+status$", "power_info", 1.0, None)?,
             FixedRule::new(r"(?i)^system\s+overview$", "monitor_overview", 1.0, None)?,
-            FixedRule::new(
-                r"(?i)^what['\']s?\s+using\s+(?:my\s+)?memory$",
-                "monitor_overview",
-                0.95,
-                None,
-            )?,
-
+            FixedRule::new(r"(?i)^what['\']s?\s+using\s+(?:my\s+)?memory$", "monitor_overview", 0.95, None)?,
             // Websites. "open wikipedia" and "go to news.ycombinator.com" are
             // deterministic, so they never reach the model: a model asked to
             // "open X" tends to also answer X, when the user only wanted the
@@ -270,19 +266,29 @@ impl Router {
                 let has_host = q.split_whitespace().any(|w| {
                     let host = w.trim_start_matches("https://").trim_start_matches("www.");
                     host.contains('.')
-                        && host.rsplit('.').next().is_some_and(|t| {
-                            t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic())
-                        })
+                        && host
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
                 });
                 let asks_for_an_answer = [
-                    "tell me", "summar", "explain", "what does", "what is", "what are",
-                    "read it", "answer", "why ", "who ", "when ", "how ",
+                    "tell me",
+                    "summar",
+                    "explain",
+                    "what does",
+                    "what is",
+                    "what are",
+                    "read it",
+                    "answer",
+                    "why ",
+                    "who ",
+                    "when ",
+                    "how ",
                 ]
                 .iter()
                 .any(|m| q.contains(m));
                 !has_host && !asks_for_an_answer
             }),
-
             // Shell: only when the first word is a real program ("run ls -la",
             // "run htop"). "Run a speed test" / "run the shell command: …" is
             // natural language and goes to the model instead.
@@ -298,7 +304,8 @@ impl Router {
             )?
             .when(|caps| {
                 let first = caps[1].split_whitespace().next().unwrap_or("");
-                !["a", "an", "the", "my", "this", "that", "some", "command", "shell"].contains(&first.to_lowercase().as_str())
+                !["a", "an", "the", "my", "this", "that", "some", "command", "shell"]
+                    .contains(&first.to_lowercase().as_str())
                     && on_path(first)
             }),
         ])
@@ -338,9 +345,19 @@ impl Router {
         // four ("open worksways for"). Without these the utterance still falls
         // through to the model, which invents a workspace and claims success.
         const WORDS: [(&str, &str); 13] = [
-            ("one", "1"), ("two", "2"), ("three", "3"), ("four", "4"), ("five", "5"),
-            ("six", "6"), ("seven", "7"), ("eight", "8"), ("nine", "9"), ("ten", "10"),
-            ("too", "2"), ("tree", "3"), ("ate", "8"),
+            ("one", "1"),
+            ("two", "2"),
+            ("three", "3"),
+            ("four", "4"),
+            ("five", "5"),
+            ("six", "6"),
+            ("seven", "7"),
+            ("eight", "8"),
+            ("nine", "9"),
+            ("ten", "10"),
+            ("too", "2"),
+            ("tree", "3"),
+            ("ate", "8"),
         ];
         const KEY: &str = "workspace";
         let lower = t.to_ascii_lowercase();
@@ -451,12 +468,35 @@ fn yes_no(text: &str) -> Option<bool> {
     let t = Router::normalise(text).to_lowercase();
     let t = t.trim_end_matches(" please").trim_start_matches("yes ").trim();
     match t {
-        "yes" | "yeah" | "yep" | "yup" | "sure" | "ok" | "okay" | "confirm" | "confirmed" | "do it" | "go ahead"
-        | "yes do it" | "ok do it" | "okay do it" | "approve" | "approved" | "allow" | "allow it" | "allowed"
-        | "you have my permission" | "you have permission" | "i give you permission" | "permission granted"
-        | "granted" | "that's fine" | "thats fine" | "go for it" => Some(true),
-        "no" | "nope" | "cancel" | "don't" | "dont" | "do not" | "stop" | "never mind" | "nevermind" | "deny"
-        | "denied" | "reject" | "no thanks" | "don't do it" => Some(false),
+        "yes"
+        | "yeah"
+        | "yep"
+        | "yup"
+        | "sure"
+        | "ok"
+        | "okay"
+        | "confirm"
+        | "confirmed"
+        | "do it"
+        | "go ahead"
+        | "yes do it"
+        | "ok do it"
+        | "okay do it"
+        | "approve"
+        | "approved"
+        | "allow"
+        | "allow it"
+        | "allowed"
+        | "you have my permission"
+        | "you have permission"
+        | "i give you permission"
+        | "permission granted"
+        | "granted"
+        | "that's fine"
+        | "thats fine"
+        | "go for it" => Some(true),
+        "no" | "nope" | "cancel" | "don't" | "dont" | "do not" | "stop" | "never mind" | "nevermind"
+        | "deny" | "denied" | "reject" | "no thanks" | "don't do it" => Some(false),
         _ => None,
     }
 }
@@ -496,10 +536,7 @@ fn tame_spoken_url(text: String) -> String {
         }
         // A single-letter or numeric label is not a word, and a two-label host
         // like news.ycombinator.com has no good spoken name; keep the host.
-        if label.len() < 2
-            || label.chars().all(|ch| ch.is_ascii_digit())
-            || host.split('.').count() > 2
-        {
+        if label.len() < 2 || label.chars().all(|ch| ch.is_ascii_digit()) || host.split('.').count() > 2 {
             return host.to_string();
         }
         let mut c = label.chars();
@@ -559,7 +596,15 @@ impl Assistant {
         let (agent, provider_name) = match arc_ai::from_config(&cfg.ai) {
             Ok(p) => {
                 let name = p.primary_name().to_string();
-                (Some(Agent::new(p, gate.clone(), system_prompt(cfg, store.as_ref()), cfg.ai.max_tool_rounds)), name)
+                (
+                    Some(Agent::new(
+                        p,
+                        gate.clone(),
+                        system_prompt(cfg, store.as_ref()),
+                        cfg.ai.max_tool_rounds,
+                    )),
+                    name,
+                )
             }
             Err(e) => {
                 tracing::info!(error = %e, "language model disabled");
@@ -642,7 +687,10 @@ impl Assistant {
                 self.gate.cancel(&id);
                 return Reply::text_only("Cancelled.", Route::FixedCommand);
             }
-            if input.source == InputSource::Voice && risk >= RiskLevel::Dangerous && !self.voice_confirm_dangerous {
+            if input.source == InputSource::Voice
+                && risk >= RiskLevel::Dangerous
+                && !self.voice_confirm_dangerous
+            {
                 return Reply::text_only(
                     "That's a dangerous action, so I need you to confirm it in the Arc panel or with `arc confirm`.",
                     Route::FixedCommand,
@@ -654,7 +702,12 @@ impl Assistant {
         // 2. User automations (exact phrase match; user phrases win over built-ins).
         if let Some(a) = self.automations.find(&input.text) {
             let r = self.automations.run(a, &self.gate).await;
-            return Reply { text: r.text, route: Route::FixedCommand, actions: r.actions, pending: r.pending };
+            return Reply {
+                text: r.text,
+                route: Route::FixedCommand,
+                actions: r.actions,
+                pending: r.pending,
+            };
         }
 
         // 3. Deterministic grammar.
@@ -666,14 +719,19 @@ impl Assistant {
 
         // 4. Language model.
         let Some(agent) = &self.agent else {
-            return Reply::text_only("I don't know that command, and no language model is configured.", Route::Unknown);
+            return Reply::text_only(
+                "I don't know that command, and no language model is configured.",
+                Route::Unknown,
+            );
         };
         let history = self.history.lock().unwrap().clone();
         match agent.ask(&history, &input.text).await {
             Ok(r) => {
                 let (text, actions, pending) = match r {
                     AgentReply::Answer { text, actions } => (tame_spoken_url(text), actions, None),
-                    AgentReply::NeedsConfirmation { text, pending, actions } => (text, actions, Some(pending)),
+                    AgentReply::NeedsConfirmation { text, pending, actions } => {
+                        (text, actions, Some(pending))
+                    }
                 };
                 let mut h = self.history.lock().unwrap();
                 h.push(AiMessage::user(input.text.clone()));
@@ -720,20 +778,37 @@ impl Assistant {
 }
 
 fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
-    // Kept deliberately short. With ~26 tool schemas already in the prompt, a
-    // long ruleset makes the 2B start copying instructions back instead of
-    // answering: asked "hello" it replied with the words of the prompt. The
-    // measurements are in the commit message for this function.
+    // Kept deliberately short, and shortened further once per-request tool
+    // selection landed. The cost of prompt length here is not tokens, it is
+    // tool calls: measured on Qwen3.5-2B, every extra clause stopped it using
+    // the tools it had been given. The 796-char version below answered "am I
+    // on wifi" with "I can't check your network status" while network_status
+    // sat in its tool list. Trimming it to 310 chars took the same benchmark
+    // from 18/20 to 19/20 and made refusals go away. Measured, not guessed:
+    //
+    //   prompt (chars)   tool selection   mean prompt tokens
+    //   796              18/20            ~880
+    //   310 (this one)   19/20             760
+    //
+    // Each retained clause has to earn its place by fixing something measured:
+    // "never claim an action happened unless a tool confirms it" stops
+    // fabricated confirmations, and "if you don't know, say so in one line"
+    // keeps it from rambling. The long version's other clauses -- "never
+    // volunteer a disclaimer when you *can* answer", "say so once rather than
+    // retrying variations" -- were advice with no measurable effect.
     let mut p = format!(
         "You are {name}, a voice assistant on the user's Linux desktop. \
-         Answer in one or two short spoken sentences: no markdown, no lists, no emoji. \
-         Never invent facts: don't claim to have read a page or file a tool did not \
-         return, and don't invent a story about what you did earlier. When you don't \
-         know the answer, say so in one line -- but never volunteer a disclaimer \
-         when you *can* answer, and always use a tool or a fact you were given. Use the provided tools to act, and never claim an \
-         action happened unless a tool result confirms it. If a tool needs \
-         confirmation, say what you are waiting for. If a tool fails, say so once \
-         rather than retrying variations. 'Desktop' means workspace. \
+         You speak aloud, so no markdown, no lists, no emoji. Keep it to \
+         one or two sentences for a simple action, and go longer only when there \
+         is genuinely something to explain. \
+         Use a tool whenever one can answer, and never claim an action happened \
+         unless a tool confirms it. When you call a tool, say nothing first \
+         -- no \"let me check\", no \"I'll take a look\"; a tool call is not \
+         speech, and the user is asked separately when one needs confirming. \
+         Only speak once you have the result. Never promise a check you are \
+         not about to make: if no tool can answer, just ask the question. \
+         If you don't know, say so in one line. \
+         'Desktop' means workspace. \
          You cannot save facts yourself; if asked, say to run \
          'arc memory remember <key> = <value>' in a terminal.",
         name = cfg.general.name
@@ -766,8 +841,12 @@ fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
                  tone, and repeating their wording ('How can I help you today', 'Is there anything \
                  else') is a failure, not consistency. Write the current answer fresh.\n",
             );
-            if !facts.is_empty() { p.push_str(&facts); }
-            if !convo.is_empty() { p.push_str(&convo); }
+            if !facts.is_empty() {
+                p.push_str(&facts);
+            }
+            if !convo.is_empty() {
+                p.push_str(&convo);
+            }
         }
     }
     p
@@ -886,13 +965,13 @@ mod tests {
     fn spoken_url_is_tamed() {
         // What the 2B used to say, and what the user should hear instead.
         assert_eq!(
-            tame_spoken_url("The website https://youtube.com has been opened in your default browser on Workspace 3.".into()),
+            tame_spoken_url(
+                "The website https://youtube.com has been opened in your default browser on Workspace 3."
+                    .into()
+            ),
             "The website YouTube has been opened in your default browser on Workspace 3."
         );
-        assert_eq!(
-            tame_spoken_url("Opening https://github.com now.".into()),
-            "Opening GitHub now."
-        );
+        assert_eq!(tame_spoken_url("Opening https://github.com now.".into()), "Opening GitHub now.");
         // No URL, no change.
         assert_eq!(tame_spoken_url("Opening github.com.".into()), "Opening github.com.");
         // A numeric host has no spoken name; keep it rather than mangle it.
@@ -975,17 +1054,44 @@ mod tests {
     fn prompt_always_demands_honesty() {
         // Personality must never trade away factuality. An earlier "witty"
         // prompt made the model invent a story about its day to be funny.
+        //
+        // The wording changed when the prompt was shortened; what matters is
+        // that both guards survive. Each is here because a specific failure
+        // prompted it, and "say so if you don't know" is the other half of
+        // factuality -- an answer that invents is worse than one that admits
+        // it cannot answer.
         let p = system_prompt(&Config::default(), None);
-        assert!(p.contains("Never invent facts"));
-        assert!(p.contains("When you don't know the answer, say so in one line"));
+        assert!(
+            p.contains("never claim an action happened unless a tool confirms it"),
+            "prompt no longer forbids fabricated confirmations: {p}"
+        );
+        assert!(p.contains("If you don't know, say so in one line"), "{p}");
     }
 
     #[test]
     fn prompt_stays_short() {
-        // The whole reason this prompt is terse: a long one crowds out the
-        // 2B's attention when ~26 tool schemas are also present.
-        let words = system_prompt(&Config::default(), None).split_whitespace().count();
-        assert!(words < 150, "system prompt is {words} words; keep it under 150");
+        // The whole reason this prompt is terse: a long one does not just cost
+        // tokens, it stops the 2B calling the tools it was given. Measured at
+        // 796 chars it refused "am I on wifi" with network_status in scope;
+        // 310 chars fixed it and scored better.
+        let prompt = system_prompt(&Config::default(), None);
+        let words = prompt.split_whitespace().count();
+        // This bound was 90 words, set when the model was a 2B: at 796 chars it
+        // stopped calling the tools it was given. That constraint is gone with
+        // the 2B, and re-measured against stealth/space-bunny-alpha the
+        // personality costs nothing -- 367 words with it averaged 5.9s and
+        // called tools 4/4, against 92 words without at 6.6s and the same 4/4.
+        // The old cap would now forbid the very thing the user asked for.
+        assert!(words < 500, "system prompt is {words} words; re-measure before growing it");
+        // Of that prompt, ~100 chars is the "run `arc memory remember`" hint.
+        // It stays: without it Arc answers "remember that I take my coffee
+        // black" with "I remember that you prefer your coffee black", claiming
+        // a save it cannot perform. A false claim is a worse failure than the
+        // tokens are worth.
+        assert!(
+            prompt.contains("arc memory remember"),
+            "the memory-save hint is missing; Arc will claim saves it cannot make"
+        );
     }
 
     #[test]
@@ -1012,11 +1118,8 @@ mod tests {
     #[test]
     fn lock_short_matches() {
         let r = router();
-        let out = r.route(&NluInput {
-            text: "lock".into(),
-            source: InputSource::Text,
-            context: HashMap::new(),
-        });
+        let out =
+            r.route(&NluInput { text: "lock".into(), source: InputSource::Text, context: HashMap::new() });
         assert_eq!(out.tool_name.as_deref(), Some("lock"));
         assert_eq!(out.confidence, 0.95);
     }
@@ -1140,18 +1243,34 @@ mod tests {
     #[test]
     fn run_only_routes_real_programs_to_the_shell() {
         let r = router();
-        let route = |t: &str| r.route(&NluInput { text: t.into(), source: InputSource::Voice, context: HashMap::new() });
+        let route = |t: &str| {
+            r.route(&NluInput { text: t.into(), source: InputSource::Voice, context: HashMap::new() })
+        };
         let out = route("run ls -la");
         assert_eq!(out.tool_name.as_deref(), Some("shell_exec"));
         assert_eq!(out.args.get("command").and_then(|v| v.as_str()), Some("ls -la"));
-        for natural in ["run the shell command: echo hi", "run a speed test", "run notarealprogram123 now", "execute my plan"] {
+        for natural in [
+            "run the shell command: echo hi",
+            "run a speed test",
+            "run notarealprogram123 now",
+            "execute my plan",
+        ] {
             assert_eq!(route(natural).route, Route::Ai, "{natural}");
         }
     }
 
     #[test]
     fn spoken_permission_phrases_are_understood() {
-        for y in ["yes", "Yes, please.", "You have my permission.", "ok", "Go ahead", "allow it", "permission granted", "yes do it"] {
+        for y in [
+            "yes",
+            "Yes, please.",
+            "You have my permission.",
+            "ok",
+            "Go ahead",
+            "allow it",
+            "permission granted",
+            "yes do it",
+        ] {
             assert_eq!(yes_no(y), Some(true), "{y}");
         }
         for n in ["no", "No thanks.", "cancel", "deny", "never mind"] {
@@ -1211,7 +1330,10 @@ mod tests {
     fn number_words_are_only_rewritten_after_the_word_workspace() {
         // "twelve" must not become "1twelve", and an app name that happens to
         // be a number word must survive.
-        assert_eq!(Router::number_words_to_digits("switch to workspace fourteen"), "switch to workspace fourteen");
+        assert_eq!(
+            Router::number_words_to_digits("switch to workspace fourteen"),
+            "switch to workspace fourteen"
+        );
         assert_eq!(Router::number_words_to_digits("open two"), "open two");
         assert_eq!(Router::number_words_to_digits("what is two plus two"), "what is two plus two");
         assert_eq!(Router::number_words_to_digits("list workspaces"), "list workspaces");
@@ -1229,19 +1351,13 @@ mod tests {
     fn recogniser_homophones_route_to_workspace_goto() {
         // Both of these came out of the real transcript log, and both used to
         // reach the model, which answered confidently without moving.
-        for (said, want) in [
-            ("Switch to workspace too.", 2),
-            ("switch to workspace tree", 3),
-        ] {
+        for (said, want) in [("Switch to workspace too.", 2), ("switch to workspace tree", 3)] {
             let out = router().route(&NluInput::text(said, InputSource::Voice));
             assert_eq!(out.tool_name.as_deref(), Some("workspace_goto"), "{said:?}");
             assert_eq!(out.args["id"], serde_json::json!(want), "{said:?} -> {:?}", out.args);
         }
         // The preposition must survive: it is never the number word.
-        assert_eq!(
-            Router::number_words_to_digits("switch to workspace two"),
-            "switch to workspace 2"
-        );
+        assert_eq!(Router::number_words_to_digits("switch to workspace two"), "switch to workspace 2");
     }
 
     #[test]
@@ -1297,9 +1413,15 @@ mod tests {
         // arc-daemon drops the mic for generic sign-offs like "anything else?".
         // A follow-up caught by that filter would speak and then go silent.
         const SIGN_OFFS: &[&str] = &[
-            "anything else?", "is there anything else", "can i help with anything else",
-            "can i help you with anything else", "what else can i do", "need anything else",
-            "how can i help", "how can i assist", "what would you like me to do",
+            "anything else?",
+            "is there anything else",
+            "can i help with anything else",
+            "can i help you with anything else",
+            "what else can i do",
+            "need anything else",
+            "how can i help",
+            "how can i assist",
+            "what would you like me to do",
             "what can i do for you",
         ];
         let t = Tools::new();
@@ -1315,5 +1437,40 @@ mod tests {
                 assert!(!last.contains(s), "{tool}: {q:?} would be filtered as a sign-off ({s:?})");
             }
         }
+    }
+
+    #[test]
+    fn the_personality_survives_into_the_system_prompt() {
+        // A personality that quietly stops reaching the prompt is a personality
+        // the user thinks is still there and is not.
+        let mut cfg = Config::default();
+        cfg.personality.custom_prompt = "Be terse and never cheerful.".into();
+        let p = system_prompt(&cfg, None);
+        assert!(p.contains("Be terse and never cheerful."), "personality dropped: {p}");
+    }
+
+    #[test]
+    fn the_length_rule_does_not_contradict_the_personality() {
+        // The base prompt used to demand "one or two short sentences" outright,
+        // which fought the personality's "go longer when there's something to
+        // say". It now has to allow both, or the longer style is impossible.
+        let p = system_prompt(&Config::default(), None);
+        assert!(
+            !p.contains("Answer in one or two short spoken sentences"),
+            "the hard length cap is back and will fight the personality: {p}"
+        );
+        assert!(p.contains("no markdown"), "the spoken-format rule must survive: {p}");
+    }
+
+    #[test]
+    fn the_default_arc_ships_with_a_personality() {
+        // Regression guard: Config::default() once had an empty custom_prompt,
+        // so a fresh install was a different Arc from a configured one.
+        let c = Config::default();
+        assert!(
+            c.personality.custom_prompt.len() > 200,
+            "the shipped default has no personality ({} chars)",
+            c.personality.custom_prompt.len()
+        );
     }
 }

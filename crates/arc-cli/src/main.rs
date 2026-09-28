@@ -153,7 +153,8 @@ fn waybar(b: &Value) -> Value {
 }
 
 fn offline_bar(waybar_fmt: bool) -> Value {
-    let b = json!({"state": "offline", "text": "󰍭", "tooltip": "Arc daemon is not running", "class": "offline"});
+    let b =
+        json!({"state": "offline", "text": "󰍭", "tooltip": "Arc daemon is not running", "class": "offline"});
     if waybar_fmt { waybar(&b) } else { b }
 }
 
@@ -168,9 +169,7 @@ fn resolve_latest(conn: &mut Conn, approve: bool) -> Result<Value> {
 /// assuming which of them is installed.
 fn which(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(name))
-        .find(|p| p.is_file())
+    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 fn main() -> Result<()> {
@@ -209,12 +208,27 @@ fn main() -> Result<()> {
                 println!("{s}");
                 return Ok(());
             }
-            println!("Arc {}  pid {}  up {}s  state {}", s["version"].as_str().unwrap_or("?"), s["pid"], s["uptime_s"], s["state"].as_str().unwrap_or("?"));
-            println!("AI: {} {}", s["ai_provider"].as_str().unwrap_or(""), s["ai_model"].as_str().unwrap_or(""));
+            println!(
+                "Arc {}  pid {}  up {}s  state {}",
+                s["version"].as_str().unwrap_or("?"),
+                s["pid"],
+                s["uptime_s"],
+                s["state"].as_str().unwrap_or("?")
+            );
+            println!(
+                "AI: {} {}",
+                s["ai_provider"].as_str().unwrap_or(""),
+                s["ai_model"].as_str().unwrap_or("")
+            );
             println!("Voice mode: {}", s["voice_mode"].as_str().unwrap_or("off"));
             println!("Tools: {}/{} enabled", s["tools_enabled"], s["tools_total"]);
             for c in s["components"].as_array().into_iter().flatten() {
-                println!("  {:<12} {:<12} {}", c["name"].as_str().unwrap_or(""), c["status"].as_str().unwrap_or(""), c["detail"].as_str().unwrap_or(""));
+                println!(
+                    "  {:<12} {:<12} {}",
+                    c["name"].as_str().unwrap_or(""),
+                    c["status"].as_str().unwrap_or(""),
+                    c["detail"].as_str().unwrap_or("")
+                );
             }
             if let Some(e) = s["recent_errors"].as_array().filter(|e| !e.is_empty()) {
                 println!("Recent errors:");
@@ -247,15 +261,28 @@ fn main() -> Result<()> {
                 "cancel" => json!({"action": "cancel_listening"}),
                 "stop-speaking" | "shush" => json!({"action": "stop_speaking"}),
                 "say" => json!({"action": "speak", "text": text.join(" "), "utterance_id": "cli"}),
-                "mode" => json!({"action": "set_mode", "mode": text.first().cloned().unwrap_or_default().replace('-', "_")}),
-                other => bail!("unknown voice action `{other}` (start, stop, toggle, cancel, stop-speaking, say, mode)"),
+                "mode" => {
+                    json!({"action": "set_mode", "mode": text.first().cloned().unwrap_or_default().replace('-', "_")})
+                }
+                other => bail!(
+                    "unknown voice action `{other}` (start, stop, toggle, cancel, stop-speaking, say, mode)"
+                ),
             };
-            Conn::open(&sock, Some(Duration::from_secs(5)))?.call(json!({"type": "voice", "command": command}))?;
+            Conn::open(&sock, Some(Duration::from_secs(5)))?
+                .call(json!({"type": "voice", "command": command}))?;
         }
         Cmd::Bar { waybar: wb, follow } => {
             if !follow {
-                let out = match Conn::open(&sock, Some(Duration::from_secs(2))).and_then(|mut c| c.call(json!({"type": "bar_status"}))) {
-                    Ok(b) => if wb { waybar(&b) } else { b },
+                let out = match Conn::open(&sock, Some(Duration::from_secs(2)))
+                    .and_then(|mut c| c.call(json!({"type": "bar_status"})))
+                {
+                    Ok(b) => {
+                        if wb {
+                            waybar(&b)
+                        } else {
+                            b
+                        }
+                    }
                     Err(_) => offline_bar(wb),
                 };
                 println!("{out}");
@@ -298,13 +325,21 @@ fn main() -> Result<()> {
                     "state" => println!("[{}]", v["state"].as_str().unwrap_or("")),
                     "heard" => println!("heard: {}", v["text"].as_str().unwrap_or("")),
                     "reply" => println!("arc:   {}", v["text"].as_str().unwrap_or("")),
-                    "tool_finished" => println!("tool:  {} -> {}", v["record"]["tool"].as_str().unwrap_or(""), v["record"]["outcome"].as_str().unwrap_or("")),
+                    "tool_finished" => println!(
+                        "tool:  {} -> {}",
+                        v["record"]["tool"].as_str().unwrap_or(""),
+                        v["record"]["outcome"].as_str().unwrap_or("")
+                    ),
                     "confirmation_required" => println!(
                         "confirm? {} (arc confirm {})",
                         v["pending"]["explanation"].as_str().unwrap_or(""),
                         v["pending"]["confirmation_id"].as_str().unwrap_or("")
                     ),
-                    "error" => println!("error: {}: {}", v["component"].as_str().unwrap_or(""), v["message"].as_str().unwrap_or("")),
+                    "error" => println!(
+                        "error: {}: {}",
+                        v["component"].as_str().unwrap_or(""),
+                        v["message"].as_str().unwrap_or("")
+                    ),
                     _ => println!("{v}"),
                 }
             }
@@ -342,7 +377,9 @@ fn main() -> Result<()> {
                 }
                 "forget-last" => json!({"type": "memory", "op": "forget_last"}),
                 "clear" => json!({"type": "memory", "op": "clear"}),
-                other => bail!("unknown memory action `{other}` (list, search, remember, forget, forget-last, clear)"),
+                other => bail!(
+                    "unknown memory action `{other}` (list, search, remember, forget, forget-last, clear)"
+                ),
             };
             let r = c.call(req)?;
             if cli.json {
@@ -371,10 +408,7 @@ fn main() -> Result<()> {
             // surface. With no widget running there is nothing to show, so say
             // so rather than spawning a binary that no longer exists.
             let _ = toggle;
-            let candidates = [
-                "omarchy-launch-or-focus-tui",
-                "quickshell",
-            ];
+            let candidates = ["omarchy-launch-or-focus-tui", "quickshell"];
             let mut launched = false;
             for exe in candidates {
                 if which(exe).is_none() {

@@ -47,7 +47,12 @@ impl AiMessage {
         Self { role: AiRole::Assistant, content: s.into(), tool_calls, tool_call_id: None }
     }
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: AiRole::Tool, content: content.into(), tool_calls: vec![], tool_call_id: Some(call_id.into()) }
+        Self {
+            role: AiRole::Tool,
+            content: content.into(),
+            tool_calls: vec![],
+            tool_call_id: Some(call_id.into()),
+        }
     }
 }
 
@@ -83,7 +88,14 @@ pub struct Sampling {
 
 impl Default for Sampling {
     fn default() -> Self {
-        Self { temperature: 0.2, max_tokens: 400 }
+        // Greedy on purpose. Measured on Qwen3.5-2B with the tool list in
+        // scope, temperature 0.4 against 0.0: two fewer correct tool calls out
+        // of 18, and it answered "am I on wifi" with "Yes, you are currently
+        // connected to the Wi-Fi network" without ever calling network_status.
+        // That is a fabricated system fact, which is the one failure Arc must
+        // not have. Any warmth in the reply should come from the personality
+        // prompt and the phraser, not from sampling noise.
+        Self { temperature: 0.0, max_tokens: 400 }
     }
 }
 
@@ -102,6 +114,34 @@ pub enum AiError {
 impl From<reqwest::Error> for AiError {
     fn from(e: reqwest::Error) -> Self {
         if e.is_timeout() { AiError::Timeout } else { AiError::Network(e.to_string()) }
+    }
+}
+
+impl AiError {
+    /// Whether retrying the same request could plausibly work.
+    ///
+    /// A 5xx or a dropped connection is the provider's problem and usually
+    /// clears. A 401, 403 or 400 means the request itself is wrong, and
+    /// sending it again just burns the user's time before failing identically.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            AiError::Network(_) | AiError::Timeout => true,
+            AiError::Provider(text) => {
+                if text.contains("400 Bad Request")
+                    || text.contains("401")
+                    || text.contains("403")
+                    || text.contains("404")
+                {
+                    return false;
+                }
+                text.contains("429")
+                    || text.contains("500")
+                    || text.contains("502")
+                    || text.contains("503")
+                    || text.contains("504")
+            }
+            AiError::Unconfigured => false,
+        }
     }
 }
 
@@ -255,6 +295,9 @@ impl Provider for OpenAiCompat {
             req = req.bearer_auth(key);
         }
         let body = openai_body(&self.model, messages, tools, self.sampling);
+        if std::env::var("ARC_DEBUG_BODY").is_ok() {
+            eprintln!("[BODY] {}", serde_json::to_string(&body).unwrap_or_default());
+        }
         parse_openai(&post_json(req, &body).await?)
     }
 }
@@ -272,7 +315,13 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(base_url: String, model: String, api_key: Option<String>, sampling: Sampling, timeout: Duration) -> Self {
+    pub fn new(
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        sampling: Sampling,
+        timeout: Duration,
+    ) -> Self {
         Self { base_url, model, api_key, sampling, client: http_client(timeout) }
     }
 }
@@ -339,9 +388,8 @@ pub fn anthropic_body(model: &str, messages: &[AiMessage], tools: &[ToolDef], s:
 }
 
 pub fn parse_anthropic(parsed: &Json) -> Result<AiResult, AiError> {
-    let blocks = parsed["content"]
-        .as_array()
-        .ok_or_else(|| AiError::Provider("response has no content".into()))?;
+    let blocks =
+        parsed["content"].as_array().ok_or_else(|| AiError::Provider("response has no content".into()))?;
     let content = blocks
         .iter()
         .filter(|b| b["type"] == "text")
@@ -441,15 +489,41 @@ impl ProviderSet {
     }
 
     pub async fn complete(&self, messages: &[AiMessage], tools: &[ToolDef]) -> Result<AiResult, AiError> {
-        match self.primary.complete(messages, tools).await {
-            Ok(r) => Ok(r),
-            Err(e) => match &self.fallback {
-                Some(fb) => {
-                    tracing::warn!(provider = %self.primary.name(), error = %e, "primary provider failed; using fallback");
-                    fb.complete(messages, tools).await
+        // The cloud provider 500s on roughly 2 in 5 requests, transiently, and
+        // a retry clears it: measured 27/27 successes across max_tokens
+        // 400-1200 and temperature 0.0-0.9, so it is upstream noise rather
+        // than anything in the request. Retrying once keeps a hiccup on a
+        // capable model from silently degrading to the 2B, which is a far
+        // worse answer than a second of waiting.
+        let mut last = None;
+        for attempt in 0..2 {
+            match self.primary.complete(messages, tools).await {
+                Ok(r) => return Ok(r),
+                Err(e) if e.is_transient() => {
+                    tracing::debug!(provider = %self.primary.name(), %e, attempt, "transient provider error; retrying");
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt + 1))).await;
                 }
-                None => Err(e),
-            },
+                Err(e) => {
+                    // Not worth retrying (bad key, malformed request): go
+                    // straight to the fallback.
+                    return match &self.fallback {
+                        Some(fb) => {
+                            tracing::warn!(provider = %self.primary.name(), error = %e, "primary provider failed; using fallback");
+                            fb.complete(messages, tools).await
+                        }
+                        None => Err(e),
+                    };
+                }
+            }
+        }
+        let e = last.expect("a transient error to have been recorded");
+        match &self.fallback {
+            Some(fb) => {
+                tracing::warn!(provider = %self.primary.name(), error = %e, "primary provider failed after retry; using fallback");
+                fb.complete(messages, tools).await
+            }
+            None => Err(e),
         }
     }
 }
@@ -507,6 +581,15 @@ pub fn from_config(config: &arc_config::Ai) -> Result<ProviderSet, AiError> {
                 config.anthropic.base_url.clone(),
                 config.anthropic.model.clone(),
                 key_from_env(&config.anthropic.api_key_env),
+                sampling,
+                timeout,
+            )),
+            ProviderKind::Hermes => Box::new(OpenAiCompat::new(
+                "hermes-proxy",
+                config.hermes.base_url.clone(),
+                config.hermes.model.clone(),
+                // The proxy accepts any bearer and swaps in the real one.
+                key_from_env(&config.hermes.api_key_env).or_else(|| Some("hermes".into())),
                 sampling,
                 timeout,
             )),
@@ -696,5 +779,29 @@ mod tests {
         }
         let set = ProviderSet::new(Box::new(Fail), Some(Box::new(Ok_)));
         assert_eq!(set.complete(&[], &[]).await.unwrap().content, "fb");
+    }
+
+    #[test]
+    fn sampling_is_greedy_by_default() {
+        // Not a style preference. At 0.4 this model answered "am I on wifi"
+        // with "Yes, you are currently connected to the Wi-Fi network" without
+        // calling the tool that was sitting in its list, and lost two of 18
+        // tool calls against 0.0. Raising this default is how Arc starts
+        // inventing facts about the user's machine.
+        assert_eq!(Sampling::default().temperature, 0.0);
+    }
+
+    #[test]
+    fn transient_provider_errors_are_retried_and_hard_ones_are_not() {
+        // The cloud provider 500s intermittently; a retry clears it. A 401 means
+        // the key is wrong and retrying only delays the same failure.
+        assert!(AiError::Provider("status 500 Internal Server Error".into()).is_transient());
+        assert!(AiError::Provider("status 503".into()).is_transient());
+        assert!(AiError::Provider("status 429".into()).is_transient());
+        assert!(AiError::Network("connection reset".into()).is_transient());
+        assert!(AiError::Timeout.is_transient());
+        assert!(!AiError::Provider("status 401 Unauthorized".into()).is_transient());
+        assert!(!AiError::Provider("status 400 Bad Request".into()).is_transient());
+        assert!(!AiError::Unconfigured.is_transient());
     }
 }

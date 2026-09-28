@@ -7,8 +7,8 @@
 
 use crate::state::Daemon;
 use arc_proto::{
-    ClientMessage, ErrorCode, Event, MemoryRequest, PROTOCOL_VERSION, Request, ServerMessage, Topic, VoiceCommand,
-    encode_line,
+    ClientMessage, ErrorCode, Event, MemoryRequest, PROTOCOL_VERSION, Request, ServerMessage, Topic,
+    VoiceCommand, encode_line,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -93,7 +93,9 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<(
             break;
         }
         if buf.len() > MAX_LINE {
-            let _ = tx.send(encode_line(&ServerMessage::err(0, ErrorCode::BadRequest, "request too large"))).await;
+            let _ = tx
+                .send(encode_line(&ServerMessage::err(0, ErrorCode::BadRequest, "request too large")))
+                .await;
             break;
         }
         let line = buf.trim();
@@ -107,7 +109,8 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<(
                     .ok()
                     .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
                     .unwrap_or(0);
-                let _ = tx.send(encode_line(&ServerMessage::err(id, ErrorCode::BadRequest, e.to_string()))).await;
+                let _ =
+                    tx.send(encode_line(&ServerMessage::err(id, ErrorCode::BadRequest, e.to_string()))).await;
                 continue;
             }
         };
@@ -116,7 +119,8 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<(
             if let Some(t) = sub_task.take() {
                 t.abort();
             }
-            sub_task = Some(tokio::spawn(forward_events(daemon.events.subscribe(), topics.clone(), tx.clone())));
+            sub_task =
+                Some(tokio::spawn(forward_events(daemon.events.subscribe(), topics.clone(), tx.clone())));
             let _ = tx.send(encode_line(&ServerMessage::ok(msg.id, json!({"subscribed": topics})))).await;
             continue;
         }
@@ -143,11 +147,17 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<(
     Ok(())
 }
 
-async fn forward_events(mut rx: broadcast::Receiver<Event>, topics: HashSet<Topic>, tx: mpsc::Sender<String>) {
+async fn forward_events(
+    mut rx: broadcast::Receiver<Event>,
+    topics: HashSet<Topic>,
+    tx: mpsc::Sender<String>,
+) {
     loop {
         match rx.recv().await {
             Ok(e) => {
-                if topics.contains(&e.topic()) && tx.send(encode_line(&ServerMessage::Event { event: e })).await.is_err() {
+                if topics.contains(&e.topic())
+                    && tx.send(encode_line(&ServerMessage::Event { event: e })).await.is_err()
+                {
                     break;
                 }
             }
@@ -162,7 +172,10 @@ async fn forward_events(mut rx: broadcast::Receiver<Event>, topics: HashSet<Topi
 pub async fn handle(d: &Daemon, msg: ClientMessage) -> ServerMessage {
     let id = msg.id;
     match msg.request {
-        Request::Ping => ServerMessage::ok(id, json!({"pong": true, "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION})),
+        Request::Ping => ServerMessage::ok(
+            id,
+            json!({"pong": true, "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}),
+        ),
         Request::Hello { client, version } => {
             tracing::debug!(?client, %version, "client hello");
             ServerMessage::ok(id, json!({"protocol": PROTOCOL_VERSION}))
@@ -180,7 +193,9 @@ pub async fn handle(d: &Daemon, msg: ClientMessage) -> ServerMessage {
             }
             ServerMessage::ok(id, r)
         }
-        Request::Confirm { confirmation_id, approve } => ServerMessage::ok(id, d.confirm(&confirmation_id, approve).await),
+        Request::Confirm { confirmation_id, approve } => {
+            ServerMessage::ok(id, d.confirm(&confirmation_id, approve).await)
+        }
         Request::CallTool { tool, args } => ServerMessage::ok(id, d.call_tool(&tool, args).await),
         Request::Status => ServerMessage::ok(id, d.status()),
         Request::BarStatus => ServerMessage::ok(id, d.bar_status()),
@@ -207,7 +222,9 @@ pub async fn handle(d: &Daemon, msg: ClientMessage) -> ServerMessage {
             ServerMessage::ok(id, tools)
         }
         Request::Voice { command } => {
-            if matches!(command, VoiceCommand::Speak { .. } | VoiceCommand::StopSpeaking) || d.snapshot().voice.is_some() {
+            if matches!(command, VoiceCommand::Speak { .. } | VoiceCommand::StopSpeaking)
+                || d.snapshot().voice.is_some()
+            {
                 d.emit(Event::VoiceControl { command });
                 ServerMessage::ok(id, json!({"sent": true}))
             } else {

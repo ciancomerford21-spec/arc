@@ -9,7 +9,8 @@
 
 use crate::state::{Daemon, VoiceStatus};
 use arc_proto::{
-    AssistantState, ComponentHealth, ComponentStatus, Event, InputSource, VoiceCommand, VoiceReport, encode_line,
+    AssistantState, ComponentHealth, ComponentStatus, Event, InputSource, VoiceCommand, VoiceReport,
+    encode_line,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -56,7 +57,11 @@ impl VoiceLaunch {
 
 fn health_list(r: &VoiceReport) -> Option<VoiceStatus> {
     let VoiceReport::Health { mic, vad, wake, stt, tts, mode, .. } = r else { return None };
-    let c = |name: &str, h: &ComponentHealth| ComponentStatus { name: name.into(), status: h.status, detail: h.detail.clone() };
+    let c = |name: &str, h: &ComponentHealth| ComponentStatus {
+        name: name.into(),
+        status: h.status,
+        detail: h.detail.clone(),
+    };
     Some(VoiceStatus {
         mode: *mode,
         components: vec![c("mic", mic), c("vad", vad), c("wake", wake), c("stt", stt), c("tts", tts)],
@@ -185,7 +190,9 @@ fn on_report(daemon: &Arc<Daemon>, line: &str) {
         }
         VoiceReport::SpeakingStarted { .. } => daemon.set_state(AssistantState::Speaking, "speaking"),
         VoiceReport::SpeakingFinished { .. } => daemon.set_state(AssistantState::Idle, ""),
-        VoiceReport::Error { component, message } => daemon.record_error(&format!("voice.{component}"), &message),
+        VoiceReport::Error { component, message } => {
+            daemon.record_error(&format!("voice.{component}"), &message)
+        }
         VoiceReport::Health { .. } => unreachable!(),
     }
 }

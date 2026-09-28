@@ -50,11 +50,9 @@ pub async fn primary() -> Result<Interface> {
 }
 
 async fn nmcli_status() -> Result<Option<Interface>> {
-    let out = crate::run(
-        "nmcli",
-        &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION,IP4.ADDRESS", "dev"],
-        crate::SHORT,
-    ).await?;
+    let out =
+        crate::run("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION,IP4.ADDRESS", "dev"], crate::SHORT)
+            .await?;
     for line in out.lines() {
         let mut parts = line.split(':');
         let dev = match parts.next() {
@@ -95,23 +93,12 @@ async fn nmcli_status() -> Result<Option<Interface>> {
 }
 
 fn gateway_default() -> Option<String> {
-    std::process::Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .ok()
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .next()
-                .and_then(|l| {
-                    let mut w = l.split_whitespace();
-                    if w.next()? == "default" {
-                        w.next()?.strip_prefix("via ").map(|g| g.to_string())
-                    } else {
-                        None
-                    }
-                })
+    std::process::Command::new("ip").args(["route", "show", "default"]).output().ok().and_then(|out| {
+        String::from_utf8_lossy(&out.stdout).lines().next().and_then(|l| {
+            let mut w = l.split_whitespace();
+            if w.next()? == "default" { w.next()?.strip_prefix("via ").map(|g| g.to_string()) } else { None }
         })
+    })
 }
 
 fn ping() -> bool {
@@ -138,10 +125,10 @@ fn public_ip_sync() -> Option<IpAddr> {
 
 /// Async variant that queries public IP over the network.
 pub async fn public_ip() -> Result<Option<IpAddr>> {
-    let resp = reqwest::get("https://api.ipify.org").await
+    let resp = reqwest::get("https://api.ipify.org")
+        .await
         .map_err(|e| SysError::DBus(format!("reqwest error: {e}")))?;
-    let s = resp.text().await
-        .map_err(|e| SysError::DBus(format!("reqwest error: {e}")))?;
+    let s = resp.text().await.map_err(|e| SysError::DBus(format!("reqwest error: {e}")))?;
     Ok(s.parse().ok())
 }
 

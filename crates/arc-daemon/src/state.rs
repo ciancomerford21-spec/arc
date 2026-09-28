@@ -6,8 +6,8 @@ use arc_config::paths;
 use arc_core::{Assistant, InputSource as CoreSource, NluInput, Reply, Route};
 use arc_memory::MemoryStore;
 use arc_proto::{
-    AskResult, AssistantState, BarStatus, ComponentStatus, Event, HealthStatus, InputSource, StatusReport, VoiceCommand,
-    VoiceMode,
+    AskResult, AssistantState, BarStatus, ComponentStatus, Event, HealthStatus, InputSource, StatusReport,
+    VoiceCommand, VoiceMode,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -227,17 +227,26 @@ impl Daemon {
         }];
         components.push(ComponentStatus {
             name: "ai".into(),
-            status: if self.assistant.provider_name() == "none" { HealthStatus::Disabled } else { HealthStatus::Unknown },
+            status: if self.assistant.provider_name() == "none" {
+                HealthStatus::Disabled
+            } else {
+                HealthStatus::Unknown
+            },
             detail: self.assistant.provider_name().into(),
         });
         match &m.voice {
-            Some(v) => components.extend(v.components.iter().map(|c| ComponentStatus {
-                name: format!("voice.{}", c.name),
-                ..c.clone()
-            })),
+            Some(v) => components.extend(
+                v.components
+                    .iter()
+                    .map(|c| ComponentStatus { name: format!("voice.{}", c.name), ..c.clone() }),
+            ),
             None => components.push(ComponentStatus {
                 name: "voice".into(),
-                status: if self.config.voice.enabled { HealthStatus::Unavailable } else { HealthStatus::Disabled },
+                status: if self.config.voice.enabled {
+                    HealthStatus::Unavailable
+                } else {
+                    HealthStatus::Disabled
+                },
                 detail: if self.config.voice.enabled { "not running".into() } else { String::new() },
             }),
         }
@@ -260,6 +269,7 @@ impl Daemon {
             ai_model: match self.config.ai.provider {
                 arc_config::ProviderKind::Local => self.config.ai.local.model.clone(),
                 arc_config::ProviderKind::Openai => self.config.ai.openai.model.clone(),
+                arc_config::ProviderKind::Hermes => self.config.ai.hermes.model.clone(),
                 arc_config::ProviderKind::Anthropic => self.config.ai.anthropic.model.clone(),
                 arc_config::ProviderKind::None => String::new(),
             },

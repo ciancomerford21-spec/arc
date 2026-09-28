@@ -31,10 +31,18 @@ name = "coding mode"
 triggers = ["start coding", "dev mode"]
 description = "VS Code on workspace 2, a terminal, GitHub on workspace 3"
 steps = [
+  # Every app step names its workspace explicitly. app_launch with no
+  # workspace argument focuses whatever window it finds, so a terminal already
+  # open on another workspace dragged the active workspace (and the browser)
+  # with it. The waits are not padding: kitty is spawned asynchronously, so
+  # without them the late window came up after the browser had moved and
+  # inherited the wrong workspace.
   { tool = "app_launch", args = { app = "code", workspace = 2 } },
-  { wait_ms = 700 },
-  { tool = "app_launch", args = { app = "terminal" } },
+  { wait_ms = 900 },
+  { tool = "app_launch", args = { app = "terminal", workspace = 2 } },
+  { wait_ms = 900 },
   { tool = "open_url", args = { url = "github.com", workspace = 3 } },
+  { wait_ms = 300 },
   { tool = "workspace_goto", args = { id = 2 } },
   { say = "Coding mode is ready." },
 ]

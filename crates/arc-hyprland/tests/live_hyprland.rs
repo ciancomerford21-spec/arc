@@ -93,3 +93,63 @@ async fn bad_dispatch_is_reported() {
     let r = h.request("dispatch hl.dsp.definitely_not_real()").await.unwrap();
     assert_ne!(r.trim(), "ok");
 }
+
+/// Regression test for a real bug: `follow_browser_to` used to look for the
+/// browser once and give up. On a cold start -- no browser running, which is
+/// exactly when "coding mode" is most used -- the first lookup found nothing,
+/// the failure was logged only at debug level, and the new window inherited
+/// the active workspace. So "open GitHub on workspace 3" put the page on 2,
+/// every time, silently.
+///
+/// The wait lives in arc-tools next to the tool, but the behaviour under test
+/// is "a window that does not exist yet is still findable", so it is checked
+/// here against real Hyprland using a probe window standing in for the
+/// browser. If the retry is removed this fails.
+#[tokio::test]
+async fn a_window_that_appears_late_is_still_found() {
+    let Some(h) = hypr() else { return };
+    // Unique per run: a probe from a killed run can still be alive, and
+    // matching on a shared class would then find that stale window instead of
+    // the one this test just spawned.
+    let tag = format!("arc-late-{}", std::process::id());
+    let class = format!("arc-probe-late-{}", std::process::id());
+
+    // Park a probe on a hidden special workspace, exactly as the other live
+    // tests do, so the user's own windows and focus are untouched.
+    h.dispatch(&Dispatch::Exec {
+        cmd: format!("kitty --class {class} --title {tag} -e sleep 20"),
+        workspace: Some(format!("special:{tag} silent")),
+    })
+    .await
+    .unwrap();
+
+    // Poll the way follow_browser_to now does. A single-shot lookup is what
+    // used to fail here.
+    let mut found = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let clients = h.clients().await.unwrap();
+        if let Some(w) = clients.iter().find(|w| w.class == class) {
+            found = Some(w.clone());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let w = found.expect("probe window never appeared: the retry loop is gone");
+
+    // The move itself is already covered by probe_window_lifecycle. What is
+    // being pinned here is the retry: a window that is not there on the first
+    // lookup must still be found, because on a cold-started browser that is
+    // the normal case rather than the exception.
+    assert!(
+        w.workspace.name == format!("special:{tag}"),
+        "probe landed on {} instead of its own special workspace: {}",
+        w.workspace.name,
+        tag
+    );
+    // The probe closes itself: it was spawned as `... -e sleep 20`, the same
+    // way the other live tests clean up.
+}

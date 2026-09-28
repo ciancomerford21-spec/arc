@@ -221,7 +221,11 @@ mod tests {
     #[test]
     fn peripheral_battery_is_not_the_system_battery() {
         let t = tempfile::tempdir().unwrap();
-        dev(t.path(), "hidpp_battery_0", &[("type", "Battery"), ("scope", "Device"), ("capacity", "40"), ("status", "Discharging")]);
+        dev(
+            t.path(),
+            "hidpp_battery_0",
+            &[("type", "Battery"), ("scope", "Device"), ("capacity", "40"), ("status", "Discharging")],
+        );
         assert_eq!(read_power_supply(t.path()).mode, PowerMode::NoBattery);
     }
 
@@ -229,10 +233,18 @@ mod tests {
     fn discharging_laptop_energy() {
         let t = tempfile::tempdir().unwrap();
         dev(t.path(), "AC", &[("type", "Mains"), ("online", "0")]);
-        dev(t.path(), "BAT0", &[
-            ("type", "Battery"), ("status", "Discharging"), ("capacity", "50"),
-            ("energy_now", "30000000"), ("energy_full", "60000000"), ("power_now", "10000000"),
-        ]);
+        dev(
+            t.path(),
+            "BAT0",
+            &[
+                ("type", "Battery"),
+                ("status", "Discharging"),
+                ("capacity", "50"),
+                ("energy_now", "30000000"),
+                ("energy_full", "60000000"),
+                ("power_now", "10000000"),
+            ],
+        );
         let i = read_power_supply(t.path());
         assert_eq!(i.mode, PowerMode::OnBattery);
         assert_eq!(i.battery_percent, Some(50));
@@ -245,10 +257,18 @@ mod tests {
     fn charging_laptop_charge_units() {
         let t = tempfile::tempdir().unwrap();
         dev(t.path(), "ADP1", &[("type", "Mains"), ("online", "1")]);
-        dev(t.path(), "BAT1", &[
-            ("type", "Battery"), ("status", "Charging"), ("capacity", "75"),
-            ("charge_now", "3000000"), ("charge_full", "4000000"), ("current_now", "2000000"),
-        ]);
+        dev(
+            t.path(),
+            "BAT1",
+            &[
+                ("type", "Battery"),
+                ("status", "Charging"),
+                ("capacity", "75"),
+                ("charge_now", "3000000"),
+                ("charge_full", "4000000"),
+                ("current_now", "2000000"),
+            ],
+        );
         let i = read_power_supply(t.path());
         assert_eq!(i.mode, PowerMode::Charging);
         assert_eq!(i.time_to_full_minutes, Some(30)); // 1 Ah / 2 A

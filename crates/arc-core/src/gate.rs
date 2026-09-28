@@ -32,7 +32,11 @@ fn to_json(args: &JsonMap) -> Json {
 }
 
 fn short(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
 }
 
 impl Outcome {
@@ -51,7 +55,15 @@ impl Outcome {
                     ToolResult::Ok(v) => (ActionOutcome::Success, short(&v.to_string(), 200), v.clone()),
                     ToolResult::Error(e) => (ActionOutcome::Failed, short(e, 200), Json::Null),
                 };
-                ActionRecord { tool: tool.clone(), args: args.clone(), risk: *risk, outcome, summary, data, duration_ms: *duration_ms }
+                ActionRecord {
+                    tool: tool.clone(),
+                    args: args.clone(),
+                    risk: *risk,
+                    outcome,
+                    summary,
+                    data,
+                    duration_ms: *duration_ms,
+                }
             }
             Outcome::NeedsConfirmation(p) => ActionRecord {
                 tool: p.tool.clone(),
@@ -132,7 +144,9 @@ impl Gate {
             d => d,
         };
         match decision {
-            Decision::Deny { reason } => Outcome::Denied { tool: tool.into(), reason, args: to_json(&args), risk: a.risk },
+            Decision::Deny { reason } => {
+                Outcome::Denied { tool: tool.into(), reason, args: to_json(&args), risk: a.risk }
+            }
             Decision::Confirm { .. } => {
                 let p = self.pending.lock().unwrap().issue(
                     tool,
@@ -157,7 +171,12 @@ impl Gate {
             _ => JsonMap::new(),
         };
         let Some(t) = self.tools.by_name(&p.tool).cloned() else {
-            return Ok(Outcome::Denied { tool: p.tool, reason: "tool no longer available".into(), args: p.args, risk: p.risk });
+            return Ok(Outcome::Denied {
+                tool: p.tool,
+                reason: "tool no longer available".into(),
+                args: p.args,
+                risk: p.risk,
+            });
         };
         // Re-check: a confirmation can never unlock a blocked call.
         if let Some(reason) = t.assess(&args).blocked {
@@ -226,7 +245,11 @@ mod tests {
         let danger = Arc::new(AtomicUsize::new(0));
         let mut tools = Tools::new();
         tools.register(Arc::new(Probe { name: "probe.safe", risk: RiskLevel::Safe, runs: safe.clone() }));
-        tools.register(Arc::new(Probe { name: "probe.danger", risk: RiskLevel::Dangerous, runs: danger.clone() }));
+        tools.register(Arc::new(Probe {
+            name: "probe.danger",
+            risk: RiskLevel::Dangerous,
+            runs: danger.clone(),
+        }));
         (Gate::new(Arc::new(tools), cfg), safe, danger)
     }
 
@@ -266,7 +289,10 @@ mod tests {
     async fn real_power_tools_are_held() {
         let (g, _, _) = gate(&Config::default());
         for t in ["reboot", "shutdown"] {
-            assert!(matches!(g.run(t, JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)), "{t}");
+            assert!(
+                matches!(g.run(t, JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)),
+                "{t}"
+            );
         }
     }
 

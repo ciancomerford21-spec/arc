@@ -25,11 +25,8 @@ pub struct RunResult {
 }
 
 pub fn norm_phrase(s: &str) -> String {
-    let t: String = s
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' })
-        .collect();
+    let t: String =
+        s.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' }).collect();
     let mut words: Vec<&str> = t.split_whitespace().collect();
     for lead in [&["hey", "arc"][..], &["ok", "arc"], &["okay", "arc"], &["arc"], &["please"]] {
         if words.len() > lead.len() && words[..lead.len()] == *lead {
@@ -71,7 +68,10 @@ impl Automations {
             for s in &a.steps {
                 if let Step::Tool { tool, .. } = s {
                     if gate.tools().by_name(tool).is_none() {
-                        out.push(format!("automation \"{}\": unknown tool \"{tool}\" (see `arc tools`)", a.name));
+                        out.push(format!(
+                            "automation \"{}\": unknown tool \"{tool}\" (see `arc tools`)",
+                            a.name
+                        ));
                     }
                 }
             }
@@ -84,14 +84,17 @@ impl Automations {
         let mut actions = vec![];
         for step in &a.steps {
             match step {
-                Step::Wait { wait_ms } => tokio::time::sleep(Duration::from_millis((*wait_ms).min(60_000))).await,
+                Step::Wait { wait_ms } => {
+                    tokio::time::sleep(Duration::from_millis((*wait_ms).min(60_000))).await
+                }
                 Step::Say { say } => said.push(say.clone()),
                 Step::Tool { tool, args } => {
                     let args: JsonMap = match args {
                         Json::Object(m) => m.clone().into_iter().collect(),
                         _ => JsonMap::new(),
                     };
-                    let outcome = gate.run(tool, args, json!({"source": "automation", "automation": a.name})).await;
+                    let outcome =
+                        gate.run(tool, args, json!({"source": "automation", "automation": a.name})).await;
                     actions.push(outcome.record());
                     match outcome {
                         Outcome::Done { result: ToolResult::Ok(_), .. } => {}
@@ -104,12 +107,20 @@ impl Automations {
                         }
                         Outcome::Done { result: ToolResult::Error(e), .. } => {
                             if !a.continue_on_error {
-                                return RunResult { text: format!("\"{}\" stopped: {tool} failed: {e}", a.name), actions, pending: None };
+                                return RunResult {
+                                    text: format!("\"{}\" stopped: {tool} failed: {e}", a.name),
+                                    actions,
+                                    pending: None,
+                                };
                             }
                         }
                         Outcome::Denied { reason, .. } => {
                             if !a.continue_on_error {
-                                return RunResult { text: format!("\"{}\" stopped: {tool} was refused: {reason}", a.name), actions, pending: None };
+                                return RunResult {
+                                    text: format!("\"{}\" stopped: {tool} was refused: {reason}", a.name),
+                                    actions,
+                                    pending: None,
+                                };
                             }
                         }
                     }
@@ -134,8 +145,12 @@ mod tests {
 
     #[test]
     fn phrases_match_exactly_after_normalising() {
-        let a = autos("[[automation]]\nname = \"gaming mode\"\ntriggers = [\"let's play\"]\nsteps = [{ say = \"ok\" }]\n");
-        for t in ["gaming mode", "Gaming mode.", "Hey Arc, gaming mode please", "let's play!", "arc let's play"] {
+        let a = autos(
+            "[[automation]]\nname = \"gaming mode\"\ntriggers = [\"let's play\"]\nsteps = [{ say = \"ok\" }]\n",
+        );
+        for t in
+            ["gaming mode", "Gaming mode.", "Hey Arc, gaming mode please", "let's play!", "arc let's play"]
+        {
             assert!(a.find(t).is_some(), "{t}");
         }
         for t in ["gaming", "start gaming mode now", "play", ""] {
@@ -145,7 +160,9 @@ mod tests {
 
     #[tokio::test]
     async fn runs_steps_and_speaks_say_lines() {
-        let a = autos("[[automation]]\nname = \"check\"\nsteps = [{ tool = \"power_info\" }, { wait_ms = 1 }, { say = \"All checked.\" }]\n");
+        let a = autos(
+            "[[automation]]\nname = \"check\"\nsteps = [{ tool = \"power_info\" }, { wait_ms = 1 }, { say = \"All checked.\" }]\n",
+        );
         let gate = Gate::new(Arc::new(Tools::new()), &Config::default());
         let r = a.run(a.find("check").unwrap(), &gate).await;
         assert_eq!(r.text, "All checked.");
@@ -155,7 +172,9 @@ mod tests {
 
     #[tokio::test]
     async fn dangerous_step_pauses_for_confirmation() {
-        let a = autos("[[automation]]\nname = \"bye\"\nsteps = [{ tool = \"reboot\" }, { say = \"never said\" }]\n");
+        let a = autos(
+            "[[automation]]\nname = \"bye\"\nsteps = [{ tool = \"reboot\" }, { say = \"never said\" }]\n",
+        );
         let gate = Gate::new(Arc::new(Tools::new()), &Config::default());
         let r = a.run(a.find("bye").unwrap(), &gate).await;
         assert!(r.pending.is_some(), "reboot must not run unconfirmed");
@@ -164,7 +183,9 @@ mod tests {
 
     #[test]
     fn unknown_tools_are_reported() {
-        let a = autos("[[automation]]\nname = \"x\"\nsteps = [{ tool = \"apps.launch\" }, { tool = \"app_launch\", args = { app = \"code\" } }]\n");
+        let a = autos(
+            "[[automation]]\nname = \"x\"\nsteps = [{ tool = \"apps.launch\" }, { tool = \"app_launch\", args = { app = \"code\" } }]\n",
+        );
         let gate = Gate::new(Arc::new(Tools::new()), &Config::default());
         let p = a.problems(&gate);
         assert_eq!(p.len(), 1);

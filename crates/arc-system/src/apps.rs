@@ -43,7 +43,11 @@ pub enum Resolved {
     /// Plain executable on PATH (no desktop entry).
     Exe(String),
     /// An Omarchy launcher command (`omarchy-launch-browser` …).
-    Command { label: String, argv: Vec<String>, window: String },
+    Command {
+        label: String,
+        argv: Vec<String>,
+        window: String,
+    },
 }
 
 impl Resolved {
@@ -162,7 +166,10 @@ pub fn parse_desktop(id: &str, text: &str) -> Option<DesktopApp> {
         id: id.to_string(),
         name: kv.get("Name").unwrap_or(&id).to_string(),
         generic_name: kv.get("GenericName").unwrap_or(&"").to_string(),
-        keywords: kv.get("Keywords").map(|k| k.split(';').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default(),
+        keywords: kv
+            .get("Keywords")
+            .map(|k| k.split(';').filter(|s| !s.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default(),
         exe,
         wm_class: kv.get("StartupWMClass").unwrap_or(&"").to_string(),
     })
@@ -232,10 +239,7 @@ pub fn resolve_in(query: &str, apps: &[DesktopApp], exe_on_path: impl Fn(&str) -
         return None;
     }
     // Aliases see the phrase before the trailing type word is dropped ("web browser").
-    let target = alias(&n)
-        .or_else(|| alias(&q))
-        .map(str::to_string)
-        .unwrap_or_else(|| q.clone());
+    let target = alias(&n).or_else(|| alias(&q)).map(str::to_string).unwrap_or_else(|| q.clone());
     if target.starts_with('@') {
         if let Some(r) = omarchy_default(&target) {
             return Some(r);
@@ -260,10 +264,8 @@ pub fn resolve(query: &str) -> Option<Resolved> {
 /// Close matches, for "did you mean" error messages.
 pub fn suggestions(query: &str, n: usize) -> Vec<String> {
     let q = compact(&strip_filler(&norm(query)));
-    let mut v: Vec<(f64, String)> = desktop_apps()
-        .into_iter()
-        .map(|a| (strsim::jaro_winkler(&q, &compact(&a.name)), a.name))
-        .collect();
+    let mut v: Vec<(f64, String)> =
+        desktop_apps().into_iter().map(|a| (strsim::jaro_winkler(&q, &compact(&a.name)), a.name)).collect();
     v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     v.into_iter().take(n).map(|(_, s)| s).collect()
 }
@@ -299,8 +301,11 @@ fn spawn_detached(argv: &[String]) -> Result<()> {
     full.extend(argv.iter().cloned());
     let mut cmd = std::process::Command::new("setsid");
     cmd.arg("-f").args(&full);
-    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let status = cmd.status().map_err(|e| SysError::Command { what: full.join(" "), detail: e.to_string() })?;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let status =
+        cmd.status().map_err(|e| SysError::Command { what: full.join(" "), detail: e.to_string() })?;
     if !status.success() {
         return Err(SysError::Command { what: full.join(" "), detail: format!("exit status {status}") });
     }
@@ -372,7 +377,11 @@ pub fn normalise_url(input: &str) -> Option<String> {
     let lower = s.to_lowercase();
     let url = if lower.starts_with("https://") || lower.starts_with("http://") {
         s.to_string()
-    } else if lower.contains("://") || lower.starts_with("javascript:") || lower.starts_with("file:") || lower.starts_with("data:") {
+    } else if lower.contains("://")
+        || lower.starts_with("javascript:")
+        || lower.starts_with("file:")
+        || lower.starts_with("data:")
+    {
         return None;
     } else {
         format!("https://{s}")
@@ -380,7 +389,8 @@ pub fn normalise_url(input: &str) -> Option<String> {
     // Host must look like a domain (or localhost).
     let host = url.split("://").nth(1)?.split(['/', '?', '#']).next()?.split('@').last()?;
     let host = host.split(':').next()?;
-    let ok = host == "localhost" || (host.contains('.') && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'));
+    let ok = host == "localhost"
+        || (host.contains('.') && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'));
     ok.then_some(url)
 }
 
@@ -404,7 +414,14 @@ mod tests {
     use super::*;
 
     fn app(id: &str, name: &str, exe: &str) -> DesktopApp {
-        DesktopApp { id: id.into(), name: name.into(), generic_name: String::new(), keywords: vec![], exe: exe.into(), wm_class: String::new() }
+        DesktopApp {
+            id: id.into(),
+            name: name.into(),
+            generic_name: String::new(),
+            keywords: vec![],
+            exe: exe.into(),
+            wm_class: String::new(),
+        }
     }
 
     fn apps() -> Vec<DesktopApp> {
@@ -415,7 +432,10 @@ mod tests {
             app("footclient", "Foot Client", "footclient"),
             app("hermes-desktop", "Hermes", "hermes-desktop"),
             DesktopApp { generic_name: "Web Browser".into(), ..app("chromium", "Chromium", "chromium") },
-            DesktopApp { keywords: vec!["spreadsheet".into()], ..app("libreoffice-calc", "LibreOffice Calc", "libreoffice") },
+            DesktopApp {
+                keywords: vec!["spreadsheet".into()],
+                ..app("libreoffice-calc", "LibreOffice Calc", "libreoffice")
+            },
         ]
     }
 
@@ -461,7 +481,10 @@ mod tests {
         assert_eq!(a.exe, "nautilus");
         assert_eq!(a.keywords, vec!["folder", "manager"]);
         assert_eq!(a.wm_class, "org.gnome.Nautilus");
-        assert!(parse_desktop("x", "[Desktop Entry]\nType=Application\nName=X\nExec=x\nNoDisplay=true\n").is_none());
+        assert!(
+            parse_desktop("x", "[Desktop Entry]\nType=Application\nName=X\nExec=x\nNoDisplay=true\n")
+                .is_none()
+        );
         let env = parse_desktop("y", "[Desktop Entry]\nName=Y\nExec=env FOO=1 /usr/bin/yapp %F\n").unwrap();
         assert_eq!(env.exe, "env");
     }
@@ -478,9 +501,20 @@ mod tests {
     #[test]
     fn urls_are_normalised_and_unsafe_ones_refused() {
         assert_eq!(normalise_url("github.com").as_deref(), Some("https://github.com"));
-        assert_eq!(normalise_url("https://www.google.com/search?q=arc").as_deref(), Some("https://www.google.com/search?q=arc"));
+        assert_eq!(
+            normalise_url("https://www.google.com/search?q=arc").as_deref(),
+            Some("https://www.google.com/search?q=arc")
+        );
         assert_eq!(normalise_url("http://localhost:8080/x").as_deref(), Some("http://localhost:8080/x"));
-        for bad in ["file:///etc/passwd", "javascript:alert(1)", "rm -rf ~", "", "github", "ftp://x.org", "a.com; ls"] {
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "rm -rf ~",
+            "",
+            "github",
+            "ftp://x.org",
+            "a.com; ls",
+        ] {
             assert_eq!(normalise_url(bad), None, "{bad}");
         }
     }

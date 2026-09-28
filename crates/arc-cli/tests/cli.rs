@@ -47,7 +47,11 @@ fn arcd() -> Arcd {
 
 fn arc(sock: &Path, args: &[&str]) -> (bool, String, String) {
     let o = Command::new(env!("CARGO_BIN_EXE_arc")).args(args).env("ARC_SOCKET", sock).output().unwrap();
-    (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+    (
+        o.status.success(),
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
 }
 
 #[test]
@@ -121,7 +125,12 @@ fn bar_follow_emits_on_state_change() {
     arc(&d.socket, &["ask", "battery status"]);
     // thinking -> idle
     let states: Vec<String> = (0..2)
-        .map(|_| serde_json::from_str::<serde_json::Value>(&lines.next().unwrap().unwrap()).unwrap()["state"].as_str().unwrap().to_string())
+        .map(|_| {
+            serde_json::from_str::<serde_json::Value>(&lines.next().unwrap().unwrap()).unwrap()["state"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
     assert_eq!(states, ["thinking", "idle"]);
     let _ = f.kill();

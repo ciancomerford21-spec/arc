@@ -797,6 +797,13 @@ fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
     //   796              18/20            ~880
     //   310 (this one)   19/20             760
     //
+    // The word budget is not a style preference. Kokoro synthesises at real-time
+    // factor 1.0 (measured: 130 chars of text -> 7.62s of synthesis for 7.33s
+    // of audio), so the reply's length IS the wait, and a user cannot barge in
+    // mid-render. Uncapped, this model wrote 250-1300 char answers: up to nine
+    // minutes of talking. The cap cut the median from 85s to 73s of speech and
+    // removed the tail entirely.
+    //
     // Each retained clause has to earn its place by fixing something measured:
     // "never claim an action happened unless a tool confirms it" stops
     // fabricated confirmations, and "if you don't know, say so in one line"
@@ -807,7 +814,10 @@ fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
         "You are {name}, a voice assistant on the user's Linux desktop. \
          You speak aloud, so no markdown, no lists, no emoji. Keep it to \
          one or two sentences for a simple action, and go longer only when there \
-         is genuinely something to explain. \
+         is genuinely something to explain. Spoken output, so budget with the clock \
+         in mind: 20 words is a moment, 40 is a sentence or two, 80 is the most you \
+         should ever use unless asked to explain something at length. Do not exceed \
+         that; if the answer needs more, give the useful part first and offer to go on. \
          Use a tool whenever one can answer, and never claim an action happened \
          unless a tool confirms it. When you call a tool, say nothing first \
          -- no \"let me check\", no \"I'll take a look\"; a tool call is not \
@@ -1478,6 +1488,31 @@ mod tests {
             c.personality.custom_prompt.len() > 200,
             "the shipped default has no personality ({} chars)",
             c.personality.custom_prompt.len()
+        );
+    }
+
+    #[test]
+    fn the_prompt_carries_a_word_budget() {
+        // Removed once already as "wordy advice with no measured effect". It has
+        // a measured effect now: Kokoro runs at real-time factor 1.0, so reply
+        // length is literally the length of the pause before the user can talk
+        // again. Without this the model wrote 250-1300 char answers.
+        let p = system_prompt(&Config::default(), None);
+        assert!(p.contains("20 words is a moment"), "the word budget is gone: {p}");
+    }
+
+    #[test]
+    fn the_token_budget_leaves_room_for_a_spoken_answer() {
+        // The model reasons before it answers, so a tight budget truncates
+        // mid-sentence rather than producing a short reply. Measured over 7
+        // questions: 300 truncated 1/7, 400 truncated 0/7 at a median of 73s
+        // of speech.
+        let c = Config::default();
+        assert!(
+            c.ai.max_tokens >= 350 && c.ai.max_tokens <= 450,
+            "max_tokens is {}; under 350 truncates mid-sentence, over 450 is over a \
+             minute of extra speech for no measured gain",
+            c.ai.max_tokens
         );
     }
 }

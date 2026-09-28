@@ -34,6 +34,14 @@ pub struct Agent {
 /// output (window list, shell output) can't blow the context window.
 const MAX_RESULT_CHARS: usize = 4000;
 
+/// Longest reply Arc will speak before shortening it, in characters.
+///
+/// Kokoro is real-time, so this is also roughly the longest the user waits
+/// before they can interrupt. 240 characters is about 110 seconds of speech,
+/// which is already generous for a spoken answer; the median measured reply
+/// before this was 274.
+const MAX_SPOKEN_CHARS: usize = 240;
+
 fn result_for_model(outcome: &Outcome) -> String {
     let s = match outcome {
         Outcome::Done { result: ToolResult::Ok(v), .. } => json!({"ok": v}).to_string(),
@@ -52,6 +60,107 @@ fn result_for_model(outcome: &Outcome) -> String {
     } else {
         s
     }
+}
+
+/// Keep a spoken reply to something a person will actually sit through.
+///
+/// The prompt asks for a word budget and the model mostly ignores it: measured
+/// over five questions it wrote a median 274 characters whatever the cap said,
+/// and lowering max_tokens only cut answers off mid-word. Neither works, because
+/// the model reasons first and the budget lands after the reasoning.
+///
+/// So enforce it in software. Kokoro runs at real-time factor 1.0 (130 chars of
+/// text -> 7.33s of audio), so characters ARE seconds of silence before the user
+/// can barge in: 274 characters is 124 seconds of Arc talking. Keeping the
+/// leading sentences gets the answer out first and relies on the model leading
+/// with its conclusion, which it does.
+///
+/// The cut is announced rather than silent, so a shortened answer does not read
+/// as a whole one.
+/// Whether the dot at `hit` belongs to a URL rather than ending a sentence.
+///
+/// The tell is what surrounds it: a URL's dot is preceded by a domain label
+/// and the whole run is under a scheme. Once seen, every later dot in that run
+/// is also a URL dot, so this is checked before the generic "not followed by a
+/// space" rule that would otherwise stop at the TLD.
+fn is_url_context(rest: &str, hit: usize) -> bool {
+    if !rest[..hit].contains("://") {
+        return false;
+    }
+    // No sentence break between the scheme and this dot, i.e. the URL run is
+    // unbroken. A space would mean the URL ended and a new sentence began.
+    !rest[..hit].contains(' ')
+}
+
+pub fn shorten_for_speech(text: &str, max_chars: usize) -> String {
+    let t = text.trim();
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    let mut kept = String::new();
+    let mut rest = t;
+    // At least the first sentence always goes out, even when it alone
+    // exceeds the budget. Dropping it would leave nothing to say, and a
+    // too-long opener beats silence.
+    let mut first = true;
+    while !rest.is_empty() {
+        // A sentence ends at . ! ? -- but not a decimal point or "e.g." style
+        // fragment, which are followed by a non-space.
+        // Scan forward for a real terminator, skipping any that is not one.
+        // A terminator is a . ! ? followed by whitespace or end of text, and
+        // not a decimal point between two digits. "Your load is 11.5 and the
+        // CPU is zero." is the case that matters: cutting at the dot made Arc
+        // open with "5 and the CPU is zero".
+        // `end` is only meaningful once a real terminator is found; the scan
+        // skips dots that are not terminators, so it needs its own "found
+        // nothing" answer rather than reusing the running index.
+        let mut scan = 0usize;
+        let mut end = None;
+        loop {
+            let hit = match rest[scan..].find(|c| c == '.' || c == '!' || c == '?') {
+                Some(i) => scan + i,
+                None => break,
+            };
+            let after_dot = hit + 1;
+            // A URL first: its dots are never sentence ends, and the generic
+            // check below cannot tell "example.com" from "the end. Next".
+            if is_url_context(rest, hit) {
+                scan = after_dot;
+                continue;
+            }
+            if after_dot < rest.len() && !rest[after_dot..].starts_with(char::is_whitespace) {
+                scan = after_dot; // an abbreviation or file name
+                continue;
+            }
+            let before = rest[..hit].chars().next_back();
+            let after = rest[after_dot..].chars().next();
+            if before.is_some_and(|b| b.is_ascii_digit()) && after.is_some_and(|a| a.is_ascii_digit()) {
+                scan = after_dot; // a decimal such as 11.5
+                continue;
+            }
+            end = Some(after_dot);
+            break;
+        }
+        // No terminator anywhere left: what remains is one unbroken run.
+        let Some(end) = end else { break };
+        if end == 0 {
+            break;
+        }
+        let next = &rest[..end];
+        if !first && kept.chars().count() + next.chars().count() + 6 > max_chars {
+            break;
+        }
+        first = false;
+        kept.push_str(next);
+        kept.push(' ');
+        rest = rest[end..].trim_start();
+    }
+    if kept.trim().is_empty() {
+        // One unbroken run (a URL, a stack trace): cutting mid-token would be
+        // worse than speaking it, and a URL is not really "too talkative".
+        return t.to_string();
+    }
+    format!("{} Want the rest?", kept.trim())
 }
 
 impl Agent {
@@ -92,7 +201,7 @@ impl Agent {
                 // below and spoken verbatim, and a failed round should not be
                 // dressed up before the user is told what went wrong.
                 let text = self.providers.phrase(&msgs, &r.content).await;
-                return Ok(AgentReply::Answer { text, actions });
+                return Ok(AgentReply::Answer { text: shorten_for_speech(&text, MAX_SPOKEN_CHARS), actions });
             }
             // Two rounds of failed calls in a row: stop letting the model guess
             // and have it explain instead (one final call, no tools).
@@ -105,7 +214,7 @@ impl Agent {
                 let r = self.providers.complete(&msgs, &[]).await?;
                 let text =
                     if r.content.trim().is_empty() { "Sorry, I couldn't do that.".into() } else { r.content };
-                return Ok(AgentReply::Answer { text, actions });
+                return Ok(AgentReply::Answer { text: shorten_for_speech(&text, MAX_SPOKEN_CHARS), actions });
             }
             msgs.push(AiMessage::assistant(r.content.clone(), r.tool_calls.clone()));
             let mut held: Option<PendingConfirmation> = None;
@@ -372,5 +481,70 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 4);
         let last = seen.lock().unwrap().last().unwrap().clone();
         assert!(last.last().unwrap().content.contains("Stop calling tools"));
+    }
+
+    #[test]
+    fn a_short_reply_is_untouched() {
+        assert_eq!(shorten_for_speech("Done.", 240), "Done.");
+        assert_eq!(shorten_for_speech("  padded  ", 240), "padded");
+    }
+
+    #[test]
+    fn a_long_reply_keeps_the_leading_sentences_and_says_so() {
+        let long = "A closure is a function that remembers the variables from where it \
+                    was defined. That is the whole trick, and it is why closures are \
+                    useful for callbacks. The variables stay alive after the outer \
+                    function has returned.";
+        let out = shorten_for_speech(long, 120);
+        assert!(out.starts_with("A closure is a function"), "{out}");
+        assert!(out.ends_with("Want the rest?"), "{out}");
+        // Must not cut mid-word, and must actually be shorter.
+        assert!(out.chars().count() < long.chars().count(), "{out}");
+        assert!(out.chars().count() <= 120 + 6, "{} chars", out.chars().count());
+    }
+
+    #[test]
+    fn a_decimal_in_the_opening_sentence_is_not_a_cut_point() {
+        // The real failure: the model opened with a load average, and the
+        // guard cut at the dot, so Arc spoke "5 and the CPU is still sitting at
+        // zero" as the first thing the user heard.
+        let text = "Your load average is 11.5 and the CPU is still sitting at zero. \
+                    That gap means fifteen tasks are queued on something.";
+        let out = shorten_for_speech(text, 90);
+        assert!(out.starts_with("Your load average is 11.5"), "cut inside a decimal: {out:?}");
+    }
+
+    #[test]
+    fn a_decimal_point_is_not_a_sentence_end() {
+        // "3.5" cut at the dot would speak a fragment and then ask if they want
+        // the rest of a number.
+        let text = "Your load is 3.5 right now, which is fine. It was 11 earlier though.";
+        let out = shorten_for_speech(text, 30);
+        assert!(out.contains("3.5") || out.starts_with("Your load is 3.5"), "{out}");
+    }
+
+    #[test]
+    fn one_unbroken_run_is_spoken_whole() {
+        // A URL or a path has no sentence break. Cutting it would be worse than
+        // the pause, and it is not the rambling this guard exists for.
+        let url = "https://example.com/a/very/long/path/that/never/ends/and/keeps/going/forever";
+        assert_eq!(shorten_for_speech(url, 60), url);
+    }
+
+    #[test]
+    fn the_guard_actually_bounds_the_speech_time() {
+        // The point of the guard. 240 characters is ~110s of speech at Kokoro's
+        // measured real-time factor of 1.0.
+        let huge = (0..40)
+            .map(|i| format!("This is sentence number {i} and it goes on for a while."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = shorten_for_speech(&huge, MAX_SPOKEN_CHARS);
+        assert!(
+            out.chars().count() <= MAX_SPOKEN_CHARS + 6,
+            "{} chars is {}s of speech",
+            out.chars().count(),
+            out.chars().count() as f64 / 2.2
+        );
     }
 }

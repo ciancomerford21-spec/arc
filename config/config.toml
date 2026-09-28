@@ -13,7 +13,9 @@ fallback = "none"
 # Warmth lives in the personality prompt, not in sampling: 0.6 measured no
 # tool-calling cost against the hermes model, where 0.0 read as flat.
 temperature = 0.6
-max_tokens = 600
+max_tokens = 400
+# Capped for speech: Kokoro runs at RTF 1.0, so 400 tokens is ~73s of talking
+# with no truncation measured over 7 questions. See arc-core's system prompt.
 timeout_s = 120
 # Maximum model -> tool -> model rounds for one request.
 max_tool_rounds = 4

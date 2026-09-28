@@ -154,9 +154,12 @@ impl Default for Ai {
             // 0.6 measured no tool-calling cost against the hermes model,
             // where 0.0 read as flat. Warmth belongs in the personality.
             temperature: 0.6,
-            // 600 was the fastest setting measured (2.4s) with no
-            // truncation; the 2B's 400 truncated this model's replies.
-            max_tokens: 600,
+            // Capped for SPEECH rather than for the model. Kokoro synthesises
+            // at real-time factor 1.0, so a token is roughly a second the user
+            // waits and cannot barge in. Measured over 7 questions: 600 gave a
+            // median 85s reply, 400 gave 73s with 0/7 truncated, and 300 cut
+            // one answer off mid-sentence.
+            max_tokens: 400,
             // Cloud round-trips are slower than localhost.
             timeout_s: 120,
             max_tool_rounds: 4,

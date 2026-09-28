@@ -5,6 +5,10 @@
 
 use crate::gate::{Gate, Outcome};
 use arc_ai::{AiError, AiMessage, ProviderSet, ToolDef};
+
+// Re-exported so the daemon can read provider health without taking a direct
+// dependency on arc-ai just for one enum.
+pub use arc_ai::LastCall;
 use arc_proto::{ActionRecord, PendingConfirmation};
 use arc_tools::{JsonMap, ToolResult};
 use serde_json::{Value as Json, json};
@@ -53,6 +57,11 @@ fn result_for_model(outcome: &Outcome) -> String {
 impl Agent {
     pub fn new(providers: ProviderSet, gate: Arc<Gate>, system_prompt: String, max_rounds: u32) -> Self {
         Self { providers, gate, system_prompt, max_rounds: max_rounds.max(1) }
+    }
+
+    /// What the provider last did, for the health line in `arc status`.
+    pub fn last_call(&self) -> LastCall {
+        self.providers.last_call()
     }
 
     /// The tool schemas to send for this utterance. See

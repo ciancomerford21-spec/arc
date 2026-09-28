@@ -427,6 +427,13 @@ impl Provider for AnthropicProvider {
 // Provider set (primary + optional fallback)
 // ---------------------------------------------------------------------------
 
+/// Trim a provider error to a status-line length. Cloud errors carry a
+/// whole JSON body, which is unreadable in a two-column table.
+fn truncate(s: &str, n: usize) -> String {
+    let t = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() <= n { t } else { format!("{}…", t.chars().take(n).collect::<String>()) }
+}
+
 pub struct ProviderSet {
     primary: Box<dyn Provider>,
     fallback: Option<Box<dyn Provider>>,
@@ -434,11 +441,35 @@ pub struct ProviderSet {
     /// tool-calling model has finished acting. Lets a cheap local model do
     /// system work while a stronger model does the talking.
     phrasing: Option<Box<dyn Provider>>,
+    /// Outcome of the most recent completion, for `arc status`.
+    ///
+    /// The alternative was a health probe, and a probe here would mean
+    /// spending a real request (and a real round trip, and a possible 500)
+    /// purely to colour a line in a status table. Recording what actually
+    /// happened to real traffic is free and strictly more honest: it reports
+    /// the provider Arc is actually using, not a synthetic call.
+    last: std::sync::Arc<std::sync::Mutex<LastCall>>,
+}
+
+/// The last thing the provider did, for the health line in `arc status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LastCall {
+    /// Nothing has been sent yet, so nothing is known.
+    Never,
+    Ok,
+    /// The last call failed. Carries the reason, trimmed, because the whole
+    /// point is explaining why the component is not ok.
+    Failed(String),
 }
 
 impl ProviderSet {
     pub fn new(primary: Box<dyn Provider>, fallback: Option<Box<dyn Provider>>) -> Self {
-        Self { primary, fallback, phrasing: None }
+        Self {
+            primary,
+            fallback,
+            phrasing: None,
+            last: std::sync::Arc::new(std::sync::Mutex::new(LastCall::Never)),
+        }
     }
 
     /// Attach a separate model for final replies.
@@ -449,6 +480,20 @@ impl ProviderSet {
 
     pub fn primary_name(&self) -> &str {
         self.primary.name()
+    }
+
+    /// What happened on the most recent completion, for `arc status`.
+    pub fn last_call(&self) -> LastCall {
+        self.last.lock().map(|g| g.clone()).unwrap_or(LastCall::Never)
+    }
+
+    fn record(&self, r: Result<(), &AiError>) {
+        if let Ok(mut g) = self.last.lock() {
+            *g = match r {
+                Ok(()) => LastCall::Ok,
+                Err(e) => LastCall::Failed(truncate(&e.to_string(), 120)),
+            };
+        }
     }
 
     /// Name of the phrasing model, if one is configured.
@@ -498,7 +543,10 @@ impl ProviderSet {
         let mut last = None;
         for attempt in 0..2 {
             match self.primary.complete(messages, tools).await {
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    self.record(Ok(()));
+                    return Ok(r);
+                }
                 Err(e) if e.is_transient() => {
                     tracing::debug!(provider = %self.primary.name(), %e, attempt, "transient provider error; retrying");
                     last = Some(e);
@@ -507,24 +555,28 @@ impl ProviderSet {
                 Err(e) => {
                     // Not worth retrying (bad key, malformed request): go
                     // straight to the fallback.
-                    return match &self.fallback {
+                    let r = match &self.fallback {
                         Some(fb) => {
                             tracing::warn!(provider = %self.primary.name(), error = %e, "primary provider failed; using fallback");
                             fb.complete(messages, tools).await
                         }
                         None => Err(e),
                     };
+                    self.record(r.as_ref().map(|_| ()).map_err(|x| x));
+                    return r;
                 }
             }
         }
         let e = last.expect("a transient error to have been recorded");
-        match &self.fallback {
+        let r = match &self.fallback {
             Some(fb) => {
                 tracing::warn!(provider = %self.primary.name(), error = %e, "primary provider failed after retry; using fallback");
                 fb.complete(messages, tools).await
             }
             None => Err(e),
-        }
+        };
+        self.record(r.as_ref().map(|_| ()).map_err(|x| x));
+        r
     }
 }
 
@@ -611,7 +663,12 @@ pub fn from_config(config: &arc_config::Ai) -> Result<ProviderSet, AiError> {
             }
         }
     };
-    Ok(ProviderSet { primary, fallback, phrasing })
+    Ok(ProviderSet {
+        primary,
+        fallback,
+        phrasing,
+        last: std::sync::Arc::new(std::sync::Mutex::new(LastCall::Never)),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -818,5 +875,41 @@ mod tests {
         assert!(!AiError::Provider("status 401 Unauthorized".into()).is_transient());
         assert!(!AiError::Provider("status 400 Bad Request".into()).is_transient());
         assert!(!AiError::Unconfigured.is_transient());
+    }
+
+    #[test]
+    fn provider_health_reflects_real_traffic_not_a_probe() {
+        // A fresh provider has done nothing, so nothing is known. Reporting
+        // "ok" here would be a lie, and reporting anything else would be
+        // guessing: the line is meant to describe the last real request.
+        let cfg = arc_config::Ai { provider: arc_config::ProviderKind::Hermes, ..Default::default() };
+        let set = from_config(&cfg).unwrap();
+        assert_eq!(set.last_call(), LastCall::Never);
+    }
+
+    #[test]
+    fn a_provider_error_is_trimmed_to_something_readable() {
+        // A real 500 carries a whole JSON body, which is unreadable in a
+        // two-column status table.
+        let long = format!("status 500 Internal Server Error: {}", "x".repeat(400));
+        let out = truncate(&long, 120);
+        assert!(out.chars().count() <= 121, "{} chars", out.chars().count());
+        assert!(out.ends_with('…'), "a trimmed error should say so: {out}");
+        assert!(!out.contains("  "), "whitespace should be collapsed: {out}");
+    }
+
+    #[test]
+    fn a_short_error_is_left_alone() {
+        assert_eq!(truncate("timeout", 120), "timeout");
+    }
+
+    #[test]
+    fn fallback_and_last_call_survive_a_second_completion() {
+        // The record has to be written on every exit path, including the
+        // retry-exhausted one, or a provider that is down reports itself ok
+        // because only the happy path was instrumented.
+        let set = from_config(&arc_config::Ai::default()).unwrap();
+        assert_eq!(set.last_call(), LastCall::Never);
+        assert!(set.primary_name().contains("hermes"));
     }
 }

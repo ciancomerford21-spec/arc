@@ -3,7 +3,7 @@
 
 use arc_config::Config;
 use arc_config::paths;
-use arc_core::{Assistant, InputSource as CoreSource, NluInput, Reply, Route};
+use arc_core::{Assistant, InputSource as CoreSource, LastCall, NluInput, Reply, Route};
 use arc_memory::MemoryStore;
 use arc_proto::{
     AskResult, AssistantState, BarStatus, ComponentStatus, Event, HealthStatus, InputSource, StatusReport,
@@ -225,15 +225,21 @@ impl Daemon {
             status: HealthStatus::Ok,
             detail: format!("pid {}", std::process::id()),
         }];
-        components.push(ComponentStatus {
-            name: "ai".into(),
-            status: if self.assistant.provider_name() == "none" {
-                HealthStatus::Disabled
-            } else {
-                HealthStatus::Unknown
-            },
-            detail: self.assistant.provider_name().into(),
-        });
+        // Report what the provider actually did, not a probe. A probe here
+        // would spend a real request (and eat a possible 500) to colour one
+        // line, and the answer would describe a synthetic call rather than
+        // the traffic Arc is really serving. Before this the line read
+        // "unknown" for every configured provider, which is true of nothing
+        // and useful for no one.
+        let (ai_status, ai_detail) = match self.assistant.last_call() {
+            None => (HealthStatus::Disabled, String::new()),
+            Some(LastCall::Never) => (HealthStatus::Unknown, "no request yet".into()),
+            Some(LastCall::Ok) => (HealthStatus::Ok, self.assistant.provider_name().into()),
+            Some(LastCall::Failed(why)) => {
+                (HealthStatus::Unavailable, format!("{}: {why}", self.assistant.provider_name()))
+            }
+        };
+        components.push(ComponentStatus { name: "ai".into(), status: ai_status, detail: ai_detail });
         match &m.voice {
             Some(v) => components.extend(
                 v.components

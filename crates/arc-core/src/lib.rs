@@ -10,6 +10,7 @@ pub mod agent;
 pub mod automations;
 pub mod gate;
 
+pub use agent::LastCall;
 use agent::{Agent, AgentReply};
 use arc_ai::AiMessage;
 use arc_config::Config;
@@ -648,6 +649,12 @@ impl Assistant {
 
     pub fn provider_name(&self) -> &str {
         &self.provider_name
+    }
+
+    /// Outcome of the most recent model call, for `arc status`. `None` when
+    /// there is no agent at all, i.e. `ai.provider = "none"`.
+    pub fn last_call(&self) -> Option<LastCall> {
+        self.agent.as_ref().map(|a| a.last_call())
     }
 
     /// The memory store, if one is attached.

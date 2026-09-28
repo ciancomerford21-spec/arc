@@ -1,26 +1,11 @@
-# Arc configuration — ~/.config/arc/config.toml
-#
-# Every key is optional: anything you delete falls back to the default shown
-# here. Unknown keys are reported by `arc config check` (and in the log) rather
-# than silently ignored. Change single values with `arc config set KEY VALUE`,
-# which keeps your comments. Apply changes with `arc reload`.
-#
-# Secrets (API keys) never go in this file. Put them in the environment or in
-# ~/.config/arc/secrets.env (KEY=value lines, chmod 600).
 
 [general]
 # Name used in replies and the UI.
 name = "Arc"
 # How the speech recogniser spells the name at the start of an utterance.
 name_variants = ["arc", "ark"]
-# Follow-ups like "close that" refer to the previous request for this long.
 
 [ai]
-# local | openai | anthropic | none
-#   local     - llama.cpp on this machine (arc-llm.service), nothing leaves the PC
-#   openai    - OpenAI or any OpenAI-compatible API (OpenRouter, Groq, Ollama, ...)
-#   anthropic - Anthropic Messages API
-#   none      - no language model; Arc's built-in command grammar only
 provider = "local"
 # Provider to try when the primary one fails.
 fallback = "none"
@@ -29,16 +14,7 @@ max_tokens = 400
 timeout_s = 45
 # Maximum model -> tool -> model rounds for one request.
 max_tool_rounds = 4
-# Send a compact desktop snapshot (workspace, window titles) with requests.
-# Send remembered facts (see `arc memory`) with requests.
-# Load the model when Arc starts so the first request is fast.
 
-# Rewrite the final reply with a second, more conversational model before it
-# is spoken. The primary model above still does all the tool calling and
-# system work; this only words the result. Off by default — it costs one
-# extra request per reply.
-#   phrasing = "openai"    # local | openai | anthropic | none
-#   phrasing_enabled = false
 phrasing = "none"
 phrasing_enabled = false
 
@@ -52,9 +28,6 @@ server_binary = "auto"
 # GPU layers (-1 = fit automatically to free VRAM).
 gpu_layers = -1
 context = 8192
-# Unload the model from VRAM after this many idle seconds (-1 = never).
-# Arc reloads it the moment you start talking to it.
-idle_unload_s = 1800
 # The installer generates a random key for the local server.
 api_key_env = "ARC_LLM_API_KEY"
 extra_args = []
@@ -71,13 +44,8 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 [voice]
 enabled = true
-# push_to_talk - only the talk hotkey / Arc panel starts listening
-# wake_word    - saying "Arc, ..." or "Hey Arc" starts a command
-# continuous   - every utterance starting with the name is a command
 mode = "wake_word"
 wake_words = ["hey arc", "okay arc", "ok arc"]
-# stt - check the start of each spoken phrase with the speech recogniser (accurate)
-# kws - streaming keyword spotter (lighter, less accurate for short names)
 wake_engine = "stt"
 # PipeWire node names (`arc doctor` lists them) or "default".
 input_device = "default"
@@ -103,14 +71,7 @@ stt_engine = "moonshine"
 stt_model = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
 # piper | kokoro | espeak | none
 tts_engine = "kokoro"
-# A model *directory* under ~/.local/share/arc/models; the service picks the
-# best .onnx inside it. Use the float "kokoro-en-v0_19", not the int8 build:
-# on a 6-core Ryzen the int8 model measured 2.8x slower (0.45x vs 1.28x
-# realtime). Piper voices still work by naming one here, e.g.
-# "vits-piper-en_GB-jenny_dioco-medium".
 tts_voice = "kokoro-en-v0_19"
-# Which Kokoro voice: af_bella, af_heart, am_michael, bf_emma, bf_isabella,
-# bm_george, bm_lewis. Ignored by piper, which is one voice per model.
 tts_speaker = "af_bella"
 # Saying the wake word while Arc talks interrupts it.
 barge_in = true
@@ -118,26 +79,16 @@ barge_in = true
 preload = true
 # Listen again (without the wake word) after Arc asks you something.
 follow_up = true
-# Allow confirming DANGEROUS actions by voice. Off: confirm those in the Arc
-# panel or with `arc confirm` instead.
 voice_confirm_dangerous = false
 
 [ui]
-# omarchy (follow the current Omarchy theme) | dark | light
-# Accent override, e.g. "#7aa2f7" ("" = theme accent).
-accent = ""
-opacity = 0.92
 # top | center | bottom
 position = "top"
-# Show the overlay while Arc listens, thinks or speaks.
-# Hide it this many seconds after the last reply (0 = keep open).
 width = 560
-# Font family ("" = GTK default).
 
 [bar]
 # Publish status for the Omarchy bar widget / Waybar module.
 enabled = true
-# CPU and RAM in the tooltip (sampled every 5 s while enabled).
 
 [permissions]
 # Lowest risk level that needs your confirmation: safe | caution | dangerous
@@ -145,19 +96,11 @@ confirm_at = "dangerous"
 confirmation_timeout_s = 90
 
 [permissions.tools]
-# Per-tool overrides: allow | confirm | deny. Examples:
-# "files.move" = "confirm"
-# "apps.kill" = "confirm"
-# "shell.run" = "deny"
 
 [permissions.shell]
 # Allow Arc's controlled shell tool at all.
 enabled = true
-# Extra command-line regexes allowed without confirmation (Arc already knows
-# a set of read-only commands such as `ls`, `df`, `uptime`, `git status`).
 allow = []
-# Extra regexes that are always refused (Arc's built-in denylist covers
-# filesystem wipes, disk formatting, bootloader changes, fork bombs, ...).
 deny = []
 # Ask before running any command not on an allowlist.
 confirm_unlisted = true
@@ -165,12 +108,6 @@ timeout_s = 20
 max_output_bytes = 16384
 
 [apps]
-# Focus an open window of the app instead of starting a second one.
-# Apps that always open a new instance.
-# Seconds to wait for a launched app's window before reporting a problem.
-# Searched by "open my <name> project".
-# editor | terminal | files | a command containing {path}
-# Move windows to other workspaces without following them.
 
 [apps.aliases]
 # Spoken name = desktop id, command, or role:browser/terminal/editor/files
@@ -204,25 +141,17 @@ sensitive_paths = [
   "~/.netrc",
   "~/.hermes/.env",
 ]
-# "Delete" moves to the trash. Permanent deletion is always DANGEROUS.
 
 [web]
 # Opened in your browser for "search the web for ...".
 search_url = "https://duckduckgo.com/?q={query}"
-# Let Arc fetch search snippets to answer questions itself (sends the query
-# to DuckDuckGo; nothing else leaves the machine).
 
 [memory]
 enabled = true
-# Refuse to remember things that look like passwords, keys or card numbers.
-# Remembered facts included with each language-model request.
 
 [logging]
 # error | warn | info | debug | trace (or a tracing filter like "arc_core=debug,info")
 level = "info"
-# Log full language-model requests/responses (window titles, file names).
-log_ai_payloads = false
-# Daily log files kept in ~/.local/state/arc/logs.
 
 [tools]
 # Tools to disable: exact names ("shell.run") or categories ("files.*").

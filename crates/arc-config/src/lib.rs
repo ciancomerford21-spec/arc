@@ -167,9 +167,6 @@ pub struct LocalAi {
     /// Layers offloaded to the GPU (-1 = let llama.cpp fit to free VRAM).
     pub gpu_layers: i32,
     pub context: u32,
-    /// Seconds of inactivity before the server unloads the model from VRAM
-    /// (-1 = never). Arc pre-warms it as soon as you start talking.
-    pub idle_unload_s: i64,
     /// Environment variable holding the local server's API key (read from
     /// ~/.config/arc/secrets.env when not set in the environment).
     pub api_key_env: String,
@@ -186,7 +183,6 @@ impl Default for LocalAi {
             server_binary: "auto".into(),
             gpu_layers: -1,
             context: 8192,
-            idle_unload_s: 1800,
             api_key_env: "ARC_LLM_API_KEY".into(),
             extra_args: vec![],
         }
@@ -327,10 +323,6 @@ pub enum UiPosition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Ui {
-    /// Accent colour override ("" = theme accent).
-    pub accent: String,
-    /// Background opacity (0.5 - 1.0).
-    pub opacity: f32,
     pub position: UiPosition,
     pub width: u32,
 }
@@ -338,8 +330,6 @@ pub struct Ui {
 impl Default for Ui {
     fn default() -> Self {
         Self {
-            accent: String::new(),
-            opacity: 0.92,
             position: UiPosition::Top,
             width: 560,
         }
@@ -516,14 +506,14 @@ impl Default for Memory {
 pub struct Logging {
     /// error | warn | info | debug | trace (or a tracing filter string).
     pub level: String,
-    /// Log full model requests/responses (may include window titles and
-    /// file names; never includes API keys).
-    pub log_ai_payloads: bool,
+    // log_ai_payloads removed: it was deserialized and warned about at
+    // startup, but no provider ever read it, so it could not actually log a
+    // prompt. A switch that does nothing is worse than no switch.
 }
 
 impl Default for Logging {
     fn default() -> Self {
-        Self { level: "info".into(), log_ai_payloads: false }
+        Self { level: "info".into() }
     }
 }
 
@@ -628,7 +618,6 @@ pub fn validate(c: &Config) -> Result<Vec<String>, ConfigError> {
     range("voice.max_utterance_s", c.voice.max_utterance_s, 2.0, 60.0);
     range("voice.no_speech_timeout_s", c.voice.no_speech_timeout_s, 1.0, 30.0);
     range("ai.temperature", c.ai.temperature, 0.0, 2.0);
-    range("ui.opacity", c.ui.opacity, 0.5, 1.0);
     if !(150..=5000).contains(&c.voice.end_silence_ms) {
         errors.push(format!("voice.end_silence_ms = {} is outside 150..=5000", c.voice.end_silence_ms));
     }
@@ -650,9 +639,6 @@ pub fn validate(c: &Config) -> Result<Vec<String>, ConfigError> {
     if !c.web.search_url.contains("{query}") {
         errors.push("web.search_url must contain {query}".into());
     }
-    if !c.ui.accent.is_empty() && !is_hex_color(&c.ui.accent) {
-        errors.push(format!("ui.accent = {:?} is not a #rrggbb colour", c.ui.accent));
-    }
     for pat in c.permissions.shell.allow.iter().chain(c.permissions.shell.deny.iter()) {
         if let Err(e) = regex_syntax_ok(pat) {
             errors.push(format!("permissions.shell pattern {pat:?}: {e}"));
@@ -661,20 +647,10 @@ pub fn validate(c: &Config) -> Result<Vec<String>, ConfigError> {
     if c.permissions.confirm_at == RiskLevel::Safe {
         warnings.push("permissions.confirm_at = \"safe\" asks before every action".into());
     }
-    if c.logging.log_ai_payloads {
-        warnings.push(
-            "logging.log_ai_payloads is on: prompts (window titles, file names) are written to logs".into(),
-        );
-    }
     if c.files.allowed_roots.iter().any(|r| r.trim() == "/") {
         warnings.push("files.allowed_roots contains \"/\": file tools can reach the whole filesystem".into());
     }
     if errors.is_empty() { Ok(warnings) } else { Err(ConfigError::Invalid(errors.join("; "))) }
-}
-
-fn is_hex_color(s: &str) -> bool {
-    let s = s.trim();
-    s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Minimal regex sanity check without pulling the regex crate into config:
@@ -923,7 +899,6 @@ mod tests {
         assert!(parse_str("[voice]\nvolume = 1.5\n").is_err());
         assert!(parse_str("[voice]\nspeech_rate = 0.1\n").is_err());
         assert!(parse_str("[web]\nsearch_url = \"https://x\"\n").is_err());
-        assert!(parse_str("[ui]\naccent = \"red\"\n").is_err());
         assert!(parse_str("[permissions.shell]\ndeny = [\"(unclosed\"]\n").is_err());
     }
 
@@ -991,5 +966,25 @@ mod tests {
         assert_eq!(read_secret_file(&p, "FOO_KEY").unwrap().as_deref(), Some("abc"));
         assert_eq!(read_secret_file(&p, "BAR").unwrap(), None);
         assert_eq!(read_secret_file(&p, "MISSING").unwrap(), None);
+    }
+
+    #[test]
+    fn removed_config_keys_are_flagged_as_unknown() {
+        // These were removed as dead: deserialized, documented, and never read
+        // by anything. serde's `default` means a config can name them again and
+        // still load, silently doing nothing, so assert the warning fires --
+        // that is the only signal a reintroduced key produces.
+        for (key, gone) in [
+            ("ui.accent", "[ui]\naccent = \"#ff0000\"\n"),
+            ("ui.opacity", "[ui]\nopacity = 0.9\n"),
+            ("logging.log_ai_payloads", "[logging]\nlog_ai_payloads = true\n"),
+            ("ai.local.idle_unload_s", "[ai.local]\nidle_unload_s = 600\n"),
+        ] {
+            let (_, warnings) = parse_str(gone).expect("unknown keys warn, they do not fail");
+            assert!(
+                warnings.iter().any(|w| w.contains(key)),
+                "no warning for the removed key {key}: {warnings:?}"
+            );
+        }
     }
 }

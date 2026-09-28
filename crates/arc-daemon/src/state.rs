@@ -42,6 +42,52 @@ pub struct Daemon {
     utterance: AtomicU64,
 }
 
+/// A turn at least this long gets a spoken completion line.
+///
+/// Above SLOW_TURN_SPEAKS_AT so the "still working" headsup and the "finished"
+/// notice never fire together as two speeches for one turn.
+const COMPLETION_SPEAKS_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What actually happened, said plainly.
+///
+/// Reads the tool outcomes rather than the reply, because the reply is prose
+/// and can be truncated mid-sentence. Worst outcome wins: a turn that built a
+/// project and then failed a test must not be announced as finished.
+fn completion_line(actions: &[arc_proto::ActionRecord]) -> Option<String> {
+    // Nothing to report unless something was actually done.
+    let work: Vec<_> = actions.iter().filter(|a| a.duration_ms > 0).collect();
+    if work.is_empty() {
+        return None;
+    }
+    if work.iter().any(|a| a.outcome == arc_proto::ActionOutcome::Failed) {
+        return Some("That finished, but part of it failed. I have the details.".into());
+    }
+    // Success of the CHILD PROCESS is not the same as success of the WORK. The
+    // agent exits 0 even when the task it was given could not be done -- a
+    // dependency that does not exist, a build that would not pass -- and it
+    // says so in prose. The tool's own `status` field is the sharper signal, so
+    // it wins over the exit code, which is what this got wrong first: a run
+    // whose install failed was announced as "everything ran".
+    if work.iter().any(|a| a.data.get("status").and_then(|s| s.as_str()) == Some("failed")) {
+        return Some("That didn't fully work out. I have the details.".into());
+    }
+    if work.iter().any(|a| a.outcome == arc_proto::ActionOutcome::Cancelled) {
+        return Some("That stopped before it finished.".into());
+    }
+    if work.iter().any(|a| a.outcome == arc_proto::ActionOutcome::AwaitingConfirmation) {
+        return Some("I need your OK before I finish that.".into());
+    }
+    let done = work.iter().filter(|a| a.outcome == arc_proto::ActionOutcome::Success).count();
+    if done == 0 {
+        return None;
+    }
+    // No tool names or counts here: speech would read "underscore code" aloud,
+    // and "you asked for 1" tells the user nothing they can act on. They want
+    // to know the wait is over and the work is on disk.
+    let _ = done;
+    Some("That's finished. Everything ran and it's all on disk. Have a look at it.".into())
+}
+
 /// How long a turn may run before Arc says something.
 ///
 /// Measured: the `code` tool takes 2-4 minutes on a small project, and until
@@ -234,6 +280,25 @@ impl Daemon {
         if let Some(p) = &reply.pending {
             self.emit(Event::ConfirmationRequired { pending: p.clone() });
         }
+        // A long task that ends quietly is indistinguishable from one that
+        // died, especially after an 85-second silence. The reply itself is not
+        // a reliable signal: it is the model's prose, and on a long coding turn
+        // it is routinely truncated to a summary ending "Want the rest?".
+        // This line is built from the real ActionOutcome, so it says finished
+        // because the tool finished.
+        if start.elapsed() >= COMPLETION_SPEAKS_AFTER {
+            if let Some(line) = completion_line(&reply.actions) {
+                tracing::info!("speaking completion notice: {line}");
+                let events = self.events.clone();
+                let _ = events.send(Event::VoiceControl {
+                    command: VoiceCommand::Speak {
+                        text: line,
+                        utterance_id: format!("done-{}", next_progress_id()),
+                        listen_after: false,
+                    },
+                });
+            }
+        }
         self.emit(Event::Reply { text: reply.text.clone(), route: route_name(reply.route).into() });
         {
             let mut m = self.m.lock().unwrap();
@@ -397,6 +462,7 @@ fn rss_kb() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_proto::ActionOutcome;
 
     #[test]
     fn a_slow_turn_says_something_before_it_finishes() {
@@ -423,5 +489,86 @@ mod tests {
         let a = next_progress_id();
         let b = next_progress_id();
         assert_ne!(a, b);
+    }
+
+    fn act(tool: &str, outcome: ActionOutcome, ms: u64) -> arc_proto::ActionRecord {
+        arc_proto::ActionRecord {
+            tool: tool.into(),
+            args: serde_json::json!({}),
+            risk: arc_proto::RiskLevel::Caution,
+            outcome,
+            summary: String::new(),
+            data: serde_json::Value::Null,
+            duration_ms: ms,
+        }
+    }
+
+    /// The point of the line: it is built from tool outcomes, so it cannot
+    /// claim success when the run failed, whatever the model's prose says.
+    #[test]
+    fn a_failed_step_is_never_announced_as_finished() {
+        let line = completion_line(&[
+            act("code", ActionOutcome::Success, 60_000),
+            act("code", ActionOutcome::Failed, 5_000),
+        ])
+        .unwrap();
+        assert!(line.contains("failed"), "{line}");
+        assert!(!line.contains("done"), "worst outcome must win: {line}");
+    }
+
+    #[test]
+    fn a_pending_confirmation_says_so_instead_of_claiming_done() {
+        let line = completion_line(&[act("code", ActionOutcome::AwaitingConfirmation, 40_000)]).unwrap();
+        assert!(line.contains("OK"), "{line}");
+    }
+
+    #[test]
+    fn a_cancelled_run_does_not_claim_success() {
+        let line = completion_line(&[act("code", ActionOutcome::Cancelled, 40_000)]).unwrap();
+        assert!(line.contains("stopped"), "{line}");
+    }
+
+    #[test]
+    fn a_successful_long_run_announces_completion() {
+        let line = completion_line(&[act("code", ActionOutcome::Success, 85_000)]).unwrap();
+        assert!(line.contains("finished"), "must say the wait is over: {line}");
+        // Tool names must never reach speech.
+        assert!(!line.contains("code"), "would be read aloud as a word: {line}");
+    }
+
+    #[test]
+    fn a_turn_that_did_nothing_says_nothing() {
+        // Reading the battery is not worth announcing, and the reply already
+        // covers it. duration_ms > 0 filters these out.
+        assert_eq!(completion_line(&[act("power_info", ActionOutcome::Success, 0)]), None);
+        assert_eq!(completion_line(&[]), None);
+    }
+
+    #[test]
+    fn the_completion_notice_never_collides_with_the_headsup() {
+        // Both fire off one turn; if the thresholds overlapped the user would
+        // hear "on it" and "that's done" for the same request.
+        assert!(
+            COMPLETION_SPEAKS_AFTER > SLOW_TURN_SPEAKS_AT,
+            "a turn between the two thresholds would speak twice"
+        );
+    }
+
+    /// The one that slipped through: the agent process exited 0 while the
+    /// task it was handed had failed. Exit status is not task status.
+    #[test]
+    fn a_child_exit_zero_with_a_failed_task_is_not_announced_as_finished() {
+        let mut a = act("code", ActionOutcome::Success, 40_000);
+        a.data = serde_json::json!({"status": "failed"});
+        let line = completion_line(&[a]).unwrap();
+        assert!(!line.contains("everything ran"), "{line}");
+        assert!(line.contains("didn't fully work"), "{line}");
+    }
+
+    #[test]
+    fn a_reported_ok_task_still_announces_completion() {
+        let mut a = act("code", ActionOutcome::Success, 40_000);
+        a.data = serde_json::json!({"status": "done"});
+        assert!(completion_line(&[a]).unwrap().contains("finished"));
     }
 }

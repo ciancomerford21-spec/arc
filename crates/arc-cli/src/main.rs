@@ -181,13 +181,13 @@ fn main() -> Result<()> {
             println!("arcd {} (protocol {})", r["version"].as_str().unwrap_or("?"), r["protocol"]);
         }
         Cmd::Ask { text, speak } => {
-            let mut c = Conn::open(&sock, Some(Duration::from_secs(120)))?;
+            let mut c = Conn::open(&sock, Some(Duration::from_secs(900)))?;
             let source = if speak { "voice" } else { "text" };
             let r = c.call(json!({"type": "ask", "text": text.join(" "), "source": source}))?;
             print_ask(&r, cli.json);
         }
         Cmd::Confirm { id } => {
-            let mut c = Conn::open(&sock, Some(Duration::from_secs(120)))?;
+            let mut c = Conn::open(&sock, Some(Duration::from_secs(900)))?;
             let r = match id {
                 Some(id) => c.call(json!({"type": "confirm", "confirmation_id": id, "approve": true}))?,
                 None => resolve_latest(&mut c, true)?,

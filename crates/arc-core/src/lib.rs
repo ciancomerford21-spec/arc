@@ -675,6 +675,13 @@ fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
     if !title.is_empty() {
         p.push_str(&format!(" You address the user as \"{title}\"."));
     }
+    // The personality goes BEFORE the recalled-history block on purpose. The
+    // 2B follows the tone of any assistant replies it can see, so a history
+    // full of old filler outranks an instruction that arrives after it.
+    if !cfg.personality.custom_prompt.trim().is_empty() {
+        p.push_str("\n\n");
+        p.push_str(cfg.personality.custom_prompt.trim());
+    }
     if let Some(store) = store {
         let facts = store.prompt_block(8, None);
         let convo = store.recent_conversation();
@@ -687,15 +694,14 @@ fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
                  there. The user's actual request is the final message.\n\
                  IGNORE YOUR OWN EARLIER REPLIES in that history: do not copy a previous answer as \
                  your answer now, and do not reuse an old refusal when you could answer the current \
-                 question. Answer the final message on its own terms.\n",
+                 question. Answer the final message on its own terms.\n\
+                 Also do not imitate their style. Those replies are stale records of a different \
+                 tone, and repeating their wording ('How can I help you today', 'Is there anything \
+                 else') is a failure, not consistency. Write the current answer fresh.\n",
             );
             if !facts.is_empty() { p.push_str(&facts); }
             if !convo.is_empty() { p.push_str(&convo); }
         }
-    }
-    if !cfg.personality.custom_prompt.trim().is_empty() {
-        p.push_str("\n\n");
-        p.push_str(cfg.personality.custom_prompt.trim());
     }
     p
 }

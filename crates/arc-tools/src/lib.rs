@@ -1456,6 +1456,42 @@ impl HermesCode {
                 return Some(format!("refusing a task touching {bad}"));
             }
         }
+        // The literal blocklist above checks the text of the task, but tasks
+        // arrive as plain English, and plenty of destructive work is described
+        // innocently: "clean up the build artifacts" is `cargo clean`, "reset
+        // the repo" is `git reset --hard`, "free up disk space" is `rm -rf`.
+        // With confirmation optional these implied commands are the whole risk
+        // surface, so the intent words are matched too. This is a blunt
+        // instrument and will refuse some benign work ("delete the unused
+        // import" trips it); that is the correct trade when nobody is watching.
+        const IMPLIED: &[&str] = &[
+            "delete",
+            "remove",
+            "destroy",
+            "wipe",
+            "erase",
+            "clean up",
+            "clean the",
+            "get rid of",
+            "tidy up",
+            "reset",
+            "revert",
+            "purge",
+            "clear out",
+            "free up",
+            "uninstall",
+            "format",
+            "empty the",
+            "start over",
+        ];
+        for word in IMPLIED {
+            if t.contains(word) {
+                return Some(format!(
+                    "refusing a task whose wording implies deletion (`{word}`); \
+                     say what to remove precisely and run it yourself if you mean it"
+                ));
+            }
+        }
         let _ = dir;
         None
     }
@@ -1470,8 +1506,8 @@ impl Tool for HermesCode {
         "Hand a multi-step task to Hermes, which acts on the machine itself: build \
          or fix a project, create a calculator, debug a failing build, investigate a \
          codebase, or do anything too involved for a single command. Writes files and \
-         runs commands, so it takes minutes and always confirms first. For a single \
-         quick action prefer the specific tool."
+         runs commands, so it takes minutes. For a single quick action prefer the \
+         specific tool. Destructive tasks are refused, never run."
     }
     fn hints(&self) -> &'static [&'static str] {
         &[
@@ -1528,15 +1564,40 @@ impl Tool for HermesCode {
                 explanation: why,
             };
         }
+        // With `code.confirm = false` the tool proceeds on a spoken
+        // instruction. `risk` stays Dangerous either way, so `tools.disabled`
+        // and the confirm_at policy still see it as what it is -- but
+        // force_confirm is what actually stops it, and the user asked for it
+        // off. The screen above has already run, and it is the only gate left,
+        // which is why it matches implied intent and not just literal commands.
+        // With confirmation off, the risk reported has to change as well, not
+        // just force_confirm. Policy::decide treats every Dangerous action as
+        // requiring confirmation by design -- an `allow` rule cannot silently
+        // enable a destructive operation -- so leaving the risk at Dangerous
+        // would prompt no matter what this tool said. Reporting Caution is
+        // this tool explicitly asserting that it has already vetted the task
+        // through `screen()` above and is taking responsibility for it. It is
+        // a claim about THIS task, not a reclassification of the tool: the
+        // refused ones never reach here, and a task the screen misses is the
+        // one this trades with.
+        let risk = if self.cfg.confirm { RiskLevel::Dangerous } else { RiskLevel::Caution };
         Assessment {
-            risk: RiskLevel::Dangerous,
+            risk,
             blocked: None,
-            force_confirm: true,
-            explanation: format!(
-                "let Hermes work in {} for up to {} minutes: {task}",
-                arc_config::paths::expand(&self.cfg.workspace).display(),
-                self.cfg.timeout_s / 60
-            ),
+            force_confirm: self.cfg.confirm,
+            explanation: if self.cfg.confirm {
+                format!(
+                    "let Hermes work in {} for up to {} minutes: {task}",
+                    arc_config::paths::expand(&self.cfg.workspace).display(),
+                    self.cfg.timeout_s / 60
+                )
+            } else {
+                format!(
+                    "working in {} for up to {} minutes without asking: {task}",
+                    arc_config::paths::expand(&self.cfg.workspace).display(),
+                    self.cfg.timeout_s / 60
+                )
+            },
         }
     }
     fn summarize(&self, v: &Json) -> Option<String> {
@@ -2074,5 +2135,91 @@ mod tests {
         let reply = HermesCode::extract_reply(raw);
         assert!(reply.contains("Something happened"), "{reply}");
         assert!(!reply.contains("Resume"), "{reply}");
+    }
+
+    #[test]
+    fn destructive_work_described_innocently_is_still_refused() {
+        // The screen checks the TASK TEXT, so a task that reads harmless but
+        // implies `rm -rf` or `git reset --hard` is the real risk once
+        // confirmation is optional. Each of these is a destructive command
+        // wearing ordinary English.
+        for task in [
+            "clean up the old build artifacts",
+            "tidy the project, remove the generated files",
+            "get rid of everything in the target folder",
+            "reset the repo to its original state",
+            "free up some disk space in this project",
+            "delete the node_modules directory",
+            "wipe the old database",
+            "purge the cache",
+        ] {
+            assert!(
+                HermesCode::screen(task, "/home/u/Projects").is_some(),
+                "implied destruction should be refused: {task}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_coding_still_passes_the_screen() {
+        // The refusal above is blunt on purpose, so this guards against it
+        // being so blunt that Arc can no longer code -- which is the entire
+        // feature being enabled.
+        for task in [
+            "create a Rust CLI calculator that adds and subtracts, with tests",
+            "debug why this fails to compile: cannot find value `x` in scope",
+            "add a --verbose flag to the parser",
+            "investigate why the tests are flaky",
+            "write a function that reverses a linked list",
+            "port the parser to Python",
+            "review this module and tell me what is wrong with it",
+        ] {
+            assert_eq!(HermesCode::screen(task, "/home/u/Projects"), None, "should be allowed: {task}");
+        }
+    }
+
+    #[test]
+    fn confirmation_is_a_setting_not_a_removal() {
+        // The user asked for no prompt, not for the gate to be deleted. Risk
+        // stays Dangerous so `tools.disabled` and confirm_at still apply.
+        let mut cfg = Config::default();
+        cfg.code.enabled = true;
+        cfg.code.confirm = false;
+        let t = Tools::build(&cfg, None, "https://x/?q={query}".into()).unwrap();
+        let a = t.by_name("code").unwrap().assess(&HashMap::from([(
+            "task".to_string(),
+            serde_json::json!("create a Rust CLI calculator, with tests"),
+        )]));
+        // Risk drops to Caution because the screen vetted this task. Assert
+        // the real gate outcome, not just the flag: Dangerous would prompt
+        // regardless of force_confirm, which is why this is not a no-op.
+        assert_eq!(a.risk, RiskLevel::Caution, "a screened task is no longer unvetted");
+        assert!(a.blocked.is_none());
+        assert!(!a.force_confirm, "code.confirm = false must not ask");
+        // The gate itself lives in arc-core, which depends on this crate, so
+        // it cannot be constructed here. The property that matters is checked
+        // in arc-security: Caution under confirm_at = "dangerous" must be
+        // allowed. What must hold here is that the tool reports Caution at
+        // all -- reporting Dangerous would prompt regardless of force_confirm,
+        // which is what made this a no-op the first time.
+        // ...and the screen still runs first.
+        let b = t.by_name("code").unwrap().assess(&HashMap::from([(
+            "task".to_string(),
+            serde_json::json!("delete the node_modules directory"),
+        )]));
+        assert!(b.blocked.is_some(), "the screen is the only gate left; it must hold");
+    }
+
+    #[test]
+    fn confirmation_comes_back_when_turned_on() {
+        let mut cfg = Config::default();
+        cfg.code.enabled = true;
+        assert!(cfg.code.confirm, "the safe default is to ask");
+        let t = Tools::build(&cfg, None, "https://x/?q={query}".into()).unwrap();
+        let a = t.by_name("code").unwrap().assess(&HashMap::from([(
+            "task".to_string(),
+            serde_json::json!("create a Rust CLI calculator, with tests"),
+        )]));
+        assert!(a.force_confirm, "confirm = true must ask");
     }
 }

@@ -168,6 +168,11 @@ workspace = "~/Projects"
 # Hard limit for one task, in seconds. Hermes is told to finish inside it too.
 timeout_s = 900
 max_output_bytes = 16384
+# Ask before each task. false = Arc writes files and runs builds on a
+# spoken instruction with no prompt. The screen is then the only gate,
+# so it refuses wording that implies deletion as well as literal
+# dangerous commands. Set back to true to restore the prompt.
+confirm = true
 reasoning = "medium"
 run_budget_s = 840
 

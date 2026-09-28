@@ -380,6 +380,15 @@ pub struct Code {
     pub timeout_s: u64,
     /// Cap on captured output, so a runaway build cannot flood the prompt.
     pub max_output_bytes: usize,
+    /// Whether to ask before each task.
+    ///
+    /// Off means Arc writes files and runs builds on a spoken instruction with
+    /// no prompt. That is the point of a hands-free coding assistant, and it
+    /// is only as safe as `screen()`, which is the sole remaining gate -- so
+    /// the screen matches implied destructive intent, not just literal
+    /// commands. Kept as a setting rather than deleted so it can be turned
+    /// back on without a rebuild.
+    pub confirm: bool,
     /// Reasoning effort passed to Hermes for a task.
     pub reasoning: String,
     /// Wall-clock budget handed to Hermes as --run-budget. Same ceiling as
@@ -396,6 +405,7 @@ impl Default for Code {
             workspace: "~/Projects".into(),
             timeout_s: 900,
             max_output_bytes: 16384,
+            confirm: true,
             reasoning: "medium".into(),
             run_budget_s: 840,
         }

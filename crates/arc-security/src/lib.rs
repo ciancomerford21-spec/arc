@@ -140,6 +140,19 @@ mod tests {
         assert!(matches!(p.decide("files.delete", RiskLevel::Dangerous), Decision::Confirm { .. }));
     }
 
+    /// The `code` tool drops to Caution once it has screened a task, so that
+    /// hands-free coding is possible. That only works if Caution is allowed
+    /// under the default threshold. If this ever starts confirming, the code
+    /// tool silently goes back to prompting and nothing else fails.
+    #[test]
+    fn a_screened_caution_action_is_allowed_by_default() {
+        let p = Policy::new(&perms(RiskLevel::Dangerous, &[]), &[]);
+        assert!(matches!(p.decide("code", RiskLevel::Caution), Decision::Allow));
+        // And Dangerous is still refused without an override, so a tool that
+        // forgets to screen cannot slip through this path.
+        assert!(matches!(p.decide("files.delete", RiskLevel::Dangerous), Decision::Confirm { .. }));
+    }
+
     #[test]
     fn stricter_threshold() {
         let p = Policy::new(&perms(RiskLevel::Caution, &[]), &[]);

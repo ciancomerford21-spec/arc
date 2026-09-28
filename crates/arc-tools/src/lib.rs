@@ -1448,7 +1448,13 @@ impl HermesCode {
             }
         }
         if task.trim().is_empty() {
-            return Some("need a task to work on".into());
+            // Observed live: the model called this with {} first, burning a
+            // round trip on a tool that then runs for minutes. Name the fix.
+            return Some(
+                "you called code with no task. Call it again with the task spelled out, \
+                 e.g. {\"task\": \"create a python calculator with tests\"}."
+                    .into(),
+            );
         }
         // Named directories that are obviously outside the project tree.
         for bad in ["/etc/", "/boot/", "/sys/", "/usr/", "/var/lib/", "~/.config/", "~/.ssh"] {
@@ -1538,9 +1544,10 @@ impl Tool for HermesCode {
     }
     fn parameters(&self) -> Json {
         serde_json::json!({"type": "object", "properties": {
-            "task": {"type": "string", "description": "What to build or fix, in plain words. \
-                Example: \"create a Rust CLI calculator that adds and subtracts, with tests\". \
-                For debugging, include the error text."}
+            "task": {"type": "string", "description": "REQUIRED. What to build or fix, in plain words. \
+            The whole task goes here: it is the only thing the agent is told. \
+            Example: \"create a Rust CLI calculator that adds and subtracts, with tests\". \
+            For debugging, include the error text."}
         }, "required": ["task"]})
     }
     fn base_risk(&self) -> RiskLevel {
@@ -1667,10 +1674,37 @@ impl Tool for HermesCode {
             Ok(out) => {
                 let stdout = clip(&out.stdout);
                 let stderr = clip(&out.stderr);
-                if out.status.success() {
+                let ok = out.status.success();
+                if ok {
+                    // `raw` used to go back to the model verbatim, and Hermes prints the
+                    // full write plus a diff. For one Python file that was a
+                    // 376-line diff inside a single tool result, which crowded
+                    // out the conversation and pushed the model into a second
+                    // tool call just to check its own work -- and that call
+                    // needed confirmation, which is how a working build ended
+                    // up silent. The summary is the answer; the transcript is
+                    // not needed and is available in the daemon log.
                     ToolResult::Ok(serde_json::json!({
-                        "summary": Self::extract_reply(&stdout),
-                        "raw": stdout,
+                        // The exit status is the answer, not Hermes' closing box. That box
+                        // is its internal narration -- observed live, it ended with
+                        // "Also verify CLI with venv python", which reads like unfinished
+                        // work, so the model reached for shell_exec to check, which is
+                        // Caution, so it stopped and asked, and the user sat in silence
+                        // next to a project that had in fact been built and tested. Lead
+                        // with a definite status; keep the narration as detail only.
+                        "status": if ok { "done" } else { "failed" },
+                        "summary": format!(
+                            "{}\n\nAgent output (may be its own running notes): {}",
+                            if ok {
+                                "The agent finished. Files were written and any build and tests were \
+                                 run as part of the task. This is complete -- report it to the user \
+                                 and do not verify it with another tool."
+                            } else {
+                                "The agent FAILED. Tell the user it failed and quote the error below. \
+                                 Do not claim success."
+                            },
+                            Self::extract_reply(&stdout)
+                        ),
                         "stderr": stderr,
                         "workspace": dir.display().to_string(),
                     }))

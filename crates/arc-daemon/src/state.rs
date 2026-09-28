@@ -42,6 +42,25 @@ pub struct Daemon {
     utterance: AtomicU64,
 }
 
+/// How long a turn may run before Arc says something.
+///
+/// Measured: the `code` tool takes 2-4 minutes on a small project, and until
+/// it finished the user heard nothing at all, so a request that was working
+/// looked dead. Six seconds is past the point where a normal reply has
+/// already started being spoken (median 2.1s, slow tool calls 3-6s), so this
+/// only fires for genuinely long turns.
+const SLOW_TURN_SPEAKS_AT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// The one line said when a turn runs long. Deliberately vague: at this point
+/// the tool has been chosen but nothing has happened yet, and naming a step it
+/// may not reach would be a claim Arc cannot support.
+const SLOW_TURN_HEADSUP: &str = "On it. This one takes a minute.";
+
+fn next_progress_id() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
 fn to_core(s: InputSource) -> CoreSource {
     match s {
         InputSource::Text => CoreSource::Text,
@@ -90,6 +109,23 @@ impl Daemon {
             m: Mutex::new(Mutable::default()),
             utterance: AtomicU64::new(0),
         })
+    }
+
+    /// A cheap, cloneable way to make Arc say something from a background task.
+    ///
+    /// The events sender is behind an `Arc` already, so this hands out a
+    /// closure over a clone of it rather than over `self` -- `Daemon` owns a
+    /// `Mutex` and an `Assistant` and is not something to clone per turn just
+    /// to announce that a turn is slow.
+    fn speak_handle(&self) -> impl Fn(String) + Send + 'static {
+        let events = self.events.clone();
+        move |text| {
+            tracing::info!("speaking progress update: {text}");
+            let id = format!("progress-{}", next_progress_id());
+            let _ = events.send(Event::VoiceControl {
+                command: VoiceCommand::Speak { text, utterance_id: id, listen_after: false },
+            });
+        }
     }
 
     pub fn emit(&self, e: Event) {
@@ -153,7 +189,19 @@ impl Daemon {
         self.emit(Event::Heard { text: text.into(), source });
         self.m.lock().unwrap().last_command = Some(text.into());
         self.set_state(AssistantState::Thinking, text);
+        // A long turn used to be silent from the user's point of view: the
+        // `code` tool runs for minutes, and nothing was spoken until it
+        // finished, so a request that was in fact working looked dead. This
+        // speaks a short heads-up if the turn is still running after
+        // SLOW_TURN_SPEAKS_AT, then keeps quiet -- a line every thirty seconds
+        // would be worse than the silence it fixes.
+        let speak = self.speak_handle();
+        let watchdog = tokio::spawn(async move {
+            tokio::time::sleep(SLOW_TURN_SPEAKS_AT).await;
+            speak(SLOW_TURN_HEADSUP.to_string());
+        });
         let reply = self.assistant.handle(&NluInput::text(text, to_core(source))).await;
+        watchdog.abort();
         self.finish(reply, start)
     }
 
@@ -344,4 +392,36 @@ impl Daemon {
 fn rss_kb() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
     s.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slow_turn_says_something_before_it_finishes() {
+        // The bug this fixes: a `code` task runs for minutes and used to be
+        // completely silent, so a build that was working looked dead. Assert
+        // the threshold sits above a normal reply and below a long tool call.
+        assert!(
+            SLOW_TURN_SPEAKS_AT > std::time::Duration::from_millis(2100),
+            "the headsup would cut into a normal reply"
+        );
+        assert!(
+            SLOW_TURN_SPEAKS_AT < std::time::Duration::from_secs(30),
+            "that is a long silence to leave the user in"
+        );
+        // It must not promise a step: at six seconds the tool is chosen but
+        // nothing has happened yet.
+        assert!(!SLOW_TURN_HEADSUP.contains("test") && !SLOW_TURN_HEADSUP.contains("build"));
+    }
+
+    #[test]
+    fn progress_ids_are_unique() {
+        // Each spoken headsup needs its own id, or the voice service will treat
+        // two of them as the same utterance and cut one off.
+        let a = next_progress_id();
+        let b = next_progress_id();
+        assert_ne!(a, b);
+    }
 }

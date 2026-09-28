@@ -1,4 +1,4 @@
-//! AI provider abstraction: local llama.cpp, OpenAI-compatible, Anthropic.
+//! AI provider abstraction: OpenAI-compatible (Hermes proxy, OpenAI) and Anthropic.
 //!
 //! All providers are async (non-blocking reqwest) so they can be called from
 //! inside the daemon's tokio runtime. They support native tool calling: the
@@ -172,7 +172,7 @@ async fn post_json(req: reqwest::RequestBuilder, body: &Json) -> Result<Json, Ai
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI-compatible (also used for the local llama.cpp server)
+// OpenAI-compatible (the Hermes proxy speaks this dialect)
 // ---------------------------------------------------------------------------
 
 pub struct OpenAiCompat {
@@ -561,14 +561,6 @@ pub fn from_config(config: &arc_config::Ai) -> Result<ProviderSet, AiError> {
     let timeout = Duration::from_secs(config.timeout_s.max(1));
     let make = |kind: ProviderKind| -> Result<Box<dyn Provider>, AiError> {
         Ok(match kind {
-            ProviderKind::Local => Box::new(OpenAiCompat::new(
-                "local",
-                config.local.endpoint.clone(),
-                config.local.model.clone(),
-                key_from_env(&config.local.api_key_env),
-                sampling,
-                timeout,
-            )),
             ProviderKind::Openai => Box::new(OpenAiCompat::new(
                 "openai",
                 config.openai.base_url.clone(),
@@ -711,9 +703,32 @@ mod tests {
     }
 
     #[test]
-    fn default_config_builds_local_provider() {
+    fn default_config_builds_the_hermes_provider() {
+        // The local model is gone. If this ever reads "local" again it means
+        // the provider default drifted back to something Arc cannot start.
         let set = from_config(&arc_config::Ai::default()).unwrap();
-        assert_eq!(set.primary_name(), "local");
+        assert_eq!(set.primary_name(), "hermes-proxy");
+    }
+
+    #[test]
+    fn a_config_naming_the_local_provider_is_rejected() {
+        // The variant is gone, so a config still saying provider = "local"
+        // must fail loudly rather than quietly fall back to a default and
+        // leave the user wondering why Arc sounds like a different Arc.
+        let bad = "[ai]\nprovider = \"local\"\n";
+        assert!(arc_config::parse_str(bad).is_err(), "a config naming the local provider should be rejected");
+    }
+
+    #[test]
+    fn hermes_as_fallback_is_ignored_when_it_is_already_primary() {
+        // Otherwise Arc opens a second proxy connection to the same place.
+        let cfg = arc_config::Ai {
+            provider: arc_config::ProviderKind::Hermes,
+            fallback: arc_config::ProviderKind::Hermes,
+            ..Default::default()
+        };
+        let set = from_config(&cfg).unwrap();
+        assert_eq!(set.primary_name(), "hermes-proxy");
     }
 
     /// Regression test for the old blocking client, which panicked when

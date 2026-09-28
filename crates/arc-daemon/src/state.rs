@@ -267,7 +267,6 @@ impl Daemon {
             components,
             ai_provider: self.assistant.provider_name().into(),
             ai_model: match self.config.ai.provider {
-                arc_config::ProviderKind::Local => self.config.ai.local.model.clone(),
                 arc_config::ProviderKind::Openai => self.config.ai.openai.model.clone(),
                 arc_config::ProviderKind::Hermes => self.config.ai.hermes.model.clone(),
                 arc_config::ProviderKind::Anthropic => self.config.ai.anthropic.model.clone(),

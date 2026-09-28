@@ -22,9 +22,9 @@ Everything is per-user; no root. `scripts/uninstall.sh` removes it again
 | Binaries | `~/.local/bin/arc`, `~/.local/bin/arcd` |
 | Config | `~/.config/arc/config.toml` |
 | API keys | `~/.config/arc/secrets.env` (mode 600, `NAME=value` lines) |
-| Voice venv, models, llama.cpp | `~/.local/share/arc/` |
+| Voice venv and speech models | `~/.local/share/arc/` |
 | Memory store | `~/.local/share/arc/memory/` |
-| Services | `arcd.service`, `arc-llm.service` (systemd user units) |
+| Services | `arcd.service`, `hermes-proxy.service` (systemd user units) |
 | Bar widget | `~/.config/omarchy/plugins/arc.status` |
 
 ## Using it
@@ -95,38 +95,55 @@ store somewhere else.
 
 ## Language model
 
-Local by default. `arc-llm.service` runs llama.cpp against the model named in
-`[ai.local]` and the daemon talks to it over `http://127.0.0.1:8765/v1`.
+Cloud by default, and the only option. Arc talks to the Hermes proxy
+(`hermes-proxy.service`, an OpenAI-compatible endpoint on
+`http://127.0.0.1:8645/v1`), which attaches your own Hermes credentials. The
+proxy is Arc's only reasoning provider, so it is enabled at boot; if it is
+down, Arc cannot answer.
 
-The shipped defaults are `provider = "local"`, `fallback = "none"` and
-`phrasing = "none"`, with Qwen3.5-2B (Q4_K_M) and 30 tools. The same 2B model
-picks tools, reasons and words the final reply.
+There is no local model. The 2B that used to run here refused coherent tasks
+("I can't create applications") and answered flatly, and it cost ~3.6GB of
+VRAM. Voice stays local: Moonshine for speech recognition and Kokoro for
+speech, both under `[voice]`.
 
-Cloud providers are still implemented if you want them — set `provider` in
-`[ai]` to one of these:
+Other providers remain implemented — set `provider` in `[ai]` to:
 
+- `hermes`: the proxy above.
 - `openai`: any OpenAI-compatible API. `[ai.openai]` holds the endpoint and
   model; the key is read from the variable named in `api_key_env`.
 - `anthropic`: the Messages API.
-- `local`, `none` (built-in commands only).
+- `none` (built-in commands only).
 
-`phrasing` optionally routes only the final spoken sentence to a second model,
-leaving tool selection and reasoning local. It is off by default, and the
-installer only enables `arc-llm.service` when the config uses `local`.
+`fallback` is `none`: there is no local model left to degrade to, so a proxy
+outage means no reply rather than a worse one. Requests are retried once on a
+transient 5xx, which the proxy throws on roughly 2 in 5 calls; a 401 or 400
+fails immediately, because retrying those just wastes time.
 
-### A note on the 2B model
+`phrasing` is set to `hermes`, the same connection as the primary, so replies
+are not rewritten on a second connection. Pointing it at another provider
+costs an extra round trip per reply for no measured gain.
 
-Qwen3.5-2B is fast enough for voice, but it is a small model and the tool list
-is long. Two things follow from that, both deliberate:
+### What the model decides, and what it does not
 
 - **Known commands bypass the model.** "open wikipedia.org" opens the site
   directly. A dot or a TLD is required, so "open spotify" is still
   treated as an app request. Anything that asks for an answer ("search X and tell me about it")
   goes to the model instead, because there is no fetch tool to satisfy it.
-- **The system prompt is short.** A 2B cannot hold a persona alongside 30 tool
-  schemas without losing factual accuracy, so there is no wit or style prompt.
+- **The prompt carries a personality.** `[personality] custom_prompt` sets the
+  voice; it ships filled in and lives in `Config::default()`, so a fresh
+  install sounds the same. It used to be forced short because a long prompt
+  stopped the 2B calling tools — that constraint is gone, and re-measured the
+  full prompt costs nothing against a cloud model.
 
-## Voice
+### The `code` tool
+
+`[code] enabled = true` hands multi-step tasks to `hermes chat -q`, which
+acts on the machine itself: build a project, debug a failing build,
+investigate a codebase. It writes files and runs commands, so it is always
+`Dangerous` and always confirms. The task is passed via `--query-file` so the
+shell cannot reinterpret what the model wrote, and the task text is screened
+for destructive commands. `workspace` bounds where it may write.
+
 
 Under `[voice]`, all local:
 
@@ -140,7 +157,7 @@ Under `[voice]`, all local:
 ## Troubleshooting
 
 ```bash
-systemctl --user status arcd arc-llm
+systemctl --user status arcd hermes-proxy
 journalctl --user -u arcd -f          # daemon + voice log
 arc status                            # component health
 ARC_VOICE_DEBUG=1 arcd                # log every transcript the mic hears (privacy: includes nearby talk)

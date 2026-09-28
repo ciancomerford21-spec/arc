@@ -10,7 +10,7 @@ purge=0
 cfg=${XDG_CONFIG_HOME:-$HOME/.config}
 data=${XDG_DATA_HOME:-$HOME/.local/share}/arc
 
-for u in arcd arc-llm; do
+for u in arcd hermes-proxy; do
     systemctl --user disable --now "$u.service" 2>/dev/null || true
     rm -f "$cfg/systemd/user/$u.service"
 done
@@ -32,12 +32,12 @@ fi
 rm -rf "$cfg/omarchy/plugins/arc.status"
 
 rm -f "$HOME/.local/bin/arc" "$HOME/.local/bin/arcd"
-rm -rf "$data/python" "$data/bin/arc-llm"
+rm -rf "$data/python"
 
 if [[ $purge == 1 ]]; then
     rm -rf "$cfg/arc" "$data"
     echo "Arc removed, including config, secrets, models and venv."
 else
-    echo "Arc removed. Kept: $cfg/arc (config + secrets), $data (models, venv, llama.cpp)."
+    echo "Arc removed. Kept: $cfg/arc (config + secrets), $data (voice models)."
     echo "Run with --purge to delete those too."
 fi

@@ -108,8 +108,6 @@ Never fake feelings, never over-explain what you're about to do, never stack on 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
-    /// Arc-managed llama.cpp server (OpenAI-compatible, localhost).
-    Local,
     /// OpenAI or any OpenAI-compatible endpoint (OpenRouter, Groq, Ollama...).
     Openai,
     /// Anthropic Messages API.
@@ -140,7 +138,6 @@ pub struct Ai {
     /// Rewrites the final reply before it is spoken. Off means replies are
     /// passed through untouched, which costs nothing.
     pub phrasing_enabled: bool,
-    pub local: LocalAi,
     pub openai: RemoteAi,
     pub anthropic: RemoteAi,
     /// Endpoint for the Hermes proxy fallback (`hermes proxy start`).
@@ -150,20 +147,29 @@ pub struct Ai {
 impl Default for Ai {
     fn default() -> Self {
         Self {
-            provider: ProviderKind::Local,
+            provider: ProviderKind::Hermes,
+            // Nothing to fall back to: the local model was removed, so a
+            // proxy outage means no answer rather than a worse one.
             fallback: ProviderKind::None,
-            temperature: 0.0,
-            max_tokens: 400,
-            timeout_s: 45,
+            // 0.6 measured no tool-calling cost against the hermes model,
+            // where 0.0 read as flat. Warmth belongs in the personality.
+            temperature: 0.6,
+            // 600 was the fastest setting measured (2.4s) with no
+            // truncation; the 2B's 400 truncated this model's replies.
+            max_tokens: 600,
+            // Cloud round-trips are slower than localhost.
+            timeout_s: 120,
             max_tool_rounds: 4,
-            phrasing: ProviderKind::None,
-            phrasing_enabled: false,
-            local: LocalAi::default(),
+            // The primary already speaks well, so the same connection does
+            // the phrasing. Naming any other provider here would add a second
+            // one and a second round trip for no measured gain.
+            phrasing: ProviderKind::Hermes,
+            phrasing_enabled: true,
             // The proxy ignores the bearer: `hermes proxy start` attaches the
             // user's own Portal credentials. Any non-empty value works.
             hermes: RemoteAi {
                 base_url: "http://127.0.0.1:8645/v1".into(),
-                model: "hermes".into(),
+                model: "stealth/space-bunny-alpha".into(),
                 api_key_env: "ARC_HERMES_PROXY_KEY".into(),
             },
             openai: RemoteAi {
@@ -176,44 +182,6 @@ impl Default for Ai {
                 model: "claude-sonnet-4-5".into(),
                 api_key_env: "ANTHROPIC_API_KEY".into(),
             },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct LocalAi {
-    /// OpenAI-compatible endpoint of the local server.
-    pub endpoint: String,
-    /// Display name of the model.
-    pub model: String,
-    /// GGUF file served by arc-llm.service (relative to
-    /// ~/.local/share/arc/models, or absolute).
-    pub model_file: String,
-    /// llama-server binary: "auto" picks the CUDA build when an NVIDIA GPU
-    /// is usable, then Vulkan, then CPU (`arc doctor` shows the choice).
-    pub server_binary: String,
-    /// Layers offloaded to the GPU (-1 = let llama.cpp fit to free VRAM).
-    pub gpu_layers: i32,
-    pub context: u32,
-    /// Environment variable holding the local server's API key (read from
-    /// ~/.config/arc/secrets.env when not set in the environment).
-    pub api_key_env: String,
-    /// Extra llama-server arguments.
-    pub extra_args: Vec<String>,
-}
-
-impl Default for LocalAi {
-    fn default() -> Self {
-        Self {
-            endpoint: "http://127.0.0.1:8765/v1".into(),
-            model: "Qwen3.5-2B (Q4_K_M)".into(),
-            model_file: "Qwen3.5-2B-Q4_K_M.gguf".into(),
-            server_binary: "auto".into(),
-            gpu_layers: -1,
-            context: 8192,
-            api_key_env: "ARC_LLM_API_KEY".into(),
-            extra_args: vec![],
         }
     }
 }
@@ -1045,7 +1013,6 @@ mod tests {
             ("ui.accent", "[ui]\naccent = \"#ff0000\"\n"),
             ("ui.opacity", "[ui]\nopacity = 0.9\n"),
             ("logging.log_ai_payloads", "[logging]\nlog_ai_payloads = true\n"),
-            ("ai.local.idle_unload_s", "[ai.local]\nidle_unload_s = 600\n"),
         ] {
             let (_, warnings) = parse_str(gone).expect("unknown keys warn, they do not fail");
             assert!(

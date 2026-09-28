@@ -1,0 +1,15 @@
+[Unit]
+Description=Hermes OpenAI-compatible proxy (Arc's reasoning provider)
+Documentation=file://%h/Projects/arc/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hermes proxy start --provider nous --host 127.0.0.1 --port 8645
+# Arc's only reasoning provider. If this is down, Arc cannot answer.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

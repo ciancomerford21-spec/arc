@@ -8,8 +8,7 @@
 # Layout:
 #   ~/.local/bin/{arc,arcd}                     binaries
 #   ~/.local/share/arc/python/arc_voice         voice sidecar (venv + models already in ~/.local/share/arc)
-#   ~/.local/share/arc/bin/arc-llm              llama-server launcher
-#   ~/.config/systemd/user/{arcd,arc-llm}.service
+#   ~/.config/systemd/user/{arcd,hermes-proxy}.service
 #   ~/.config/omarchy/plugins/arc.status        bar widget
 #   ~/.config/arc/config.toml                   only created if missing
 set -euo pipefailq
@@ -48,7 +47,6 @@ fi
 step "Installing files"
 install -Dm755 "$root/target/$profile/arcd" "$bin/arcd"
 install -Dm755 "$root/target/$profile/arc" "$bin/arc"
-install -Dm755 "$root/scripts/arc-llm.sh" "$data/bin/arc-llm"
 rm -rf "$data/python/arc_voice"
 mkdir -p "$data/python"
 cp -r "$root/python/arc_voice" "$data/python/arc_voice"
@@ -65,16 +63,12 @@ fi
 [[ -f $conf/secrets.env ]] && chmod 600 "$conf/secrets.env"
 
 install -Dm644 "$root/systemd/arcd.service" "$units/arcd.service"
-install -Dm644 "$root/systemd/arc-llm.service" "$units/arc-llm.service"
+install -Dm644 "$root/systemd/hermes-proxy.service" "$units/hermes-proxy.service"
 
 step "Starting services"
 systemctl --user daemon-reload
-# Only run the local model server if the config actually uses it.
-if grep -qE '^(provider|fallback)[[:space:]]*=[[:space:]]*"local"' "$conf/config.toml"; then
-    systemctl --user enable --now arc-llm.service
-else
-    echo "   local model not used by config; arc-llm.service left disabled"
-fi
+# The proxy is Arc's only reasoning provider: without it Arc cannot answer.
+systemctl --user enable --now hermes-proxy.service
 systemctl --user enable arcd.service
 systemctl --user restart arcd.service
 

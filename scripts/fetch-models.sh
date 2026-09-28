@@ -8,8 +8,10 @@
 #
 # Every model file that Arc loads is pinned by SHA-256 below. A mismatch is
 # fatal: the file is left in place and nothing is overwritten silently.
-# Language models (GGUF for llama.cpp) are handled separately by the
-# installer because of their size.
+# These are the speech models, and the only models Arc loads: Moonshine for
+# recognition, Kokoro for speech, plus the VAD and wake-word models. They all
+# run on this machine. Reasoning is not here -- it goes through the hermes
+# proxy, and there is no local language model.
 set -euo pipefail
 
 BASE="https://github.com/k2-fsa/sherpa-onnx/releases/download"

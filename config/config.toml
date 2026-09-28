@@ -6,38 +6,33 @@ name = "Arc"
 name_variants = ["arc", "ark"]
 
 [ai]
-provider = "local"
-# Provider to try when the primary one fails.
+# Hermes is the only provider. There is no local model left to fall back to,
+# so a proxy outage means no reply rather than a worse one.
+provider = "hermes"
 fallback = "none"
-# Greedy. Above ~0.2 the 2B skips tool calls and starts inventing system
-# facts; warmth belongs in the personality prompt, not in sampling.
-temperature = 0.0
-max_tokens = 400
-timeout_s = 45
+# Warmth lives in the personality prompt, not in sampling: 0.6 measured no
+# tool-calling cost against the hermes model, where 0.0 read as flat.
+temperature = 0.6
+max_tokens = 600
+timeout_s = 120
 # Maximum model -> tool -> model rounds for one request.
 max_tool_rounds = 4
-
-phrasing = "none"
-phrasing_enabled = false
-
-[ai.local]
-endpoint = "http://127.0.0.1:8765/v1"
-model = "Qwen3.5-2B (Q4_K_M)"
-# Relative to ~/.local/share/arc/models, or an absolute path.
-model_file = "Qwen3.5-2B-Q4_K_M.gguf"
-# "auto" = CUDA build if an NVIDIA GPU is usable, else Vulkan, else CPU.
-server_binary = "auto"
-# GPU layers (-1 = fit automatically to free VRAM).
-gpu_layers = -1
-context = 8192
-# The installer generates a random key for the local server.
-api_key_env = "ARC_LLM_API_KEY"
-extra_args = []
+# The primary already speaks well, so the same connection does the phrasing.
+# Anything else here would be a second provider and a second round trip.
+phrasing = "hermes"
+phrasing_enabled = true
 
 [ai.openai]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4.1-mini"
 api_key_env = "OPENAI_API_KEY"
+
+[ai.hermes]
+# The local proxy from `hermes proxy start --provider nous`. It attaches your
+# own Portal credentials, so the key here is a placeholder.
+base_url = "http://127.0.0.1:8645/v1"
+model = "stealth/space-bunny-alpha"
+api_key_env = "ARC_HERMES_PROXY_KEY"
 
 [ai.anthropic]
 base_url = "https://api.anthropic.com"

@@ -2,8 +2,8 @@
 Description=Arc voice assistant daemon
 Documentation=file://%h/.local/share/arc/README.md
 # The local model is the fallback provider; start it alongside, but Arc works without it.
-Wants=arc-llm.service
-After=arc-llm.service pipewire.service wireplumber.service
+Wants=hermes-proxy.service
+After=hermes-proxy.service pipewire.service wireplumber.service
 PartOf=graphical-session.target
 After=graphical-session.target
 

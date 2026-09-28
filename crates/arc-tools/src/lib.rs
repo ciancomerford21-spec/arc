@@ -79,6 +79,20 @@ pub trait Tool: Send + Sync + 'static {
     fn summarize(&self, _result: &Json) -> Option<String> {
         None
     }
+    /// A question to append after the summary, so Arc offers the obvious next
+    /// step and opens the mic for the answer.
+    ///
+    /// Only for commands that usually sit *in the middle* of something the
+    /// user is doing -- moving to a workspace, opening an app -- where "what
+    /// now?" is a real question and the user almost always has an answer.
+    /// Deliberately absent from terminal commands (mute, pause, lock): asking
+    /// "anything else?" after every one of those is noise.
+    ///
+    /// Must end in a question mark so the voice layer listens, and must be
+    /// specific to the command. Never a generic "anything else?".
+    fn follow_up(&self, _result: &Json) -> Option<String> {
+        None
+    }
 }
 
 fn s(v: &Json, k: &str) -> Option<String> {
@@ -186,7 +200,7 @@ impl Tools {
         self.by_name.keys().cloned().collect()
     }
 
-    fn register_builtins(&mut self, shell: ShellExec, store: Store, search_url: String) {
+    fn register_builtins(&mut self, shell: ShellExec, _store: Store, search_url: String) {
         self.register(Arc::new(shell));
         self.register(Arc::new(WebSearch { template: search_url }));
         // NOTE: the four memory_* tools are deliberately NOT registered. Reading
@@ -307,6 +321,12 @@ impl Tool for WorkspaceGoto {
     }
     fn summarize(&self, v: &Json) -> Option<String> {
         Some(format!("Switched to workspace {}.", s(v, "switched_to")?))
+    }
+    fn follow_up(&self, v: &Json) -> Option<String> {
+        // Keyed on switched_to so a result that never confirmed the switch
+        // cannot still ask "what would you like to do here?".
+        s(v, "switched_to")?;
+        Some("What would you like to do on this workspace?".into())
     }
     async fn execute(&self, args: &JsonMap) -> ToolResult {
         let id = args.get("id").and_then(|v| v.as_i64()).map(|i| i.to_string());
@@ -831,6 +851,13 @@ impl Tool for OpenUrl {
             None => Some(format!("Opening {host}.")),
         }
     }
+    fn follow_up(&self, v: &Json) -> Option<String> {
+        // Only when the user picked the workspace: they have just told Arc
+        // where they want to be, so "what next here?" is the live question.
+        // A bare "open github.com" is usually the whole request.
+        v.get("workspace").and_then(|w| w.as_i64())?;
+        Some("What would you like to do next?".into())
+    }
     async fn execute(&self, args: &JsonMap) -> ToolResult {
         let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let workspace = args.get("workspace").and_then(|v| v.as_i64());
@@ -882,6 +909,10 @@ impl Tool for WindowMove {
     }
     fn summarize(&self, v: &Json) -> Option<String> {
         Some(format!("Moved {} to workspace {}.", s(v, "window")?, v.get("workspace")?))
+    }
+    fn follow_up(&self, v: &Json) -> Option<String> {
+        v.get("workspace")?;
+        Some("Want me to open something there?".into())
     }
     async fn execute(&self, args: &JsonMap) -> ToolResult {
         let Some(ws) = args.get("workspace").and_then(|v| v.as_i64()) else {
@@ -996,137 +1027,9 @@ impl Tool for PowerInfo {
 /// tools report that rather than failing.
 type Store = Option<Arc<arc_memory::MemoryStore>>;
 
-struct MemoryRemember(Store);
-#[async_trait]
-impl Tool for MemoryRemember {
-    fn name(&self) -> &str {
-        "memory_remember"
-    }
-    fn description(&self) -> &str {
-        "Store a fact about the user for later, across sessions. Use only when the user asks you to \
-         remember something, or states a durable preference, name, or goal worth keeping. \
-         Write it as a plain sentence about the user, in the third person."
-    }
-    fn parameters(&self) -> Json {
-        serde_json::json!({"type": "object", "properties": {
-            "fact": {"type": "string", "description": "The fact to remember, as a sentence about the user"}
-        }, "required": ["fact"]})
-    }
-    fn summarize(&self, v: &Json) -> Option<String> {
-        s(v, "fact").map(|f| format!("Noted: {f}."))
-    }
-    async fn execute(&self, args: &JsonMap) -> ToolResult {
-        let Some(store) = self.0.as_ref() else { return not_available() };
-        let fact = args.get("fact").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        if fact.is_empty() {
-            return ToolResult::Error("memory_remember: need a non-empty 'fact'".into());
-        }
-        let e = store.remember(fact, vec![]);
-        ToolResult::Ok(serde_json::json!({"id": e.id, "fact": e.fact, "remembered_at": e.remembered_at}))
-    }
-}
 
-struct MemoryForget(Store);
-#[async_trait]
-impl Tool for MemoryForget {
-    fn name(&self) -> &str {
-        "memory_forget"
-    }
-    fn description(&self) -> &str {
-        "Delete a remembered fact by its id. Use when the user asks you to forget something. \
-         Call memory_list first if you need the id."
-    }
-    fn parameters(&self) -> Json {
-        serde_json::json!({"type": "object", "properties": {
-            "id": {"type": "string", "description": "Id of the fact to delete, from memory_list"}
-        }, "required": ["id"]})
-    }
-    fn summarize(&self, _v: &Json) -> Option<String> {
-        Some("Forgotten.".into())
-    }
-    async fn execute(&self, args: &JsonMap) -> ToolResult {
-        let Some(store) = self.0.as_ref() else { return not_available() };
-        let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
-        if id.is_empty() {
-            return ToolResult::Error("memory_forget: need an 'id'".into());
-        }
-        if store.forget(id) {
-            ToolResult::Ok(serde_json::json!({"id": id, "forgotten": true}))
-        } else {
-            ToolResult::Error(format!("memory_forget: no fact with id {id}"))
-        }
-    }
-}
 
-struct MemoryList(Store);
-#[async_trait]
-impl Tool for MemoryList {
-    fn name(&self) -> &str {
-        "memory_list"
-    }
-    fn description(&self) -> &str {
-        "List every fact Arc has remembered, with ids."
-    }
-    fn parameters(&self) -> Json {
-        no_params()
-    }
-    fn summarize(&self, v: &Json) -> Option<String> {
-        Some(match v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) {
-            0 => "I don't have anything remembered yet.".into(),
-            n => format!("{n} thing{} remembered.", if n == 1 { "" } else { "s" }),
-        })
-    }
-    async fn execute(&self, _args: &JsonMap) -> ToolResult {
-        let Some(store) = self.0.as_ref() else { return not_available() };
-        let entries = store.list();
-        let facts: Vec<Json> = entries
-            .iter()
-            .map(|e| serde_json::json!({"id": e.id, "fact": e.fact, "remembered_at": e.remembered_at}))
-            .collect();
-        ToolResult::Ok(serde_json::json!({"count": facts.len(), "facts": facts}))
-    }
-}
 
-struct MemorySearch(Store);
-#[async_trait]
-impl Tool for MemorySearch {
-    fn name(&self) -> &str {
-        "memory_search"
-    }
-    fn description(&self) -> &str {
-        "Search remembered facts for a keyword, returning the ones that match. \
-         Use when the user refers to something they told you previously."
-    }
-    fn parameters(&self) -> Json {
-        serde_json::json!({"type": "object", "properties": {
-            "query": {"type": "string", "description": "Words to look for"}
-        }, "required": ["query"]})
-    }
-    fn summarize(&self, v: &Json) -> Option<String> {
-        Some(match v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) {
-            0 => "Nothing remembered matches that.".into(),
-            n => format!("{n} match{}.", if n == 1 { "" } else { "es" }),
-        })
-    }
-    async fn execute(&self, args: &JsonMap) -> ToolResult {
-        let Some(store) = self.0.as_ref() else { return not_available() };
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        if query.is_empty() {
-            return ToolResult::Error("memory_search: need a non-empty 'query'".into());
-        }
-        let terms: Vec<&str> = query.split_whitespace().collect();
-        let entries = store.search(terms);
-        let facts: Vec<Json> = entries
-            .iter()
-            .map(|e| serde_json::json!({"id": e.id, "fact": e.fact, "remembered_at": e.remembered_at}))
-            .collect();
-        ToolResult::Ok(serde_json::json!({"count": facts.len(), "facts": facts}))
-    }
-}
-
-fn not_available() -> ToolResult {
-    ToolResult::Error("memory is disabled (no memory store configured)".into())
-}
 
 struct WebSearch {
     template: String,

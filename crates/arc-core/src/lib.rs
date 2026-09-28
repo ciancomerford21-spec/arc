@@ -511,6 +511,15 @@ fn tame_spoken_url(text: String) -> String {
     .into_owned()
 }
 
+/// The tool's own follow-up question, if it has one. Only offered when the
+/// call actually succeeded: asking "what next?" after a failure is nonsense.
+fn follow_up_for(tools: &Tools, tool: &str, result: &ToolResult) -> Option<String> {
+    match result {
+        ToolResult::Ok(v) => tools.by_name(tool)?.follow_up(v),
+        _ => None,
+    }
+}
+
 fn summarise(tools: &Tools, tool: &str, result: &ToolResult) -> String {
     if let (ToolResult::Ok(v), Some(t)) = (result, tools.by_name(tool)) {
         if let Some(s) = t.summarize(v) {
@@ -603,11 +612,21 @@ impl Assistant {
 
     fn reply_from_outcome(&self, outcome: Outcome, route: Route) -> Reply {
         let record = outcome.record();
-        let text = match &outcome {
+        let mut text = match &outcome {
             Outcome::Done { tool, result, .. } => summarise(self.gate.tools(), tool, result),
             Outcome::NeedsConfirmation(p) => format!("This will {}. Confirm?", p.explanation),
             Outcome::Denied { tool, reason, .. } => format!("I won't run {tool}: {reason}"),
         };
+        // Offer the next step for the commands that sit mid-task. The question
+        // mark is what makes the voice layer open the mic for the answer, so
+        // this doubles as the follow-up trigger rather than needing a second
+        // signal plumbed through the reply.
+        if let Outcome::Done { tool, result, .. } = &outcome {
+            if let Some(q) = follow_up_for(self.gate.tools(), tool, result) {
+                text.push(' ');
+                text.push_str(&q);
+            }
+        }
         let pending = match outcome {
             Outcome::NeedsConfirmation(p) => Some(p),
             _ => None,
@@ -1223,5 +1242,78 @@ mod tests {
             Router::number_words_to_digits("switch to workspace two"),
             "switch to workspace 2"
         );
+    }
+
+    #[test]
+    fn mid_workflow_commands_offer_a_follow_up_question() {
+        // Each of these lands the user somewhere new, so "what now?" is a real
+        // question. The question mark is load-bearing: it is what makes the
+        // voice layer open the mic instead of going silent.
+        let t = Tools::new();
+        for (tool, result, want) in [
+            ("workspace_goto", serde_json::json!({"switched_to": "4"}), "on this workspace"),
+            ("window_move", serde_json::json!({"window": "firefox", "workspace": 3}), "open something there"),
+            ("open_url", serde_json::json!({"opened": "https://github.com", "workspace": 2}), "next"),
+        ] {
+            let q = follow_up_for(&t, tool, &ToolResult::Ok(result))
+                .unwrap_or_else(|| panic!("{tool} has no follow-up"));
+            assert!(q.ends_with('?'), "{tool}: follow-up must ask something: {q}");
+            assert!(q.contains(want), "{tool}: {q:?} should mention {want:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_commands_do_not_ask_a_follow_up() {
+        // These end the interaction. Offering "anything else?" after every
+        // volume change is the noise that made follow-ups feel bad before.
+        let t = Tools::new();
+        for (tool, result) in [
+            ("audio_volume_set", serde_json::json!({"percent": 30})),
+            ("media_pause", serde_json::json!({"paused": true})),
+            ("lock", serde_json::json!({"locked": true})),
+            ("workspace_list", serde_json::json!([{"id": 1}])),
+            ("open_url", serde_json::json!({"opened": "https://github.com"})),
+        ] {
+            assert!(
+                follow_up_for(&t, tool, &ToolResult::Ok(result)).is_none(),
+                "{tool} should not ask a follow-up"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_command_never_offers_a_follow_up() {
+        // "What would you like to do next?" after a failure reads as though
+        // something succeeded.
+        let t = Tools::new();
+        assert!(follow_up_for(&t, "workspace_goto", &ToolResult::Error("no".into())).is_none());
+        // And an empty result must not produce one either.
+        let empty = follow_up_for(&t, "workspace_goto", &ToolResult::Ok(serde_json::Value::Null));
+        assert!(empty.is_none(), "an empty result should not invent a follow-up: {empty:?}");
+    }
+
+    #[test]
+    fn every_follow_up_survives_the_voice_sign_off_filter() {
+        // arc-daemon drops the mic for generic sign-offs like "anything else?".
+        // A follow-up caught by that filter would speak and then go silent.
+        const SIGN_OFFS: &[&str] = &[
+            "anything else?", "is there anything else", "can i help with anything else",
+            "can i help you with anything else", "what else can i do", "need anything else",
+            "how can i help", "how can i assist", "what would you like me to do",
+            "what can i do for you",
+        ];
+        let t = Tools::new();
+        for (tool, result) in [
+            ("workspace_goto", serde_json::json!({"switched_to": "2"})),
+            ("window_move", serde_json::json!({"window": "foot", "workspace": 1})),
+            ("open_url", serde_json::json!({"opened": "https://x.com", "workspace": 2})),
+        ] {
+            let q = follow_up_for(&t, tool, &ToolResult::Ok(result)).unwrap();
+            let last = q.to_lowercase();
+            assert!(last.ends_with('?'), "{tool}: {q}");
+            for s in SIGN_OFFS {
+                assert!(!last.contains(s), "{tool}: {q:?} would be filtered as a sign-off ({s:?})");
+            }
+        }
     }
 }

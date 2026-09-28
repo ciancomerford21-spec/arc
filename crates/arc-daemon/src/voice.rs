@@ -246,4 +246,28 @@ mod follow_up_tests {
         assert!(!expects_answer("Got it. What would you like me to do?", false));
         assert!(!expects_answer("", false));
     }
+
+    #[test]
+    fn the_new_follow_ups_open_the_mic() {
+        // The point of the change: these commands should leave the mic open.
+        for reply in [
+            "Switched to workspace 4. What would you like to do on this workspace?",
+            "Moved firefox to workspace 3. Want me to open something there?",
+            "Opening GitHub on workspace 2. What would you like to do next?",
+        ] {
+            assert!(expects_answer(reply, false), "mic would stay shut after: {reply}");
+        }
+    }
+
+    #[test]
+    fn terminal_replies_still_leave_the_mic_shut() {
+        for reply in [
+            "Volume is 30 percent.",
+            "Paused: some track.",
+            "Locking the screen.",
+            "Switched to workspace 4.",
+        ] {
+            assert!(!expects_answer(reply, false), "mic would stay open after: {reply}");
+        }
+    }
 }

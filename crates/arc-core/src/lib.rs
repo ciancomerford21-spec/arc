@@ -321,9 +321,56 @@ impl Router {
     /// site without calling any tool.
     ///
     /// Only a known verb followed immediately by a domain is split, and the
-    /// domain's first label is lowercased so "YouTube.com" becomes
-    /// "youtube.com". Nothing else is touched: "github.com" is already fine,
-    /// and app names like "openscad" are not in the verb list.
+    /// Rewrite a spoken number word to digits.
+    ///
+    /// Moonshine transcribes "switch to workspace four" and
+    /// "switch to workspace too" for the same intent, so a rule that only
+    /// accepts `\d+` misses most of what is actually said. That miss is not
+    /// silent: the utterance then falls through to the model, which invents
+    /// a workspace, calls `workspace_goto`, and reports success without
+    /// anything moving.
+    ///
+    /// Only the token immediately after "workspace" is rewritten, and only
+    /// when it is a standalone word, so an app named "twelve" is untouched.
+    fn number_words_to_digits(t: &str) -> String {
+        // The recogniser's homophones matter as much as the real words: it
+        // writes "too" for two ("switch to workspace too"), and "for" for
+        // four ("open worksways for"). Without these the utterance still falls
+        // through to the model, which invents a workspace and claims success.
+        const WORDS: [(&str, &str); 13] = [
+            ("one", "1"), ("two", "2"), ("three", "3"), ("four", "4"), ("five", "5"),
+            ("six", "6"), ("seven", "7"), ("eight", "8"), ("nine", "9"), ("ten", "10"),
+            ("too", "2"), ("tree", "3"), ("ate", "8"),
+        ];
+        const KEY: &str = "workspace";
+        let lower = t.to_ascii_lowercase();
+        let Some(key_at) = lower.find(KEY) else { return t.to_string() };
+        // Skip the keyword and any spaces after it.
+        let mut at = key_at + KEY.len();
+        let bytes = t.as_bytes();
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        for (word, digits) in WORDS {
+            if !t[at..].to_ascii_lowercase().starts_with(word) {
+                continue;
+            }
+            // Must be the whole token: "fourteen" must not become "4teen".
+            if t[at + word.len()..].chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                continue;
+            }
+            let mut out = t.to_string();
+            out.replace_range(at..at + word.len(), digits);
+            return out;
+        }
+        t.to_string()
+    }
+
+    /// Split a verb the recogniser fused to a domain: "OpenYouTube.com"
+    /// becomes "open youtube.com". The first label is lowercased so
+    /// "YouTube.com" becomes "youtube.com". Nothing else is touched:
+    /// "github.com" is already fine, and app names like "openscad" are not
+    /// in the verb list.
     fn split_fused_verb(t: &str) -> String {
         const VERBS: [&str; 7] = ["open", "visit", "browse", "goto", "load", "search", "google"];
         let bytes = t.as_bytes();
@@ -353,6 +400,7 @@ impl Router {
     pub fn route(&self, input: &NluInput) -> NluOutput {
         let text = Self::normalise(&input.text);
         let text = Self::split_fused_verb(&text);
+        let text = Self::number_words_to_digits(&text);
         for rule in &self.fixed_rules {
             if let Some(caps) = rule.pattern.captures(&text) {
                 if rule.guard.as_ref().is_some_and(|g| !g(&caps)) {
@@ -1120,5 +1168,60 @@ mod tests {
         // Still pending; a typed/UI confirmation would be allowed.
         assert_eq!(a.gate().latest_pending().as_deref(), Some(id.as_str()));
         assert_eq!(a.reject(&id).text, "Cancelled.");
+    }
+
+    #[test]
+    fn spoken_number_words_route_to_workspace_goto() {
+        // Moonshine writes "four" and "too" for the same intent, and a rule
+        // that only accepts \d+ let these fall through to the model, which
+        // then invented a workspace and claimed success.
+        for (said, want) in [
+            ("switch to workspace four", 4),
+            ("Switch to workspace two.", 2),
+            ("go to workspace one", 1),
+            ("switch to workspace 3", 3),
+        ] {
+            let out = router().route(&NluInput::text(said, InputSource::Voice));
+            assert_eq!(out.route, Route::FixedCommand, "{said:?} went to the model");
+            assert_eq!(out.tool_name.as_deref(), Some("workspace_goto"), "{said:?}");
+            assert_eq!(out.args["id"], serde_json::json!(want), "{said:?} -> {:?}", out.args);
+        }
+    }
+
+    #[test]
+    fn number_words_are_only_rewritten_after_the_word_workspace() {
+        // "twelve" must not become "1twelve", and an app name that happens to
+        // be a number word must survive.
+        assert_eq!(Router::number_words_to_digits("switch to workspace fourteen"), "switch to workspace fourteen");
+        assert_eq!(Router::number_words_to_digits("open two"), "open two");
+        assert_eq!(Router::number_words_to_digits("what is two plus two"), "what is two plus two");
+        assert_eq!(Router::number_words_to_digits("list workspaces"), "list workspaces");
+    }
+
+    #[test]
+    fn number_word_rewrite_preserves_the_rest_of_the_sentence() {
+        assert_eq!(
+            Router::number_words_to_digits("Open youtube.com on workspace three"),
+            "Open youtube.com on workspace 3"
+        );
+    }
+
+    #[test]
+    fn recogniser_homophones_route_to_workspace_goto() {
+        // Both of these came out of the real transcript log, and both used to
+        // reach the model, which answered confidently without moving.
+        for (said, want) in [
+            ("Switch to workspace too.", 2),
+            ("switch to workspace tree", 3),
+        ] {
+            let out = router().route(&NluInput::text(said, InputSource::Voice));
+            assert_eq!(out.tool_name.as_deref(), Some("workspace_goto"), "{said:?}");
+            assert_eq!(out.args["id"], serde_json::json!(want), "{said:?} -> {:?}", out.args);
+        }
+        // The preposition must survive: it is never the number word.
+        assert_eq!(
+            Router::number_words_to_digits("switch to workspace two"),
+            "switch to workspace 2"
+        );
     }
 }

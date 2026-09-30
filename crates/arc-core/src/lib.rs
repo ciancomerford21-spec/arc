@@ -155,6 +155,29 @@ impl Router {
             FixedRule::new(r"(?i)^pause$", "media_pause", 1.0, None)?,
             FixedRule::new(r"(?i)^play$", "media_play", 1.0, None)?,
             FixedRule::new(r"(?i)^(?:what['\']s?\s+)?(?:now\s+)?play(?:ing)?$", "media_info", 1.0, None)?,
+            // Self-made tools. Deterministic because the model got this wrong
+            // live: asked to "delete your uptime_report tool" it *ran*
+            // uptime_report instead (held for confirmation, so harmless, but
+            // wrong). tool_delete still asks, and refuses a built-in's name.
+            FixedRule::new(
+                r"(?i)^(?:delete|remove|forget)\s+(?:your\s+|the\s+|my\s+)?([a-z][a-z0-9_ ]{2,39}?)\s+tool$",
+                "tool_delete",
+                1.0,
+                Some(Box::new(|caps| {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "name".into(),
+                        serde_json::json!(caps[1].trim().replace(' ', "_").to_lowercase()),
+                    );
+                    m
+                })),
+            )?,
+            FixedRule::new(
+                r"(?i)^(?:list|show)\s+(?:your|the)\s+(?:own\s+|self[- ]made\s+)?tools\s+you(?:'ve|\s+have)?\s+made$|^what\s+tools\s+have\s+you\s+made$|^(?:list|show)\s+your\s+(?:own|self[- ]made)\s+tools$",
+                "tool_list_own",
+                1.0,
+                None,
+            )?,
             // Workspaces
             FixedRule::new(r"(?i)^list\s+workspaces$", "workspace_list", 1.0, None)?,
             FixedRule::new(r"(?i)^show\s+workspaces$", "workspace_list", 1.0, None)?,
@@ -844,6 +867,7 @@ fn system_prompt(cfg: &Config, store: Option<&Arc<MemoryStore>>) -> String {
          not about to make: if no tool can answer, just ask the question. \
          If you don't know, say so in one line. \
          'Desktop' means workspace. \
+         Asked to learn a task, make yourself a tool with tool_create. \
          You cannot save facts yourself; if asked, say to run \
          'arc memory remember <key> = <value>' in a terminal.",
         name = cfg.general.name
@@ -1101,6 +1125,30 @@ mod tests {
             "prompt no longer forbids fabricated confirmations: {p}"
         );
         assert!(p.contains("If you don't know, say so in one line"), "{p}");
+    }
+
+    #[test]
+    fn tool_management_is_routed_without_the_model() {
+        let r = Router::new().unwrap();
+        for (said, name) in [
+            ("delete your uptime_report tool", "uptime_report"),
+            ("Delete your uptime report tool.", "uptime_report"),
+            ("remove the desk_check tool", "desk_check"),
+            ("forget my desk check tool please", "desk_check"),
+        ] {
+            let o = r.route(&NluInput::text(said, InputSource::Voice));
+            assert_eq!(o.route, Route::FixedCommand, "{said}");
+            assert_eq!(o.tool_name.as_deref(), Some("tool_delete"), "{said}");
+            assert_eq!(o.args["name"], serde_json::json!(name), "{said}");
+        }
+        for said in ["what tools have you made", "list your own tools", "show the tools you've made"] {
+            let o = r.route(&NluInput::text(said, InputSource::Voice));
+            assert_eq!(o.tool_name.as_deref(), Some("tool_list_own"), "{said}");
+        }
+        // Not a tool-management request: goes to the model.
+        for said in ["delete the file notes.txt", "remove the tool from the drawer please now"] {
+            assert_eq!(r.route(&NluInput::text(said, InputSource::Voice)).route, Route::Ai, "{said}");
+        }
     }
 
     #[test]

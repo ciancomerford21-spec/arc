@@ -35,6 +35,14 @@ pub fn state_dir() -> PathBuf {
         .unwrap_or_else(|| xdg("XDG_STATE_HOME", ".local/state").join("arc"))
 }
 
+/// `~/.local/share/arc/tools` (override: `$ARC_TOOLS_DIR`). Tools Arc made
+/// for itself, one directory each (`tool.json`, plus `run.sh`/`run.py`).
+/// Data, not config: Arc writes these, and deleting the directory is how to
+/// wipe them all.
+pub fn custom_tools_dir() -> PathBuf {
+    std::env::var_os("ARC_TOOLS_DIR").map(PathBuf::from).unwrap_or_else(|| data_dir().join("tools"))
+}
+
 pub fn log_dir() -> PathBuf {
     state_dir().join("logs")
 }

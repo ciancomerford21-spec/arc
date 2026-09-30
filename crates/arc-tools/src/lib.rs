@@ -15,6 +15,9 @@ use serde_json::{Map, Value as Json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod custom;
+pub use custom::CustomTools;
+
 /// Arguments passed to a tool at execution time. Always a JSON object.
 pub type JsonMap = HashMap<String, Json>;
 
@@ -132,6 +135,9 @@ fn media_sentence(verb: &str, v: &Json) -> Option<String> {
 /// Registry of all available tools.
 pub struct Tools {
     by_name: HashMap<String, Arc<dyn Tool>>,
+    /// Tools Arc made for itself. Looked up after the built-ins, which they
+    /// can never shadow (creation refuses a built-in's name).
+    custom: Arc<CustomTools>,
 }
 
 impl Default for Tools {
@@ -175,13 +181,17 @@ impl Tools {
             .collect();
         let analyzer = ShellAnalyzer::new(&cfg.permissions.shell, &sensitive)
             .map_err(|e| format!("invalid permissions.shell regex: {e}"))?;
-        let mut t = Tools { by_name: HashMap::new() };
+        let custom = Arc::new(CustomTools::new(analyzer.clone(), cfg.permissions.shell.timeout_s));
+        let mut t = Tools { by_name: HashMap::new(), custom: custom.clone() };
         t.register_builtins(
             HermesCode { cfg: cfg.code.clone() },
             ShellExec { analyzer, policy: cfg.permissions.shell.clone() },
             store,
             search_url,
         );
+        t.register(Arc::new(ToolCreate { store: custom.clone() }));
+        t.register(Arc::new(ToolDelete { store: custom.clone() }));
+        t.register(Arc::new(ToolListOwn { store: custom }));
         Ok(t)
     }
 
@@ -190,6 +200,8 @@ impl Tools {
         let mut v: Vec<ToolSpec> = self
             .by_name
             .values()
+            .cloned()
+            .chain(self.custom.names().iter().filter_map(|n| self.by_name(n)))
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -302,15 +314,35 @@ impl Tools {
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        // Every registered tool is a built-in as far as self-made tools are
+        // concerned: they may call it and may never take its name.
+        self.custom.add_builtin(tool.name());
         self.by_name.insert(tool.name().to_string(), tool);
     }
 
-    pub fn by_name(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.by_name.get(name)
+    /// A tool by name: built-ins first, then the ones Arc made itself.
+    pub fn by_name(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if let Some(t) = self.by_name.get(name) {
+            return Some(t.clone());
+        }
+        // A composite's risk is the worst of its steps' own levels, so the
+        // tool list and the picker show what running it will actually ask.
+        // Composites cannot contain composites, so one level of lookup is
+        // enough: a step is a built-in or a script tool (always dangerous).
+        let risk = |step: &str| match self.by_name.get(step) {
+            Some(t) => t.base_risk(),
+            None => RiskLevel::Dangerous,
+        };
+        self.custom.tool(name, &risk)
     }
 
     pub fn all_names(&self) -> Vec<String> {
-        self.by_name.keys().cloned().collect()
+        self.by_name.keys().cloned().chain(self.custom.names()).collect()
+    }
+
+    /// The store of tools Arc made for itself.
+    pub fn custom(&self) -> &Arc<CustomTools> {
+        &self.custom
     }
 
     fn register_builtins(&mut self, code: HermesCode, shell: ShellExec, _store: Store, search_url: String) {
@@ -1821,6 +1853,202 @@ impl Tool for ShellExec {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// `tool_create`: Arc makes itself a tool. No confirmation (the user's
+/// choice): a composite adds no capability, and a script tool asks before
+/// every run, so creating one changes nothing until someone approves a run.
+struct ToolCreate {
+    store: Arc<CustomTools>,
+}
+
+#[async_trait]
+impl Tool for ToolCreate {
+    fn name(&self) -> &str {
+        "tool_create"
+    }
+    fn description(&self) -> &str {
+        "Create a new tool for yourself, so a task you will repeat becomes one call. \
+         kind=composite chains your existing tools (steps: [{tool, args}], args may use {param} placeholders). \
+         kind=script runs a bash or python script you write, for things no existing tool can do; \
+         arguments reach it as $ARC_ARG_<NAME> env vars and as JSON on stdin. Script tools ask the user before every run. \
+         Prefer composite when existing tools suffice. The tool is available from the next request."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "snake_case, e.g. focus_mode"},
+                "description": {"type": "string", "description": "what it does and when to use it, for your future self"},
+                "kind": {"type": "string", "enum": ["composite", "script"]},
+                "params": {"type": "object", "description": "parameter name -> description; all required", "additionalProperties": {"type": "string"}},
+                "steps": {"type": "array", "description": "composite only", "items": {"type": "object", "properties": {"tool": {"type": "string"}, "args": {"type": "object"}}, "required": ["tool"]}},
+                "language": {"type": "string", "enum": ["bash", "python"], "description": "script only"},
+                "script": {"type": "string", "description": "script only: the full script text"}
+            },
+            "required": ["name", "description", "kind"]
+        })
+    }
+    fn base_risk(&self) -> RiskLevel {
+        RiskLevel::Caution
+    }
+    fn hints(&self) -> &'static [&'static str] {
+        &["tool", "teach yourself", "make yourself", "learn to", "shortcut", "routine"]
+    }
+    async fn execute(&self, args: &JsonMap) -> ToolResult {
+        let text = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let params = match args.get("params") {
+            None | Some(Json::Null) => Default::default(),
+            Some(v) => match serde_json::from_value(v.clone()) {
+                Ok(p) => p,
+                Err(_) => return ToolResult::Error("params must be an object of name -> description".into()),
+            },
+        };
+        let body = match text("kind").as_str() {
+            "composite" => match serde_json::from_value(args.get("steps").cloned().unwrap_or(Json::Null)) {
+                Ok(steps) => custom::Body::Composite { steps },
+                Err(_) => {
+                    return ToolResult::Error(
+                        "a composite needs steps: [{\"tool\": \"media_pause\"}, {\"tool\": \"workspace_goto\", \"args\": {\"id\": \"{ws}\"}}]".into(),
+                    );
+                }
+            },
+            "script" => {
+                let language = match text("language").as_str() {
+                    "bash" | "sh" => custom::Language::Bash,
+                    "python" | "python3" => custom::Language::Python,
+                    _ => return ToolResult::Error("a script needs language: bash or python".into()),
+                };
+                custom::Body::Script { language, script: text("script") }
+            }
+            _ => return ToolResult::Error("kind must be composite or script".into()),
+        };
+        let def = custom::Def {
+            name: text("name"),
+            description: text("description"),
+            params,
+            created: String::new(),
+            body,
+        };
+        match self.store.create(def) {
+            Ok(d) => ToolResult::Ok(serde_json::json!({
+                "created": d.name,
+                "kind": d.kind(),
+                "params": d.params.keys().collect::<Vec<_>>(),
+                "note": if d.kind() == "script" { "the user will be asked before each run" } else { "each step keeps its own safety checks" },
+            })),
+            Err(e) => ToolResult::Error(e),
+        }
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        let name = v.get("created")?.as_str()?.replace('_', " ");
+        Some(match v.get("kind").and_then(|k| k.as_str()) {
+            Some("script") => format!("I made myself a script tool called {name}. I'll ask before each run."),
+            _ => format!("I made myself a tool called {name}."),
+        })
+    }
+}
+
+/// `tool_delete`: removes a self-made tool. Always asks (the user's choice),
+/// and cannot be lowered in the picker, because it is dangerous by nature.
+struct ToolDelete {
+    store: Arc<CustomTools>,
+}
+
+#[async_trait]
+impl Tool for ToolDelete {
+    fn name(&self) -> &str {
+        "tool_delete"
+    }
+    fn description(&self) -> &str {
+        "Delete one of the tools you made for yourself. The user is asked first. Built-in tools cannot be deleted."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]})
+    }
+    fn base_risk(&self) -> RiskLevel {
+        RiskLevel::Dangerous
+    }
+    fn hints(&self) -> &'static [&'static str] {
+        &["tool", "forget how", "remove the"]
+    }
+    fn assess(&self, args: &JsonMap) -> Assessment {
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        // Refuse outright rather than ask about something that is not there:
+        // "confirm deleting reboot?" would be a question with no good answer.
+        let blocked = match self.store.get(name) {
+            None => Some(format!("`{name}` is not a tool I made; built-in tools cannot be deleted")),
+            Some(_) => {
+                let users = self.store.used_by(name);
+                (!users.is_empty())
+                    .then(|| format!("`{name}` is used by {}; delete that first", users.join(", ")))
+            }
+        };
+        let kind = self.store.get(name).map(|d| d.kind()).unwrap_or("");
+        let mut a = Assessment::new(RiskLevel::Dangerous, format!("delete my {kind} tool `{name}`"));
+        a.force_confirm = true;
+        a.blocked = blocked;
+        a
+    }
+    async fn execute(&self, args: &JsonMap) -> ToolResult {
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        match self.store.delete(name) {
+            Ok(d) => ToolResult::Ok(serde_json::json!({"deleted": d.name, "kind": d.kind()})),
+            Err(e) => ToolResult::Error(e),
+        }
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        Some(format!("Deleted my {} tool.", v.get("deleted")?.as_str()?.replace('_', " ")))
+    }
+}
+
+struct ToolListOwn {
+    store: Arc<CustomTools>,
+}
+
+#[async_trait]
+impl Tool for ToolListOwn {
+    fn name(&self) -> &str {
+        "tool_list_own"
+    }
+    fn description(&self) -> &str {
+        "List the tools you have made for yourself, with what each does and its steps or script."
+    }
+    fn hints(&self) -> &'static [&'static str] {
+        &["your tools", "tools you made", "tools have you"]
+    }
+    async fn execute(&self, _args: &JsonMap) -> ToolResult {
+        let tools: Vec<Json> = self
+            .store
+            .list()
+            .into_iter()
+            .map(|d| {
+                let body = match &d.body {
+                    custom::Body::Composite { steps } => serde_json::json!({"steps": steps}),
+                    custom::Body::Script { language, script } => serde_json::json!({
+                        "language": language,
+                        "script": script.chars().take(600).collect::<String>(),
+                    }),
+                };
+                serde_json::json!({"name": d.name, "kind": d.kind(), "description": d.description,
+                                   "params": d.params, "created": d.created, "body": body})
+            })
+            .collect();
+        ToolResult::Ok(serde_json::json!({"count": tools.len(), "tools": tools}))
+    }
+    fn summarize(&self, v: &Json) -> Option<String> {
+        let names: Vec<String> = v
+            .get("tools")?
+            .as_array()?
+            .iter()
+            .filter_map(|t| t.get("name")?.as_str().map(|n| n.replace('_', " ")))
+            .collect();
+        Some(match names.len() {
+            0 => "I haven't made any tools yet.".into(),
+            1 => format!("I've made one tool: {}.", names[0]),
+            n => format!("I've made {n} tools: {}.", names.join(", ")),
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -50,6 +50,11 @@ fn start(extra_config: &str, args: &[&str]) -> Arcd {
         .env("ARC_CONFIG_DIR", dir.path().join("nonexistent"))
         // Never pick up the developer's own ~/.config/arc/automations.toml.
         .env("ARC_AUTOMATIONS", dir.path().join("automations.toml"))
+        // Nor their self-made tools or tool classifications: a test that
+        // creates or reclassifies a tool must never write the real ones.
+        .env("ARC_TOOLS_DIR", dir.path().join("tools"))
+        .env("ARC_TOOL_CLASSES", dir.path().join("tool_classes.json"))
+        .env("ARC_MEMORY_PATH", dir.path().join("memory"))
         .env("ARC_LOG", "info")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

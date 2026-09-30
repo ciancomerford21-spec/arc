@@ -168,6 +168,27 @@ investigate a codebase. It writes files and runs commands, so it is always
 shell cannot reinterpret what the model wrote, and the task text is screened
 for destructive commands. `workspace` bounds where it may write.
 
+### Tools Arc makes for itself
+
+Ask Arc to learn something ("make yourself a tool that…") and it calls
+`tool_create`. No confirmation is needed to create one; there are two kinds:
+
+| Kind | What it is | Safety |
+|---|---|---|
+| **composite** | A named chain of existing tools, with `{param}` placeholders | Every step is gated as if called on its own, so wrapping `shell_exec "poweroff"` in a composite changes nothing about whether it asks. A held step stops the chain and the reply names the steps that did not run. |
+| **script** | A bash or python script Arc wrote | Dangerous by nature: **every run asks**, and the picker cannot lower it. Bash lines are screened by the `shell_exec` policy at creation and again at every load. Arguments arrive as `$ARC_ARG_<NAME>` and as JSON on stdin, never spliced into the script. |
+
+* Stored in `~/.local/share/arc/tools/<name>/` (`tool.json` plus `run.sh` /
+  `run.py`; override `$ARC_TOOLS_DIR`) and loaded at start. A tool edited on
+  disk is re-screened at the next restart and skipped if it no longer passes.
+* **Deleting always asks** ("delete your X tool" is routed straight to
+  `tool_delete`). Built-ins cannot be deleted, and a tool another one uses
+  cannot be deleted until that one is deleted.
+* Names cannot shadow a built-in, a tool cannot overwrite an existing one,
+  and a composite cannot call `tool_create`/`tool_delete` or another composite.
+* `what tools have you made` lists them. In the app they are marked `✦ self-made`.
+* To wipe them all: `rm -r ~/.local/share/arc/tools && systemctl --user restart arcd`.
+
 
 Under `[voice]`, all local:
 

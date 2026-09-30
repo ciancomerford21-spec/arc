@@ -240,7 +240,10 @@ impl Gate {
     /// Run a tool call subject to policy. `context` is opaque data returned
     /// with the confirmation (e.g. which conversation to resume).
     pub async fn run(&self, tool: &str, args: JsonMap, context: Json) -> Outcome {
-        let Some(t) = self.tools.by_name(tool).cloned() else {
+        if self.tools.custom().composite_steps(tool).is_some() {
+            return self.run_composite(tool, args, context, false).await;
+        }
+        let Some(t) = self.tools.by_name(tool) else {
             return Outcome::Denied {
                 tool: tool.into(),
                 reason: format!("unknown tool `{tool}`"),
@@ -290,7 +293,13 @@ impl Gate {
             Json::Object(m) => m.clone().into_iter().collect(),
             _ => JsonMap::new(),
         };
-        let Some(t) = self.tools.by_name(&p.tool).cloned() else {
+        // A composite held as a whole (the user raised it to dangerous) runs
+        // its steps now -- each still individually gated.
+        if self.tools.custom().composite_steps(&p.tool).is_some() {
+            tracing::info!(tool = %p.tool, id, "confirmed; running composite");
+            return Ok(self.run_composite(&p.tool, args, p.context, true).await);
+        }
+        let Some(t) = self.tools.by_name(&p.tool) else {
             return Ok(Outcome::Denied {
                 tool: p.tool,
                 reason: "tool no longer available".into(),
@@ -307,6 +316,130 @@ impl Gate {
         // between asking and clicking, and the stored call is what runs.
         let warning = self.caution_notice(&p.tool);
         Ok(Self::execute(&t, &p.tool, &args, p.risk, warning).await)
+    }
+
+    /// Run a tool Arc made from other tools.
+    ///
+    /// The composite is a name, not a permission: every step goes through
+    /// [`Gate::run`] exactly as if the model had called it directly, so its
+    /// own assessment, classification, policy and confirmation all apply.
+    /// Wrapping `shell_exec "systemctl poweroff"` in a composite called
+    /// `tidy_up` changes nothing about whether it asks.
+    ///
+    /// On top of that, the composite's own row can be raised: marked
+    /// dangerous (or denied in config), the whole chain is held or refused
+    /// before any step runs. `confirmed` is set when the user already
+    /// approved that hold.
+    ///
+    /// A step that needs confirmation stops the chain there: steps before it
+    /// have run, the held step runs alone if approved, and later steps do not
+    /// run -- the reply says so, rather than implying the whole thing finished.
+    async fn run_composite(&self, tool: &str, args: JsonMap, context: Json, confirmed: bool) -> Outcome {
+        let Some((steps, params)) = self.tools.custom().composite_steps(tool) else {
+            return Outcome::Denied {
+                tool: tool.into(),
+                reason: format!("`{tool}` no longer exists"),
+                args: to_json(&args),
+                risk: RiskLevel::Safe,
+            };
+        };
+        let risk = self.base_risk_of(tool).unwrap_or(RiskLevel::Safe);
+        let missing: Vec<&String> = params.keys().filter(|k| !args.contains_key(*k)).collect();
+        if !missing.is_empty() {
+            let result = ToolResult::Error(format!("missing argument(s) {missing:?} for `{tool}`"));
+            return Outcome::Done {
+                tool: tool.into(),
+                result,
+                args: to_json(&args),
+                risk,
+                duration_ms: 0,
+                warning: None,
+            };
+        }
+        if !confirmed {
+            let class = self.classification(tool);
+            let decision = self.policy.decide(tool, class.unwrap_or(RiskLevel::Safe));
+            if let Decision::Deny { reason } = decision {
+                return Outcome::Denied { tool: tool.into(), reason, args: to_json(&args), risk };
+            }
+            if class == Some(RiskLevel::Dangerous) {
+                let explanation = format!("run my tool `{tool}` ({} steps)", steps.len());
+                let p = self.pending.lock().unwrap().issue(
+                    tool,
+                    to_json(&args),
+                    RiskLevel::Dangerous,
+                    &explanation,
+                    context,
+                    Instant::now(),
+                );
+                tracing::info!(tool, id = %p.confirmation_id, "composite held for confirmation");
+                return Outcome::NeedsConfirmation(p);
+            }
+        }
+        let start = Instant::now();
+        let mut done: Vec<Json> = vec![];
+        let mut warnings: Vec<String> = vec![];
+        let total = steps.len();
+        for (i, step) in steps.iter().enumerate() {
+            let filled: JsonMap = match arc_tools::custom::fill(&step.args, &args) {
+                Json::Object(m) => m.into_iter().collect(),
+                _ => JsonMap::new(),
+            };
+            // Steps are never composites (creation refuses it), so this
+            // recursion is one level deep.
+            let outcome = Box::pin(self.run(&step.tool, filled, context.clone())).await;
+            let n = i + 1;
+            match outcome {
+                Outcome::Done { result: ToolResult::Ok(v), warning, .. } => {
+                    if let Some(w) = warning {
+                        warnings.push(w);
+                    }
+                    done.push(serde_json::json!({"step": n, "tool": step.tool, "result": v}));
+                }
+                Outcome::Done { result: ToolResult::Error(e), .. } => {
+                    let result = ToolResult::Error(format!(
+                        "`{tool}` stopped at step {n} of {total} ({}): {e}. Steps before it ran.",
+                        step.tool
+                    ));
+                    return Outcome::Done {
+                        tool: tool.into(),
+                        result,
+                        args: to_json(&args),
+                        risk,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        warning: None,
+                    };
+                }
+                Outcome::Denied { reason, .. } => {
+                    return Outcome::Denied {
+                        tool: tool.into(),
+                        reason: format!("step {n} of {total} ({}) was refused: {reason}", step.tool),
+                        args: to_json(&args),
+                        risk,
+                    };
+                }
+                Outcome::NeedsConfirmation(mut p) => {
+                    let rest = total - n;
+                    p.explanation = if rest == 0 {
+                        format!("{} (step {n} of {total} of `{tool}`)", p.explanation)
+                    } else {
+                        format!(
+                            "{} (step {n} of {total} of `{tool}`; the {rest} step(s) after it won't run until you ask again)",
+                            p.explanation
+                        )
+                    };
+                    return Outcome::NeedsConfirmation(p);
+                }
+            }
+        }
+        Outcome::Done {
+            tool: tool.into(),
+            result: ToolResult::Ok(serde_json::json!({"steps": done})),
+            args: to_json(&args),
+            risk,
+            duration_ms: start.elapsed().as_millis() as u64,
+            warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        }
     }
 
     pub fn cancel(&self, id: &str) -> bool {
@@ -575,6 +708,143 @@ mod tests {
         assert_eq!(g.classification("probe.safe"), None);
         // Also true for a dangerous-by-nature tool: picking dangerous is fine.
         assert!(!g.set_classification("probe.danger", Some(RiskLevel::Dangerous)).unwrap().1);
+    }
+
+    fn def(name: &str, steps: Json, params: &[&str]) -> arc_tools::custom::Def {
+        arc_tools::custom::Def {
+            name: name.into(),
+            description: "test composite".into(),
+            params: params.iter().map(|p| (p.to_string(), "x".to_string())).collect(),
+            created: String::new(),
+            body: arc_tools::custom::Body::Composite { steps: serde_json::from_value(steps).unwrap() },
+        }
+    }
+
+    fn judging_gate() -> (Gate, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let safe = Arc::new(AtomicUsize::new(0));
+        let mut tools = Tools::new();
+        tools.register(Arc::new(Judging { runs: runs.clone() }));
+        tools.register(Arc::new(Probe { name: "probe.safe", risk: RiskLevel::Safe, runs: safe.clone() }));
+        (Gate::new(Arc::new(tools), &Config::default()), runs, safe)
+    }
+
+    fn cmd(c: &str) -> JsonMap {
+        [("c".to_string(), Json::String(c.into()))].into()
+    }
+
+    /// Wrapping a call in a composite changes nothing about whether it asks:
+    /// each step is gated as if called directly, with the arguments filled in.
+    #[tokio::test]
+    async fn a_composite_gates_every_step_on_its_own() {
+        let (g, runs, safe) = judging_gate();
+        g.tools()
+            .custom()
+            .create(def(
+                "tidy_up",
+                serde_json::json!([{"tool": "probe.safe"}, {"tool": "probe.judging", "args": {"cmd": "{c}"}}, {"tool": "probe.safe"}]),
+                &["c"],
+            ))
+            .unwrap();
+        let Outcome::Done { result: ToolResult::Ok(v), .. } = g.run("tidy_up", cmd("ls"), Json::Null).await
+        else {
+            panic!("an ordinary chain runs")
+        };
+        assert_eq!(v["steps"].as_array().unwrap().len(), 3);
+        assert_eq!((safe.load(Ordering::SeqCst), runs.load(Ordering::SeqCst)), (2, 1));
+
+        // The dangerous step is held; the one before it ran, the one after did not.
+        let Outcome::NeedsConfirmation(p) = g.run("tidy_up", cmd("boom"), Json::Null).await else {
+            panic!("a dangerous step inside a composite must still be held")
+        };
+        assert_eq!(p.tool, "probe.judging", "the held call is the step itself, not the wrapper");
+        assert!(
+            p.explanation.contains("step 2 of 3") && p.explanation.contains("won't run"),
+            "{}",
+            p.explanation
+        );
+        assert_eq!((safe.load(Ordering::SeqCst), runs.load(Ordering::SeqCst)), (3, 1));
+        assert!(g.cancel(&p.confirmation_id));
+    }
+
+    #[tokio::test]
+    async fn a_composite_reports_the_step_that_failed_and_missing_args() {
+        let (g, _, _) = judging_gate();
+        let c = g.tools().custom();
+        c.create(def(
+            "needs_c",
+            serde_json::json!([{"tool": "probe.judging", "args": {"cmd": "{c}"}}]),
+            &["c"],
+        ))
+        .unwrap();
+        let Outcome::Done { result: ToolResult::Error(e), .. } =
+            g.run("needs_c", JsonMap::new(), Json::Null).await
+        else {
+            panic!()
+        };
+        assert!(e.contains("missing"), "{e}");
+    }
+
+    /// The composite's own row obeys the picker: raised to dangerous, the
+    /// whole chain waits before any step runs, and approving it runs them.
+    #[tokio::test]
+    async fn a_composite_raised_to_dangerous_is_held_as_a_whole() {
+        let (g, runs, safe) = judging_gate();
+        g.tools().custom().create(def("chain", serde_json::json!([{"tool": "probe.safe"}]), &[])).unwrap();
+        assert_eq!(g.base_risk_of("chain"), Some(RiskLevel::Safe), "worst of its steps");
+        g.set_classification("chain", Some(RiskLevel::Dangerous)).unwrap();
+        let Outcome::NeedsConfirmation(p) = g.run("chain", JsonMap::new(), Json::Null).await else {
+            panic!()
+        };
+        assert_eq!(safe.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            g.confirm(&p.confirmation_id).await,
+            Ok(Outcome::Done { result: ToolResult::Ok(_), .. })
+        ));
+        assert_eq!((safe.load(Ordering::SeqCst), runs.load(Ordering::SeqCst)), (1, 0));
+    }
+
+    /// Creating needs no confirmation; deleting always does, and a tool Arc
+    /// did not make is refused rather than asked about.
+    #[tokio::test]
+    async fn creating_is_free_deleting_asks() {
+        let (g, _, _) = judging_gate();
+        let create: JsonMap = serde_json::from_value(serde_json::json!({
+            "name": "say_hi", "description": "says hi", "kind": "script", "language": "bash", "script": "echo hi"
+        }))
+        .unwrap();
+        assert!(matches!(
+            g.run("tool_create", create, Json::Null).await,
+            Outcome::Done { result: ToolResult::Ok(_), .. }
+        ));
+        assert!(g.tools().by_name("say_hi").is_some());
+        assert_eq!(g.base_risk_of("say_hi"), Some(RiskLevel::Dangerous));
+        // A script tool is dangerous by nature: every run asks, and the
+        // picker cannot lower it.
+        assert!(matches!(g.run("say_hi", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)));
+        assert!(g.set_classification("say_hi", Some(RiskLevel::Safe)).is_err());
+
+        let del = |n: &str| -> JsonMap { [("name".to_string(), Json::String(n.into()))].into() };
+        assert!(matches!(g.run("tool_delete", del("reboot"), Json::Null).await, Outcome::Denied { .. }));
+        let Outcome::NeedsConfirmation(p) = g.run("tool_delete", del("say_hi"), Json::Null).await else {
+            panic!()
+        };
+        assert!(g.tools().by_name("say_hi").is_some(), "nothing is deleted before the user says yes");
+        assert!(g.set_classification("tool_delete", Some(RiskLevel::Safe)).is_err());
+        g.confirm(&p.confirmation_id).await.unwrap();
+        assert!(g.tools().by_name("say_hi").is_none());
+    }
+
+    /// A composite cannot smuggle tool management past the user.
+    #[tokio::test]
+    async fn a_composite_cannot_wrap_tool_management() {
+        let (g, _, _) = judging_gate();
+        let e = g.tools().custom().create(def(
+            "sneaky",
+            serde_json::json!([{"tool": "tool_delete", "args": {"name": "x"}}]),
+            &[],
+        ));
+        assert!(e.unwrap_err().contains("cannot create"));
     }
 
     /// A tool whose risk depends on the call, like shell_exec.

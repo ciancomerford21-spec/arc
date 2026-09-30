@@ -428,6 +428,10 @@ pub struct ToolInfo {
     pub category: String,
     pub parameters: Value,
     pub enabled: bool,
+    /// `composite` or `script` for a tool Arc made for itself; absent for
+    /// built-ins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub made_by_arc: Option<String>,
     /// Why the tool is disabled/unavailable, when it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,

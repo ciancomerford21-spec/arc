@@ -138,6 +138,15 @@ impl Daemon {
             tracing::info!(path = %classes.path().display(), count = classes.map().len(), "tool classifications loaded");
         }
         let mut assistant = Assistant::from_config_with_classes(&config, Some(Arc::new(store)), classes)?;
+        // Tools Arc made for itself. Only the daemon attaches the directory,
+        // so tests and one-off library use never read or write the real ones.
+        // Before automations, which may call them.
+        let tools_dir = arc_config::paths::custom_tools_dir();
+        let custom = assistant.gate().tools().custom().clone();
+        for p in custom.attach_dir(tools_dir.clone()) {
+            tracing::warn!("self-made tool not loaded: {p}");
+        }
+        tracing::info!(count = custom.names().len(), path = %tools_dir.display(), "self-made tools loaded");
         let path = std::env::var_os("ARC_AUTOMATIONS")
             .map(PathBuf::from)
             .unwrap_or_else(arc_config::paths::automations_file);
@@ -280,8 +289,13 @@ impl Daemon {
                 // most real commands.
                 let risk = g.classification(&s.name).unwrap_or(default_risk);
                 let enabled = !g.is_disabled(&s.name);
+                let made = g.tools().custom().get(&s.name).map(|d| d.kind().to_string());
                 arc_proto::ToolInfo {
-                    category: s.name.split('_').next().unwrap_or("").into(),
+                    category: match &made {
+                        Some(k) => format!("self-made {k}"),
+                        None => s.name.split('_').next().unwrap_or("").into(),
+                    },
+                    made_by_arc: made,
                     unavailable_reason: (!enabled).then(|| "disabled in configuration".into()),
                     reclassified: g.classification(&s.name).is_some(),
                     name: s.name,

@@ -120,6 +120,10 @@ ShellRoot {
       hit.summary = String(r.summary || "")
       hit.warning = String(r.warning || "")
       hit.ms = r.duration_ms || 0
+      // Arc changed its own toolset: show the new list without a restart.
+      if ((r.tool === "tool_create" || r.tool === "tool_delete") && hit.status === "success") {
+        toolLoader.running = false; toolLoader.running = true
+      }
     } else if (e === "confirmation_required") {
       var p = v.pending || {}
       t.steps.push({ kind: "confirm", id: p.confirmation_id, text: String(p.explanation || ""), risk: p.risk, at: now(), resolved: false })
@@ -342,7 +346,7 @@ ShellRoot {
                   Row {
                     spacing: 8
                     Text { text: modelData.name; color: c.text; font.family: c.mono; font.pixelSize: 13; font.bold: true }
-                    Text { text: modelData.category; color: c.muted; font.family: c.mono; font.pixelSize: 10; anchors.baseline: parent.children[0].baseline }
+                    Text { text: modelData.made_by_arc ? "✦ " + modelData.category : modelData.category; color: modelData.made_by_arc ? c.magenta : c.muted; font.family: c.mono; font.pixelSize: 10; anchors.baseline: parent.children[0].baseline }
                   }
                   // The per-tool safety selector, on its own line so it can
                   // never be pushed past the row edge by a long tool name.

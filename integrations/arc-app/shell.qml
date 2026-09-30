@@ -45,14 +45,75 @@ ShellRoot {
     // on a theme swap; mutating it in place would not.
     property var theme: ({})
 
+    // Returns a *colour*, not the hex string. The legibility helpers below
+    // read .r/.g/.b, and handing them a string made lum() NaN: the binary
+    // search then chose black as the "away" colour on a light theme, blend()
+    // returned Qt.rgba(NaN...), and every Text item was handed an invalid
+    // colour and rendered nothing at all. The window came up blank.
+    // A QML colour arrives as an object with r/g/b; a hex literal is a string.
+    // Nested lookups pass a colour back in as the fallback, so accept both
+    // rather than wrapping a colour in Qt.color() a second time.
+    function asColor(x) {
+      return (x !== null && typeof x === "object" && "r" in x) ? x : Qt.color(String(x))
+    }
     function val(key, fallback) {
       var v = theme[key]
-      return (typeof v === "string" && v.length > 0) ? v : fallback
+      return asColor(typeof v === "string" && v.length > 0 ? v : fallback)
     }
     // Mix toward another colour: used for the surface ramp, since a theme
     // gives one background and this UI needs three related ones.
     function blend(a, b, t) {
       return Qt.rgba(a.r * (1 - t) + b.r * t, a.g * (1 - t) + b.g * t, a.b * (1 - t) + b.b * t, 1)
+    }
+
+    // --- legibility ------------------------------------------------------
+    //
+    // A theme's palette is not a promise that its own colours work in this
+    // app. Measured across the 27 themes Omarchy ships or has installed,
+    // 20 had secondary text below 4.5:1 on these surfaces and 5 had an accent
+    // below it -- rose-pine's muted was 1.55:1 and matte-black's 2.40:1, which
+    // is the "black text on a dark background" this guards against. Themes
+    // pick muted against their own idea of where text sits; this app stacks
+    // three surfaces and puts type at 10px on them.
+    //
+    // So the theme chooses the colour and this decides whether it can be
+    // read: if it clears the floor it is used untouched, and if it does not,
+    // it is walked away from the background until it does. The hue survives
+    // as far as it can -- only as much desaturation as the floor demands.
+    // NOTE: a QML colour's r/g/b are already 0..1 floats. Dividing by 255 here
+    // -- the reflex from every other language -- made every luminance ~0, so
+    // contrast() was always 1, nothing was ever "readable", and readable()
+    // handed back its away colour: white. White on a dark theme is
+    // accidentally fine, which is why only the light themes broke.
+    function lum(c) {
+      var f = function (v) {
+        return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)
+      }
+      return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+    }
+    function contrast(a, b) {
+      var la = lum(a), lb = lum(b)
+      var hi = Math.max(la, lb), lo = Math.min(la, lb)
+      return (hi + 0.05) / (lo + 0.05)
+    }
+    // Smallest shift away from `bg` that reaches `min` contrast, or the
+    // colour unchanged if it already gets there. Binary search rather than a
+    // fixed step, so a colour one shade short is barely touched.
+    function readable(fg, bg, min) {
+      if (contrast(fg, bg) >= min) return fg
+      var away = lum(bg) < 0.5 ? Qt.rgba(1, 1, 1, 1) : Qt.rgba(0, 0, 0, 1)
+      var lo = 0, hi = 1, best = away
+      for (var i = 0; i < 20; i++) {
+        var mid = (lo + hi) / 2
+        var cand = blend(fg, away, mid)
+        if (contrast(cand, bg) >= min) { best = cand; hi = mid } else { lo = mid }
+      }
+      return best
+    }
+    // Text lands on both the window and the panels, and which of the two is
+    // the harder case flips with light and dark themes, so check both.
+    function onBoth(fg, a, b, min) {
+      return readable(readable(fg, a, min), b, min)
     }
 
     // One flat "#rrggbb" -> "#rrggbb" walker. Themes vary in which keys they
@@ -73,30 +134,40 @@ ShellRoot {
     readonly property color bg: val("darker_background", val("dark_background", val("background", "#141414")))
     readonly property color panel: val("background", "#1c1c1c")
     readonly property color panelHi: val("lighter_background", blend(panel, text, 0.06))
-    readonly property color line: blend(text, bg, 0.72)
+    // Borders only need to be seen, not read, so the floor is low; 1.44:1 on
+    // everforest and rose-pine was not seen.
+    readonly property color line: onBoth(blend(text, bg, 0.72), panel, bg, 1.6)
 
     // --- text
-    readonly property color text: val("foreground", "#e6e6e6")
-    // Lifted 22% toward the text colour. A theme's own `muted` is tuned for
-    // its own surfaces and lands under 4.5:1 on this app's panel -- measured
-    // across the four installed themes, Itachi 4.34 and Siren 4.09 raw. The
-    // lift puts the worst case at 5.55:1 while staying an order of magnitude
-    // below body text (13-14:1), so it still reads as secondary.
-    readonly property color muted: blend(val("muted", val("dark_foreground", text)), text, 0.22)
+    readonly property color text: onBoth(val("foreground", "#e6e6e6"), panel, bg, 4.5)
+    // Nudged toward the text colour first, then floored. The nudge is what
+    // makes it read as secondary rather than as a failed attempt at body
+    // text; the floor is what makes it readable at all, which the nudge
+    // cannot promise because a theme's muted may be nowhere near its
+    // foreground.
+    readonly property color muted: onBoth(blend(val("muted", val("dark_foreground", text)), text, 0.22), panel, bg, 4.5)
 
-    // --- roles. Accent is the theme's own accent; the rest are its named
-    // colours, so a green theme reads green and Itachi reads warm red.
+    // --- roles
+    //
+    // Omarchy's own shell paints its highlights with `accent` 235 times and
+    // the numbered palette 9 times combined, so `accent` is the chrome colour
+    // here too: the wordmark, every heading, the panel brackets, the timeline
+    // and the send button. Under Itachi that is the crimson #dc5b56, which is
+    // what the bar and launcher use.
     readonly property color accent: val("accent", val("color4", "#c05050"))
-    // The chrome colour. Omarchy's own shell paints its highlights with
-    // `accent` 235 times and the numbered palette 9 times combined -- it
-    // never uses cyan as chrome, so Arc should not either. Under Itachi that
-    // is the crimson #dc5b56, which is what the bar and launcher use.
-    readonly property color chrome: accent
-    readonly property color chromeDim: blend(chrome, bg, 0.45)
-    readonly property color magenta: val("magenta", val("bright_magenta", val("color5", accent)))
-    readonly property color amber: val("yellow", val("bright_yellow", val("color3", "#d0a040")))
-    readonly property color green: val("green", val("bright_green", val("color2", "#70a060")))
-    readonly property color red: val("red", val("bright_red", val("color1", "#c05050")))
+    readonly property color chrome: onBoth(accent, panel, bg, 4.5)
+    // Still visibly secondary, but the status chips are text: 2.08:1 on
+    // miasma, nord and white was not readable.
+    readonly property color chromeDim: onBoth(blend(chrome, bg, 0.45), panel, bg, 3.0)
+
+    // The safety colours mean safe, caution and danger, so they keep their
+    // identity and only get pushed until they can be read -- which on a light
+    // theme is most of them: rose-pine's caution amber was 1.63:1 and
+    // catppuccin-latte's safe green 2.35:1.
+    readonly property color magenta: onBoth(val("magenta", val("bright_magenta", val("color5", accent))), panel, bg, 4.5)
+    readonly property color amber: onBoth(val("yellow", val("bright_yellow", val("color3", "#d0a040"))), panel, bg, 4.5)
+    readonly property color green: onBoth(val("green", val("bright_green", val("color2", "#70a060"))), panel, bg, 4.5)
+    readonly property color red: onBoth(val("red", val("bright_red", val("color1", "#c05050"))), panel, bg, 4.5)
     readonly property string mono: "JetBrainsMono Nerd Font"
 
     // True when two parsed themes are identical, so a poll that finds no

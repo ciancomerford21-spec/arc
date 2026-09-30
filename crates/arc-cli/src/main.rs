@@ -12,6 +12,20 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+// `watch` and `bar --follow` stream into whatever launched them (the Arc app,
+// the bar widget). When that reader goes away, std's println! panics on the
+// broken pipe, which shows up as a crash report every time the app is closed.
+// A closed stdout just means nobody is listening any more: exit quietly.
+macro_rules! println {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, $($t)*).and_then(|_| out.flush()).is_err() {
+            std::process::exit(0);
+        }
+    }};
+}
+
 #[derive(Parser)]
 #[command(name = "arc", version, about = "Talk to the Arc assistant")]
 struct Cli {
@@ -325,6 +339,15 @@ fn main() -> Result<()> {
                     "state" => println!("[{}]", v["state"].as_str().unwrap_or("")),
                     "heard" => println!("heard: {}", v["text"].as_str().unwrap_or("")),
                     "reply" => println!("arc:   {}", v["text"].as_str().unwrap_or("")),
+                    "thought" => {
+                        for key in ["reasoning", "text"] {
+                            let t = v[key].as_str().unwrap_or("").trim();
+                            if !t.is_empty() {
+                                println!("think: {}", t.replace('\n', " "));
+                            }
+                        }
+                    }
+                    "tool_started" => println!("tool:  {} {}", v["tool"].as_str().unwrap_or(""), v["args"]),
                     "tool_finished" => println!(
                         "tool:  {} -> {}",
                         v["record"]["tool"].as_str().unwrap_or(""),

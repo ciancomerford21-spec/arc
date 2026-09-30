@@ -647,6 +647,13 @@ impl Assistant {
         &self.gate
     }
 
+    /// Report each agent step (reasoning, tool start) as it happens.
+    pub fn set_trace(&mut self, trace: agent::Trace) {
+        if let Some(a) = &mut self.agent {
+            a.set_trace(trace);
+        }
+    }
+
     pub fn provider_name(&self) -> &str {
         &self.provider_name
     }

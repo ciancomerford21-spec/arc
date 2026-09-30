@@ -30,6 +30,8 @@ json.dump(d, open(p, "w"), indent=2)
 EOF
 fi
 rm -rf "$cfg/omarchy/plugins/arc.status"
+rm -rf "$cfg/quickshell/arc"
+rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/arc.desktop"
 
 rm -f "$HOME/.local/bin/arc" "$HOME/.local/bin/arcd"
 rm -rf "$data/python"

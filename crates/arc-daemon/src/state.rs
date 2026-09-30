@@ -146,6 +146,12 @@ impl Daemon {
             Err(e) => tracing::error!(error = %e, "automations not loaded"),
         }
         let (events, _) = broadcast::channel(256);
+        // Stream each agent step to subscribers (the Arc app draws the thought
+        // process from these). A send with no subscribers is not an error.
+        let tx = events.clone();
+        assistant.set_trace(std::sync::Arc::new(move |e| {
+            let _ = tx.send(e);
+        }));
         Ok(Self {
             assistant,
             config,

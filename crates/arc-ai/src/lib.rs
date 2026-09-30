@@ -78,6 +78,11 @@ pub struct ToolDef {
 pub struct AiResult {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// The model's reasoning, when the provider returns it separately from the
+    /// answer. Never sent back to the model and never spoken: it exists so the
+    /// Arc app can show how a turn was decided. Empty when the model or
+    /// provider does not expose it.
+    pub reasoning: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,6 +271,12 @@ pub fn parse_openai(parsed: &Json) -> Result<AiResult, AiError> {
         .map(|c| &c["message"])
         .ok_or_else(|| AiError::Provider("response has no choices".into()))?;
     let content = msg["content"].as_str().unwrap_or("").to_string();
+    let reasoning = msg["reasoning"]
+        .as_str()
+        .or_else(|| msg["reasoning_content"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let tool_calls = msg["tool_calls"]
         .as_array()
         .map(|arr| {
@@ -279,7 +290,7 @@ pub fn parse_openai(parsed: &Json) -> Result<AiResult, AiError> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(AiResult { content, tool_calls })
+    Ok(AiResult { content, tool_calls, reasoning })
 }
 
 #[async_trait]
@@ -405,7 +416,15 @@ pub fn parse_anthropic(parsed: &Json) -> Result<AiResult, AiError> {
             args: decode_args(&b["input"]),
         })
         .collect();
-    Ok(AiResult { content, tool_calls })
+    let reasoning = blocks
+        .iter()
+        .filter(|b| b["type"] == "thinking")
+        .filter_map(|b| b["thinking"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    Ok(AiResult { content, tool_calls, reasoning })
 }
 
 #[async_trait]
@@ -846,7 +865,7 @@ mod tests {
                 "ok"
             }
             async fn complete(&self, _: &[AiMessage], _: &[ToolDef]) -> Result<AiResult, AiError> {
-                Ok(AiResult { content: "fb".into(), tool_calls: vec![] })
+                Ok(AiResult { content: "fb".into(), tool_calls: vec![], reasoning: String::new() })
             }
         }
         let set = ProviderSet::new(Box::new(Fail), Some(Box::new(Ok_)));
@@ -911,5 +930,27 @@ mod tests {
         let set = from_config(&arc_config::Ai::default()).unwrap();
         assert_eq!(set.last_call(), LastCall::Never);
         assert!(set.primary_name().contains("hermes"));
+    }
+
+    /// The Arc app shows the model's reasoning; each provider family returns
+    /// it under a different key, and a missing one must not be an error.
+    #[test]
+    fn reasoning_is_read_from_every_provider_shape() {
+        let or =
+            parse_openai(&json!({"choices": [{"message": {"content": "hi", "reasoning": " weighing it "}}]}))
+                .unwrap();
+        assert_eq!(or.reasoning, "weighing it");
+        let ds =
+            parse_openai(&json!({"choices": [{"message": {"content": "hi", "reasoning_content": "step"}}]}))
+                .unwrap();
+        assert_eq!(ds.reasoning, "step");
+        let none = parse_openai(&json!({"choices": [{"message": {"content": "hi"}}]})).unwrap();
+        assert_eq!(none.reasoning, "");
+        let an = parse_anthropic(&json!({"content": [
+            {"type": "thinking", "thinking": "first"},
+            {"type": "text", "text": "answer"}
+        ]}))
+        .unwrap();
+        assert_eq!((an.reasoning.as_str(), an.content.as_str()), ("first", "answer"));
     }
 }

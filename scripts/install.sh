@@ -10,8 +10,10 @@
 #   ~/.local/share/arc/python/arc_voice         voice sidecar (venv + models already in ~/.local/share/arc)
 #   ~/.config/systemd/user/{arcd,hermes-proxy}.service
 #   ~/.config/omarchy/plugins/arc.status        bar widget
+#   ~/.config/quickshell/arc                    Arc app (launch: qs -c arc)
+#   ~/.local/share/applications/arc.desktop     app launcher entry
 #   ~/.config/arc/config.toml                   only created if missing
-set -euo pipefailq
+set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 profile=release bar=1
@@ -89,6 +91,30 @@ if [[ $bar == 1 ]]; then
     else
         echo "   Omarchy shell not found; skipping bar widget"
     fi
+fi
+
+if command -v qs >/dev/null; then
+    step "Installing the Arc app"
+    qsdir="${XDG_CONFIG_HOME:-$HOME/.config}/quickshell/arc"
+    rm -rf "$qsdir"
+    mkdir -p "$qsdir"
+    cp "$root/integrations/arc-app/shell.qml" "$qsdir/shell.qml"
+    # The app runs `arc` by name; point it at the installed binary.
+    sed -i "s|readonly property string arcCmd: \"arc\"|readonly property string arcCmd: \"$bin/arc\"|" "$qsdir/shell.qml"
+    apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$apps"
+    cat >"$apps/arc.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Arc
+Comment=Arc assistant: tools, chat and thought process
+Exec=qs -c arc
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;
+EOF
+else
+    echo "   quickshell not found; skipping the Arc app"
 fi
 
 step "Done"

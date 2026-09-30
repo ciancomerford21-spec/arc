@@ -500,6 +500,14 @@ pub enum Event {
         text: String,
         source: InputSource,
     },
+    /// One step of the model's thinking during a turn: its reasoning text (when
+    /// the provider exposes it) and any words it wrote alongside tool calls.
+    /// For display only -- never spoken, never fed back to the model.
+    Thought {
+        round: u32,
+        reasoning: String,
+        text: String,
+    },
     ToolStarted {
         tool: String,
         args: Value,
@@ -537,6 +545,7 @@ impl Event {
             Event::State { .. }
             | Event::Bar { .. }
             | Event::Heard { .. }
+            | Event::Thought { .. }
             | Event::ToolStarted { .. }
             | Event::ToolFinished { .. }
             | Event::ConfirmationRequired { .. }

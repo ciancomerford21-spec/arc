@@ -23,11 +23,17 @@ pub enum AgentReply {
     NeedsConfirmation { text: String, pending: PendingConfirmation, actions: Vec<ActionRecord> },
 }
 
+/// Where the agent reports each step of a turn as it happens. The daemon
+/// points this at its event bus so the Arc app can draw the thought process
+/// live rather than reconstructing it after the reply.
+pub type Trace = Arc<dyn Fn(arc_proto::Event) + Send + Sync>;
+
 pub struct Agent {
     providers: ProviderSet,
     gate: Arc<Gate>,
     system_prompt: String,
     max_rounds: u32,
+    trace: Option<Trace>,
 }
 
 /// Tool results are truncated before going back to the model so a large
@@ -165,7 +171,17 @@ pub fn shorten_for_speech(text: &str, max_chars: usize) -> String {
 
 impl Agent {
     pub fn new(providers: ProviderSet, gate: Arc<Gate>, system_prompt: String, max_rounds: u32) -> Self {
-        Self { providers, gate, system_prompt, max_rounds: max_rounds.max(1) }
+        Self { providers, gate, system_prompt, max_rounds: max_rounds.max(1), trace: None }
+    }
+
+    pub fn set_trace(&mut self, trace: Trace) {
+        self.trace = Some(trace);
+    }
+
+    fn emit(&self, e: arc_proto::Event) {
+        if let Some(t) = &self.trace {
+            t(e);
+        }
     }
 
     /// What the provider last did, for the health line in `arc status`.
@@ -194,8 +210,19 @@ impl Agent {
         let mut actions = vec![];
         let mut failures = 0u32;
 
-        for _ in 0..self.max_rounds {
+        for round in 0..self.max_rounds {
             let r = self.providers.complete(&msgs, &tools).await?;
+            // Words the model wrote alongside tool calls are its working notes;
+            // a final answer is already shown as the reply, so it is not
+            // repeated here.
+            let note = if r.tool_calls.is_empty() { String::new() } else { r.content.trim().to_string() };
+            if !r.reasoning.is_empty() || !note.is_empty() {
+                self.emit(arc_proto::Event::Thought {
+                    round: round + 1,
+                    reasoning: r.reasoning.clone(),
+                    text: note,
+                });
+            }
             if r.tool_calls.is_empty() {
                 // Reword only a real answer. Confirmation prompts are built
                 // below and spoken verbatim, and a failed round should not be
@@ -232,6 +259,11 @@ impl Agent {
                         Json::Object(m) => m.clone().into_iter().collect(),
                         _ => JsonMap::new(),
                     };
+                    self.emit(arc_proto::Event::ToolStarted {
+                        tool: call.name.clone(),
+                        args: call.args.clone(),
+                        risk: self.gate.risk_of(&call.name, &args).unwrap_or(arc_proto::RiskLevel::Safe),
+                    });
                     self.gate.run(&call.name, args, json!({"source": "ai"})).await
                 };
                 if let Outcome::NeedsConfirmation(p) = &outcome {
@@ -287,7 +319,11 @@ mod tests {
             self.seen.lock().unwrap().push(m.to_vec());
             let mut r = self.replies.lock().unwrap();
             if r.is_empty() {
-                Ok(AiResult { content: "loop".into(), tool_calls: vec![call("x", "network_status")] })
+                Ok(AiResult {
+                    content: "loop".into(),
+                    tool_calls: vec![call("x", "network_status")],
+                    reasoning: String::new(),
+                })
             } else {
                 Ok(r.remove(0))
             }
@@ -327,7 +363,7 @@ mod tests {
             "phraser"
         }
         async fn complete(&self, _: &[AiMessage], _: &[ToolDef]) -> Result<AiResult, AiError> {
-            Ok(AiResult { content: self.0.into(), tool_calls: vec![] })
+            Ok(AiResult { content: self.0.into(), tool_calls: vec![], reasoning: String::new() })
         }
     }
 
@@ -350,6 +386,7 @@ mod tests {
             vec![AiResult {
                 content: "Volume has been set to 40 percent successfully.".into(),
                 tool_calls: vec![],
+                reasoning: String::new(),
             }],
             4,
             Some(Box::new(Fixed("Set it to forty."))),
@@ -362,7 +399,11 @@ mod tests {
     async fn phrasing_failure_keeps_the_original_answer() {
         // The phraser is an enhancement; losing it must never lose the reply.
         let (a, _) = agent_with(
-            vec![AiResult { content: "Memory usage is at sixty two percent.".into(), tool_calls: vec![] }],
+            vec![AiResult {
+                content: "Memory usage is at sixty two percent.".into(),
+                tool_calls: vec![],
+                reasoning: String::new(),
+            }],
             4,
             Some(Box::new(Broken)),
         );
@@ -375,7 +416,7 @@ mod tests {
         // "Cancelled." and similar are built elsewhere or are error paths;
         // rewording them would be noise.
         let (a, _) = agent_with(
-            vec![AiResult { content: "Done.".into(), tool_calls: vec![] }],
+            vec![AiResult { content: "Done.".into(), tool_calls: vec![], reasoning: String::new() }],
             4,
             Some(Box::new(Fixed("something else entirely"))),
         );
@@ -387,7 +428,11 @@ mod tests {
     async fn confirmation_prompts_are_not_reworded() {
         // The prompt must name the exact action; a rewrite could drop it.
         let (a, _) = agent_with(
-            vec![AiResult { content: String::new(), tool_calls: vec![call("c1", "reboot")] }],
+            vec![AiResult {
+                content: String::new(),
+                tool_calls: vec![call("c1", "reboot")],
+                reasoning: String::new(),
+            }],
             4,
             Some(Box::new(Fixed("Should I restart now?"))),
         );
@@ -401,8 +446,14 @@ mod tests {
 
     #[tokio::test]
     async fn no_phrasing_model_means_no_extra_call() {
-        let (a, seen) =
-            agent(vec![AiResult { content: "A perfectly ordinary answer.".into(), tool_calls: vec![] }], 4);
+        let (a, seen) = agent(
+            vec![AiResult {
+                content: "A perfectly ordinary answer.".into(),
+                tool_calls: vec![],
+                reasoning: String::new(),
+            }],
+            4,
+        );
         let AgentReply::Answer { text, .. } = a.ask(&[], "hello").await.unwrap() else { panic!() };
         assert_eq!(text, "A perfectly ordinary answer.");
         assert_eq!(seen.lock().unwrap().len(), 1, "phrasing added a request");
@@ -410,7 +461,8 @@ mod tests {
 
     #[tokio::test]
     async fn plain_answer() {
-        let (a, _) = agent(vec![AiResult { content: "42".into(), tool_calls: vec![] }], 4);
+        let (a, _) =
+            agent(vec![AiResult { content: "42".into(), tool_calls: vec![], reasoning: String::new() }], 4);
         let AgentReply::Answer { text, actions } = a.ask(&[], "meaning?").await.unwrap() else { panic!() };
         assert_eq!(text, "42");
         assert!(actions.is_empty());
@@ -420,8 +472,12 @@ mod tests {
     async fn tool_result_is_fed_back() {
         let (a, seen) = agent(
             vec![
-                AiResult { content: String::new(), tool_calls: vec![call("c1", "no_such_tool")] },
-                AiResult { content: "done".into(), tool_calls: vec![] },
+                AiResult {
+                    content: String::new(),
+                    tool_calls: vec![call("c1", "no_such_tool")],
+                    reasoning: String::new(),
+                },
+                AiResult { content: "done".into(), tool_calls: vec![], reasoning: String::new() },
             ],
             4,
         );
@@ -439,6 +495,7 @@ mod tests {
             vec![AiResult {
                 content: String::new(),
                 tool_calls: vec![call("c1", "reboot"), call("c2", "shutdown")],
+                reasoning: String::new(),
             }],
             4,
         );
@@ -465,13 +522,21 @@ mod tests {
     async fn repeated_failures_stop_early_with_explanation() {
         // The model keeps calling a tool that fails; after two failed rounds it must
         // be asked (without tools) to explain instead of burning every round.
-        let failing = || AiResult { content: String::new(), tool_calls: vec![call("f", "no_such_tool")] };
+        let failing = || AiResult {
+            content: String::new(),
+            tool_calls: vec![call("f", "no_such_tool")],
+            reasoning: String::new(),
+        };
         let (a, seen) = agent(
             vec![
                 failing(),
                 failing(),
                 failing(),
-                AiResult { content: "That app isn't installed.".into(), tool_calls: vec![] },
+                AiResult {
+                    content: "That app isn't installed.".into(),
+                    tool_calls: vec![],
+                    reasoning: String::new(),
+                },
             ],
             8,
         );
@@ -546,5 +611,32 @@ mod tests {
             out.chars().count(),
             out.chars().count() as f64 / 2.2
         );
+    }
+
+    /// The app draws the thought process from these events, so the agent must
+    /// publish them in order: reasoning, then the tool it chose, before it runs.
+    #[tokio::test]
+    async fn each_step_is_traced_before_the_reply() {
+        let (mut a, _) = agent(
+            vec![
+                AiResult {
+                    content: "checking".into(),
+                    tool_calls: vec![call("c1", "network_status")],
+                    reasoning: "user wants network".into(),
+                },
+                AiResult { content: "All good.".into(), tool_calls: vec![], reasoning: String::new() },
+            ],
+            4,
+        );
+        let seen = Arc::new(Mutex::new(vec![]));
+        let sink = seen.clone();
+        a.set_trace(Arc::new(move |e| sink.lock().unwrap().push(e)));
+        a.ask(&[], "is the network up").await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(matches!(&seen[0], arc_proto::Event::Thought { round: 1, reasoning, text }
+            if reasoning == "user wants network" && text == "checking"));
+        assert!(matches!(&seen[1], arc_proto::Event::ToolStarted { tool, .. } if tool == "network_status"));
+        // A plain final answer is the reply itself, not a thought.
+        assert_eq!(seen.len(), 2, "{seen:?}");
     }
 }

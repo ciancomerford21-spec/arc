@@ -37,6 +37,11 @@ pub enum ConfigError {
 // Schema
 // ---------------------------------------------------------------------------
 
+/// serde default for a bool that should be on unless configured off.
+fn yes_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct Config {
@@ -99,7 +104,7 @@ When something fails, say what happened, what you think caused it, and what you'
 
 Refer to things by context: "the project", "that window", "the other branch" should resolve from the conversation. Ask only when guessing would be worse than asking.
 
-Never fake feelings, never over-explain what you're about to do, never stack on emojis, and never be sarcastic at the user's expense.
+Never fake feelings, never stack on emojis, never be sarcastic at the user's expense. Say one short line before anything slow, then do it -- silence reads as broken.
 "#.to_string().to_string(),
             user_title: String::new(),
         }
@@ -248,6 +253,12 @@ pub struct Voice {
     pub volume: f32,
     /// Speak replies to voice requests.
     pub speak_replies: bool,
+    /// Speak the words the model writes *alongside* a tool call ("I'll grab a
+    /// shot."). Off by default before: the note was display-only, so a turn
+    /// that opened with one was silent until the tool finished -- measured
+    /// live at 135s with nothing said at all.
+    #[serde(default = "yes_default")]
+    pub speak_tool_notes: bool,
     /// Also speak replies to typed requests.
     pub speak_text_replies: bool,
     /// Short tones when listening starts/stops.
@@ -294,6 +305,7 @@ impl Default for Voice {
             speech_rate: 1.0,
             volume: 0.8,
             speak_replies: true,
+            speak_tool_notes: true,
             speak_text_replies: false,
             chime: true,
             max_utterance_s: 15.0,

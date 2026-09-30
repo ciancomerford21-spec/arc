@@ -217,10 +217,15 @@ impl Agent {
             // repeated here.
             let note = if r.tool_calls.is_empty() { String::new() } else { r.content.trim().to_string() };
             if !r.reasoning.is_empty() || !note.is_empty() {
+                // A note before a `code` call would be spoken and then
+                // followed seconds later by the handoff line: two
+                // announcements for one turn.
+                let speakable = !r.tool_calls.iter().any(|c| c.name == "code");
                 self.emit(arc_proto::Event::Thought {
                     round: round + 1,
                     reasoning: r.reasoning.clone(),
                     text: note,
+                    speakable,
                 });
             }
             if r.tool_calls.is_empty() && r.content.trim().is_empty() {
@@ -750,7 +755,7 @@ mod tests {
         a.set_trace(Arc::new(move |e| sink.lock().unwrap().push(e)));
         a.ask(&[], "is the network up").await.unwrap();
         let seen = seen.lock().unwrap();
-        assert!(matches!(&seen[0], arc_proto::Event::Thought { round: 1, reasoning, text }
+        assert!(matches!(&seen[0], arc_proto::Event::Thought { round: 1, reasoning, text, .. }
             if reasoning == "user wants network" && text == "checking"));
         assert!(matches!(&seen[1], arc_proto::Event::ToolStarted { tool, .. } if tool == "network_status"));
         // A plain final answer is the reply itself, not a thought.

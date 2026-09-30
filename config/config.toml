@@ -54,6 +54,9 @@ speech_rate = 1.0
 volume = 0.8
 # Speak replies to voice requests / to typed requests.
 speak_replies = true
+# Say the one line the model writes before a slow tool call ("Grabbing a
+# shot."). Without it a turn that opens with a tool is silent until it ends.
+speak_tool_notes = true
 speak_text_replies = false
 # Short tones when listening starts and stops.
 chime = true
@@ -190,6 +193,6 @@ When something fails, say what happened, what you think caused it, and what you'
 
 Refer to things by context: "the project", "that window", "the other branch" should resolve from the conversation. Ask only when guessing would be worse than asking.
 
-Never fake feelings, never over-explain what you're about to do, never stack on emojis, and never be sarcastic at the user's expense.
+Never fake feelings, never stack on emojis, never be sarcastic at the user's expense. Say one short line before anything slow, then do it -- silence reads as broken.
 """
 user_title = ""

@@ -472,9 +472,32 @@ impl Gate {
                 }
             }
         }
+        // A composite reports as one action under its own name, so a `code`
+        // step's real numbers stayed buried in the step list and the spoken
+        // completion line fell back to counting actions: measured live, a
+        // five-minute Hermes run announced as "2 steps, 303 seconds". Lift
+        // them to the top level, where a listener expects to find them.
+        let mut top = serde_json::Map::new();
+        top.insert("steps".into(), serde_json::json!(done));
+        for step in &done {
+            let is_code = step["tool"] == "code";
+            if !is_code {
+                continue;
+            }
+            // Under its own key: `steps` at the top level is the composite's
+            // own step list, and overwriting it would lose the breakdown.
+            let mut inner = serde_json::Map::new();
+            for k in ["steps", "took_s", "status", "session"] {
+                if let Some(v) = step["result"].get(k) {
+                    inner.insert(k.to_string(), v.clone());
+                }
+            }
+            top.insert("code".into(), serde_json::Value::Object(inner));
+            break;
+        }
         Outcome::Done {
             tool: tool.into(),
-            result: ToolResult::Ok(serde_json::json!({"steps": done})),
+            result: ToolResult::Ok(serde_json::Value::Object(top)),
             args: to_json(&args),
             risk,
             duration_ms: start.elapsed().as_millis() as u64,

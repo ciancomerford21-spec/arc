@@ -92,7 +92,7 @@ fn completion_line(actions: &[arc_proto::ActionRecord]) -> Option<String> {
     });
     let total_ms: u64 = work.iter().map(|a| a.duration_ms).sum();
     // Capitalised for speech: these lines start sentences.
-    let Subject = {
+    let subject_start = {
         let s = work.last().map(|a| tool_phrase(&a.tool)).unwrap_or_else(|| "that".into());
         let mut c = s.chars();
         match c.next() {
@@ -104,12 +104,12 @@ fn completion_line(actions: &[arc_proto::ActionRecord]) -> Option<String> {
     if hard_failed {
         return match failure_detail(&work) {
             Some(why) => Some(vary(&[
-                &format!("{Subject} hit a wall: {why}."),
+                &format!("{subject_start} hit a wall: {why}."),
                 &format!("That one didn't work -- {why}."),
-                &format!("{Subject} fell over: {why}."),
+                &format!("{subject_start} fell over: {why}."),
             ])),
             None => Some(vary(&[
-                &format!("{Subject} didn't finish cleanly. I've got the details."),
+                &format!("{subject_start} didn't finish cleanly. I've got the details."),
                 "That didn't come out clean. Details coming up.",
             ])),
         };
@@ -119,9 +119,17 @@ fn completion_line(actions: &[arc_proto::ActionRecord]) -> Option<String> {
     }
     // A `code` task reports its own real numbers, so use them: "9 steps, 37
     // seconds" is information, "everything ran" is not.
-    if let Some(code) = work.iter().rev().find(|a| a.tool == "code") {
-        let steps = code.data.get("steps").and_then(|v| v.as_u64());
-        let took = code.data.get("took_s").and_then(|v| v.as_u64()).unwrap_or(total_ms / 1000);
+    // Either a direct `code` action, or a self-made composite that ran one
+    // as a step and passed its numbers up.
+    let code_data = work
+        .iter()
+        .rev()
+        .find(|a| a.tool == "code")
+        .map(|a| a.data.clone())
+        .or_else(|| work.iter().rev().find_map(|a| a.data.get("code").cloned()));
+    if let Some(data) = code_data {
+        let steps = data.get("steps").and_then(|v| v.as_u64());
+        let took = data.get("took_s").and_then(|v| v.as_u64()).unwrap_or(total_ms / 1000);
         // No verdict here. The `code` tool cannot know whether the task
         // succeeded: hermes exits 0 even when the build failed and says so in
         // prose. Measured -- a task that failed dependency resolution reported
@@ -132,11 +140,15 @@ fn completion_line(actions: &[arc_proto::ActionRecord]) -> Option<String> {
         // support, and repeating the verdict is the double summary this line
         // exists to avoid.
         return Some(match (steps, took) {
-            (Some(n), t) => vary(&[
-                &format!("Hermes: {n} steps, {t} seconds."),
-                &format!("That took Hermes {n} steps, {t} seconds."),
-                &format!("Hermes worked through {n} steps in {t} seconds."),
-            ]),
+            (Some(n), t) => {
+                let steps = if n == 1 { "1 step".to_string() } else { format!("{n} steps") };
+                let secs = plural_secs(t * 1000);
+                vary(&[
+                    &format!("Hermes: {steps}, {secs}."),
+                    &format!("That took Hermes {steps}, {secs}."),
+                    &format!("Hermes worked through {steps} in {secs}."),
+                ])
+            }
             (None, t) => vary(&[&format!("Hermes took {t} seconds."), &format!("That ran for {t} seconds.")]),
         });
     }
@@ -144,8 +156,8 @@ fn completion_line(actions: &[arc_proto::ActionRecord]) -> Option<String> {
     if n == 1 {
         let secs = plural_secs(total_ms);
         return Some(vary(&[
-            &format!("{Subject} took {secs}. Done."),
-            &format!("{Subject} finished in {secs}."),
+            &format!("{subject_start} took {secs}. Done."),
+            &format!("{subject_start} finished in {secs}."),
         ]));
     }
     let secs = plural_secs(total_ms);
@@ -221,6 +233,63 @@ fn vary(options: &[&str]) -> String {
 /// already started being spoken (median 2.1s, slow tool calls 3-6s), so this
 /// only fires for genuinely long turns.
 const SLOW_TURN_SPEAKS_AT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// The model's words alongside a tool call, prepared for speech.
+///
+/// These were display-only, so a turn that opened with one was silent until
+/// the tool finished: measured live, "take a screenshot and describe what you
+/// see" said "I'll grab a shot." to nobody and then took 135 seconds.
+///
+/// Rules, because a note is a promise to say something and then stop talking:
+/// - at most [`NOTE_SPOKEN_MAX`] per turn, so a four-round tool loop is not
+///   four announcements;
+/// - never during a `code` task, which has its own progress lines and would
+///   otherwise double up;
+/// - never a question: the user would answer into a turn that is still
+///   running, and nothing would use the answer;
+/// - the first sentence only, cut short: the point is to cover a wait, not
+///   to be read.
+fn speakable_note(text: &str, spoken: &mut u32, code_active: bool) -> Option<String> {
+    if *spoken >= NOTE_SPOKEN_MAX || code_active {
+        return None;
+    }
+    let t = text.trim();
+    if t.is_empty() || t.ends_with('?') {
+        return None;
+    }
+    let first = t.split(['.', '!', '\n']).map(str::trim).find(|s| !s.is_empty())?;
+    let words: Vec<&str> = first.split_whitespace().take(12).collect();
+    let line = words.join(" ");
+    if line.len() < 3 {
+        return None;
+    }
+    *spoken += 1;
+    Some(if line.ends_with('.') || line.ends_with('!') { line } else { format!("{line}.") })
+}
+
+/// One note per turn. Two would be a conversation with itself.
+const NOTE_SPOKEN_MAX: u32 = 1;
+
+/// What the progress relay should do with one event.
+///
+/// Extracted from the relay loop because the loop's first version peeked for
+/// a `Thought` with a *second* `recv`, which threw away every other event --
+/// including the `ToolStarted` that marks a code task. A bug in a `match` arm
+/// is hard to see; a bug in a total function with a test is not.
+fn note_action(ev: &Event, speak_notes: bool, notes: &mut u32, code_active: bool) -> Option<Option<String>> {
+    if !speak_notes {
+        return None;
+    }
+    let Event::Thought { text, speakable, .. } = ev else { return None };
+    if text.trim().is_empty() {
+        return Some(None);
+    }
+    // `speakable` is false for a round that is calling `code`: the handoff
+    // line covers it, and two announcements seconds apart is what that guard
+    // exists to prevent.
+    let busy = !speakable || code_active;
+    Some(speakable_note(text, notes, busy))
+}
 
 /// The line said when a turn runs long.
 ///
@@ -638,24 +707,54 @@ impl Daemon {
         let mut talk = ProgressTalk { said: 0, last_at: None };
         let task = task_summary(text);
         let code_flag = self.code_active.clone();
+        let speak_notes = self.config.voice.speak_tool_notes;
+        let mut notes = 0u32;
         let relay = tokio::spawn({
             let mut rx = self.events.subscribe();
             let speak = self.speak_handle();
             async move {
                 loop {
-                    let (tool, detail, step, elapsed) = match rx.recv().await {
-                        Ok(Event::CodeProgress { tool, detail, step, elapsed_s }) => {
+                    // One receive, then dispatch. The first version peeked for
+                    // a Thought with a second `recv`, which silently threw
+                    // away every other event -- including the ToolStarted
+                    // that marks a code task, and the progress events.
+                    let ev = match rx.recv().await {
+                        Ok(e) => e,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(skipped = n, "progress relay fell behind");
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    // The model's own words for what it is about to do. These
+                    // were display-only, so the turn was silent until the tool
+                    // finished -- measured live at 135s with nothing said.
+                    if let Some(action) = note_action(
+                        &ev,
+                        speak_notes,
+                        &mut notes,
+                        code_flag.load(std::sync::atomic::Ordering::Relaxed),
+                    ) {
+                        match action {
+                            Some(line) => {
+                                tracing::info!(note = %line, "speaking the model's note");
+                                speak(line);
+                            }
+                            None => tracing::info!("note not spoken"),
+                        }
+                        continue;
+                    }
+                    let (tool, detail, step, elapsed) = match ev {
+                        Event::CodeProgress { tool, detail, step, elapsed_s } => {
                             (tool, detail, step, elapsed_s)
                         }
                         // The headsup stands down once a code task is under
                         // way, so mark it as soon as the tool starts.
-                        Ok(Event::ToolStarted { tool, .. }) if tool == "code" => {
+                        Event::ToolStarted { tool, .. } if tool == "code" => {
                             code_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             continue;
                         }
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(_) => break,
+                        _ => continue,
                     };
                     match progress_line(&task, &tool, step, elapsed, &mut talk) {
                         Some(t) => {
@@ -1000,6 +1099,29 @@ mod tests {
         assert!(outs.len() >= 2, "every completion sounded the same: {outs:?}");
     }
 
+    /// A self-made composite that runs `code` as a step reports as one action
+    /// under its own name, so the numbers have to be lifted or the line falls
+    /// back to counting actions -- measured live as "2 steps, 303 seconds" for
+    /// a five-minute Hermes run.
+    #[test]
+    fn a_composite_that_runs_code_still_reports_hermes_numbers() {
+        let rec = arc_proto::ActionRecord {
+            tool: "see_screen".into(),
+            args: serde_json::json!({}),
+            risk: arc_proto::RiskLevel::Dangerous,
+            outcome: ActionOutcome::Success,
+            summary: String::new(),
+            warning: None,
+            data: serde_json::json!({
+                "steps": [{"step": 1, "tool": "screenshot", "result": {"output": "Saved"}}],
+                "code": {"steps": 14, "took_s": 219, "status": "done", "session": "s"},
+            }),
+            duration_ms: 303_000,
+        };
+        let line = completion_line(&[rec]).unwrap();
+        assert!(line.contains("14") && line.contains("219"), "nested code numbers lost: {line}");
+    }
+
     /// The completion line exists to add information the reply does not have.
     /// A `code` task knows its own step count and duration, so it says those
     /// rather than "everything ran".
@@ -1072,6 +1194,104 @@ mod tests {
         // With nothing known, it must not invent a step.
         let unknown = slow_turn_headsup(None, std::time::Duration::from_secs(6));
         assert!(!unknown.contains("test") && !unknown.contains("writ"), "{unknown}");
+    }
+
+    /// The relay must handle every event, not just the ones it cares about.
+    /// Its first version peeked for a `Thought` with a second `recv` and
+    /// silently dropped everything else -- including the `ToolStarted` that
+    /// marks a code task, which is why this is a function with a test.
+    #[test]
+    fn the_relay_only_intercepts_thoughts_and_never_drops_other_events() {
+        let mut n = 0;
+        let note = Event::Thought {
+            round: 1,
+            reasoning: String::new(),
+            text: "I'll grab a shot.".into(),
+            speakable: true,
+        };
+        // A Thought is consumed, and its line spoken.
+        assert_eq!(note_action(&note, true, &mut n, false), Some(Some("I'll grab a shot.".into())));
+        // Everything else is passed through untouched, so the progress branch
+        // still sees it.
+        for ev in [
+            Event::CodeProgress { tool: "terminal".into(), detail: String::new(), step: 1, elapsed_s: 4 },
+            Event::ToolStarted {
+                tool: "code".into(),
+                args: serde_json::json!({}),
+                risk: arc_proto::RiskLevel::Dangerous,
+            },
+            Event::ToolFinished {
+                record: arc_proto::ActionRecord {
+                    tool: "x".into(),
+                    args: serde_json::json!({}),
+                    risk: arc_proto::RiskLevel::Safe,
+                    outcome: ActionOutcome::Success,
+                    summary: String::new(),
+                    warning: None,
+                    data: serde_json::json!({}),
+                    duration_ms: 1,
+                },
+            },
+        ] {
+            assert_eq!(note_action(&ev, true, &mut n, false), None, "{ev:?} was swallowed");
+        }
+        // A Thought with no words is consumed but silent.
+        let blank = Event::Thought { round: 2, reasoning: "hmm".into(), text: "  ".into(), speakable: true };
+        assert_eq!(note_action(&blank, true, &mut n, false), Some(None));
+        // The setting turns the whole thing off.
+        let mut m = 0;
+        assert_eq!(note_action(&note, false, &mut m, false), None);
+        assert_eq!(m, 0);
+        // A note in a round that is calling code is not spoken: the handoff
+        // line already covers it.
+        let code_round = Event::Thought {
+            round: 1,
+            reasoning: String::new(),
+            text: "I'll build that.".into(),
+            speakable: false,
+        };
+        let mut c = 0;
+        assert_eq!(note_action(&code_round, true, &mut c, false), Some(None));
+    }
+
+    /// A note before a tool call used to be display-only, so the turn was
+    /// silent until the tool finished. It is spoken now, under rules that keep
+    /// it from becoming a monologue.
+    #[test]
+    fn a_note_before_a_tool_is_spoken_but_only_once() {
+        let mut n = 0;
+        assert_eq!(
+            speakable_note("I'll grab a shot.", &mut n, false),
+            Some("I'll grab a shot.".into()),
+            "the model's own words should be said"
+        );
+        // One per turn: a second would be Arc talking to itself.
+        assert_eq!(speakable_note("Now let me look at it.", &mut n, false), None);
+        assert_eq!(n, 1);
+
+        let mut n = 0;
+        // Never over a code task, which announces itself.
+        assert_eq!(speakable_note("I'll build it.", &mut n, true), None);
+        // Never a question: the user would answer into a running turn.
+        let mut q = 0;
+        assert_eq!(speakable_note("Which project should I use?", &mut q, false), None);
+        // Nothing usable.
+        let mut e = 0;
+        assert_eq!(speakable_note("   ", &mut e, false), None);
+        assert_eq!(speakable_note("ok", &mut e, false), None);
+    }
+
+    /// A note is often a paragraph, and a paragraph before a tool call is a
+    /// monologue. Only the first sentence, and only so much of it.
+    #[test]
+    fn a_note_is_cut_to_one_short_line() {
+        let mut n = 0;
+        let long = "Right, so what I'll do is first read the config file and check the theme, \
+                    then look at the wallpaper settings, and after that probably check the bar too.";
+        let out = speakable_note(long, &mut n, false).unwrap();
+        assert!(out.starts_with("Right, so what I'll do is"), "{out}");
+        assert!(!out.contains("wallpaper"), "only the first sentence: {out}");
+        assert!(out.split_whitespace().count() <= 13, "{out}");
     }
 
     /// The first progress line is spoken, so what it says has to be
@@ -1191,7 +1411,11 @@ mod tests {
     #[test]
     fn a_cancelled_run_does_not_claim_success() {
         let line = completion_line(&[act("code", ActionOutcome::Cancelled, 40_000)]).unwrap();
-        assert!(line.contains("stopped"), "{line}");
+        let low = line.to_lowercase();
+        assert!(
+            low.contains("stopped") || low.contains("pulled"),
+            "a cancelled run must not sound finished: {line}"
+        );
     }
 
     #[test]

@@ -541,6 +541,11 @@ pub enum Event {
         round: u32,
         reasoning: String,
         text: String,
+        /// False when this round is calling `code`: that case announces
+        /// itself with its own progress lines, and speaking both would be two
+        /// announcements seconds apart. The note still shows in the app.
+        #[serde(default = "yes")]
+        speakable: bool,
     },
     /// What Hermes is doing right now, while a `code` task runs. Display
     /// only -- never spoken automatically and never fed back to the model.

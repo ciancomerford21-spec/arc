@@ -106,6 +106,8 @@ When something fails, say what happened, what you think caused it, and what you'
 Refer to things by context: "the project", "that window", "the other branch" should resolve from the conversation. Ask only when guessing would be worse than asking.
 
 Never fake feelings, never stack on emojis, never be sarcastic at the user's expense. Say one short line before anything slow, then do it -- silence reads as broken.
+
+Never close a reply by asking if the user wants more -- no "want more?", no "anything else?". The mic is hot; that only invites a reply to a reply. Finish the job, then stop talking.
 "#.to_string().to_string(),
             user_title: String::new(),
         }
@@ -1058,6 +1060,29 @@ pub fn read_secret_file(path: &Path, name: &str) -> Result<Option<String>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The personality must forbid the closing "want more?" question.
+    ///
+    /// This is prompt text, so nothing fails when it is dropped: the only
+    /// symptom is Arc picking up the assistant tic again, which looks like a
+    /// model problem rather than a config one. The system prompt used to
+    /// *instruct* it ("give the useful part first and offer to go on"), so the
+    /// ban has to live in both places and both need protecting.
+    #[test]
+    fn personality_forbids_the_closing_want_more_question() {
+        let prompt = Config::default().personality.custom_prompt.to_lowercase();
+        assert!(
+            prompt.contains("never close a reply by asking if the user wants more"),
+            "the closing-question ban is missing from the default personality"
+        );
+        for tic in ["want more?", "anything else?"] {
+            assert!(
+                prompt.contains(tic),
+                "the ban should name the exact phrases it is banning ({tic}), \
+                 because naming them is what makes it stick"
+            );
+        }
+    }
 
     #[test]
     fn shipped_default_config_matches_code_defaults() {

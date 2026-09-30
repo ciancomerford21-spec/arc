@@ -90,7 +90,9 @@ pub enum Body {
 pub struct Def {
     pub name: String,
     pub description: String,
-    /// Parameter name -> description. All are required.
+    /// Parameter name -> description. Required for a composite (its steps
+    /// need the value); optional for a script, which sees an unset
+    /// `$ARC_ARG_<NAME>` and uses its own default.
     #[serde(default)]
     pub params: BTreeMap<String, String>,
     #[serde(default)]
@@ -110,11 +112,16 @@ impl Def {
     fn schema(&self) -> Json {
         let props: serde_json::Map<String, Json> =
             self.params.iter().map(|(k, d)| (k.clone(), serde_json::json!({ "description": d }))).collect();
-        serde_json::json!({
-            "type": "object",
-            "properties": props,
-            "required": self.params.keys().collect::<Vec<_>>(),
-        })
+        // Marking a script's parameters required forced the model to invent
+        // a value for one it had meant as optional: measured live, a
+        // screenshot tool with an optional `output` path was called with a
+        // made-up path and date (shot_20260214_... on 2026-09-30) instead
+        // of letting the script pick the default.
+        let required: Vec<&String> = match self.body {
+            Body::Composite { .. } => self.params.keys().collect(),
+            Body::Script { .. } => vec![],
+        };
+        serde_json::json!({ "type": "object", "properties": props, "required": required })
     }
 }
 
@@ -371,8 +378,15 @@ impl CustomTools {
                 }
             }
             Body::Script { language, script } => {
-                if script.trim().is_empty() {
-                    return Err("the script is empty".into());
+                // A shebang and comments are not a script. This is what a tool
+                // call cut off by the token budget looks like, and it was
+                // accepted live as a "screenshot" tool that did nothing.
+                let body = script.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+                if body.count() == 0 {
+                    return Err(
+                        "the script has no commands (only a shebang or comments); send the whole script"
+                            .into(),
+                    );
                 }
                 if script.len() > MAX_SCRIPT_BYTES {
                     return Err(format!("the script is over {} KB", MAX_SCRIPT_BYTES / 1024));
@@ -504,10 +518,6 @@ impl Tool for ScriptTool {
         let Body::Script { language, script } = &self.def.body else {
             return ToolResult::Error("not a script tool".into());
         };
-        let missing: Vec<&String> = self.def.params.keys().filter(|k| !args.contains_key(*k)).collect();
-        if !missing.is_empty() {
-            return ToolResult::Error(format!("missing argument(s): {missing:?}"));
-        }
         // The script text runs as held in memory -- what was screened is what
         // runs. Editing the file on disk takes effect (re-screened) at restart.
         let mut cmd = tokio::process::Command::new(language.interpreter());
@@ -651,6 +661,16 @@ mod tests {
     }
 
     #[test]
+    fn a_shebang_alone_is_not_a_script() {
+        let s = store();
+        for stub in ["#!/usr/bin/env bash\n", "#!/usr/bin/env bash\n# take a screenshot\n\n", "   "] {
+            let e = s.create(script("screenshot", Language::Bash, stub, &[])).unwrap_err();
+            assert!(e.contains("no commands"), "{stub:?}: {e}");
+        }
+        assert!(s.get("screenshot").is_none());
+    }
+
+    #[test]
     fn script_tools_always_ask_and_are_dangerous_by_nature() {
         let s = store();
         s.create(script("greet", Language::Bash, "echo hi", &[])).unwrap();
@@ -684,12 +704,17 @@ mod tests {
             panic!()
         };
         assert_eq!(v["output"], "bob bob");
-        let ToolResult::Error(e) =
-            s.tool("py_greet", &|_| RiskLevel::Safe).unwrap().execute(&JsonMap::new()).await
+        // Script parameters are optional: an omitted one is simply unset, so
+        // the script applies its own default instead of the model making one
+        // up.
+        let t = s.tool("py_greet", &|_| RiskLevel::Safe).unwrap();
+        assert_eq!(t.parameters()["required"], serde_json::json!([]));
+        s.create(script("maybe", Language::Bash, "echo \"${ARC_ARG_OUT:-default}\"", &["out"])).unwrap();
+        let ToolResult::Ok(v) = s.tool("maybe", &|_| RiskLevel::Safe).unwrap().execute(&JsonMap::new()).await
         else {
             panic!()
         };
-        assert!(e.contains("missing"), "{e}");
+        assert_eq!(v["output"], "default");
     }
 
     #[tokio::test]

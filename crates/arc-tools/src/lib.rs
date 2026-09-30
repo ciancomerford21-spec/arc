@@ -1880,7 +1880,7 @@ impl Tool for ToolCreate {
                 "name": {"type": "string", "description": "snake_case, e.g. focus_mode"},
                 "description": {"type": "string", "description": "what it does and when to use it, for your future self"},
                 "kind": {"type": "string", "enum": ["composite", "script"]},
-                "params": {"type": "object", "description": "parameter name -> description; all required", "additionalProperties": {"type": "string"}},
+                "params": {"type": "object", "description": "parameter name -> description. Composite: all required. Script: all optional; an omitted one is an unset env var, so give it a default in the script", "additionalProperties": {"type": "string"}},
                 "steps": {"type": "array", "description": "composite only", "items": {"type": "object", "properties": {"tool": {"type": "string"}, "args": {"type": "object"}}, "required": ["tool"]}},
                 "language": {"type": "string", "enum": ["bash", "python"], "description": "script only"},
                 "script": {"type": "string", "description": "script only: the full script text"}

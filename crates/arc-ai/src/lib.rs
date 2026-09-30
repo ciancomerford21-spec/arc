@@ -83,6 +83,11 @@ pub struct AiResult {
     /// Arc app can show how a turn was decided. Empty when the model or
     /// provider does not expose it.
     pub reasoning: String,
+    /// The provider stopped because it hit `max_tokens` (OpenAI
+    /// `finish_reason: "length"`, Anthropic `stop_reason: "max_tokens"`).
+    /// A reasoning model can spend the whole budget thinking and return no
+    /// answer at all, or stop half-way through a tool call's arguments.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +160,16 @@ impl AiError {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     async fn complete(&self, messages: &[AiMessage], tools: &[ToolDef]) -> Result<AiResult, AiError>;
+    /// As `complete`, with a different token budget. Providers that cannot
+    /// change it just run `complete`.
+    async fn complete_with_budget(
+        &self,
+        messages: &[AiMessage],
+        tools: &[ToolDef],
+        _max_tokens: u32,
+    ) -> Result<AiResult, AiError> {
+        self.complete(messages, tools).await
+    }
 }
 
 fn http_client(timeout: Duration) -> reqwest::Client {
@@ -290,7 +305,20 @@ pub fn parse_openai(parsed: &Json) -> Result<AiResult, AiError> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(AiResult { content, tool_calls, reasoning })
+    // Cut off by the budget. finish_reason says so most of the time, but not
+    // always: measured, the proxy returned finish_reason "tool_calls" for a
+    // call that stopped at exactly max_tokens with its arguments cut
+    // mid-JSON (1208 chars, unparseable). decode_args turns that into `{}`
+    // or a fragment, and a script tool arrived as just its shebang line. So
+    // arguments that are not valid JSON also count as cut off.
+    let broken_args = msg["tool_calls"].as_array().is_some_and(|a| {
+        a.iter().any(|tc| match &tc["function"]["arguments"] {
+            Json::String(s) => !s.trim().is_empty() && serde_json::from_str::<Json>(s).is_err(),
+            _ => false,
+        })
+    });
+    let truncated = parsed["choices"][0]["finish_reason"] == "length" || broken_args;
+    Ok(AiResult { content, tool_calls, reasoning, truncated })
 }
 
 #[async_trait]
@@ -310,6 +338,21 @@ impl Provider for OpenAiCompat {
             eprintln!("[BODY] {}", serde_json::to_string(&body).unwrap_or_default());
         }
         parse_openai(&post_json(req, &body).await?)
+    }
+
+    async fn complete_with_budget(
+        &self,
+        messages: &[AiMessage],
+        tools: &[ToolDef],
+        max_tokens: u32,
+    ) -> Result<AiResult, AiError> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let mut req = self.client.post(url);
+        if let Some(key) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
+            req = req.bearer_auth(key);
+        }
+        let s = Sampling { max_tokens, ..self.sampling };
+        parse_openai(&post_json(req, &openai_body(&self.model, messages, tools, s)).await?)
     }
 }
 
@@ -424,7 +467,8 @@ pub fn parse_anthropic(parsed: &Json) -> Result<AiResult, AiError> {
         .join("\n")
         .trim()
         .to_string();
-    Ok(AiResult { content, tool_calls, reasoning })
+    let truncated = parsed["stop_reason"] == "max_tokens";
+    Ok(AiResult { content, tool_calls, reasoning, truncated })
 }
 
 #[async_trait]
@@ -468,7 +512,21 @@ pub struct ProviderSet {
     /// happened to real traffic is free and strictly more honest: it reports
     /// the provider Arc is actually using, not a synthetic call.
     last: std::sync::Arc<std::sync::Mutex<LastCall>>,
+    /// The configured budget, so a cut-off reply can be retried with more.
+    max_tokens: u32,
 }
+
+/// A reply cut off by `max_tokens` is retried once with this multiple of
+/// the budget, and never less than `RETRY_BUDGET_MIN`.
+///
+/// Sized from a measurement, not a guess. "Create yourself a screenshot
+/// tool" against the real tool_create schema: at 400 and at 1600 tokens
+/// every attempt was cut off (all budget spent reasoning, or arguments cut
+/// mid-JSON); at 8000 it produced a valid 129-line script using 6301
+/// tokens, 14.6k chars of them reasoning, in 37 s. It is only spent when the
+/// normal budget has already failed.
+const RETRY_BUDGET_FACTOR: u32 = 4;
+const RETRY_BUDGET_MIN: u32 = 8000;
 
 /// The last thing the provider did, for the health line in `arc status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,7 +546,14 @@ impl ProviderSet {
             fallback,
             phrasing: None,
             last: std::sync::Arc::new(std::sync::Mutex::new(LastCall::Never)),
+            max_tokens: Sampling::default().max_tokens,
         }
+    }
+
+    /// The budget a cut-off reply is retried from.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     /// Attach a separate model for final replies.
@@ -553,6 +618,46 @@ impl ProviderSet {
     }
 
     pub async fn complete(&self, messages: &[AiMessage], tools: &[ToolDef]) -> Result<AiResult, AiError> {
+        let r = self.complete_once(messages, tools).await?;
+        if !r.truncated {
+            return Ok(r);
+        }
+        // Cut off by max_tokens. The budget is set for speech, but a reasoning
+        // model spends it *thinking* first, and on a list-style question it
+        // can use all 400 tokens before writing a word: measured on
+        // "create a list of some tools that might be useful" -- 400 tokens,
+        // 1727 chars of reasoning, 0 chars of answer, finish_reason=length --
+        // which Arc then passed on as a silent reply, three times running.
+        // A truncated tool call is worse: its arguments are cut mid-JSON, so
+        // a script arrives as just its shebang line.
+        //
+        // Retry once with a bigger budget. Speech stays short regardless:
+        // the reply is still cut to MAX_SPOKEN_CHARS before it is spoken.
+        let bigger = (self.max_tokens * RETRY_BUDGET_FACTOR).max(RETRY_BUDGET_MIN);
+        tracing::info!(
+            provider = %self.primary.name(),
+            from = self.max_tokens,
+            to = bigger,
+            content = r.content.len(),
+            tool_calls = r.tool_calls.len(),
+            "reply cut off by max_tokens; retrying with a bigger budget"
+        );
+        match self.primary.complete_with_budget(messages, tools, bigger).await {
+            Ok(again) => {
+                if again.truncated {
+                    tracing::warn!(to = bigger, "still cut off after the bigger budget");
+                }
+                Ok(again)
+            }
+            // The first reply is still something; keep it rather than fail.
+            Err(e) => {
+                tracing::warn!(error = %e, "bigger-budget retry failed; keeping the cut-off reply");
+                Ok(r)
+            }
+        }
+    }
+
+    async fn complete_once(&self, messages: &[AiMessage], tools: &[ToolDef]) -> Result<AiResult, AiError> {
         // The cloud provider 500s on roughly 2 in 5 requests, transiently, and
         // a retry clears it: measured 27/27 successes across max_tokens
         // 400-1200 and temperature 0.0-0.9, so it is upstream noise rather
@@ -687,6 +792,7 @@ pub fn from_config(config: &arc_config::Ai) -> Result<ProviderSet, AiError> {
         fallback,
         phrasing,
         last: std::sync::Arc::new(std::sync::Mutex::new(LastCall::Never)),
+        max_tokens: config.max_tokens,
     })
 }
 
@@ -865,11 +971,85 @@ mod tests {
                 "ok"
             }
             async fn complete(&self, _: &[AiMessage], _: &[ToolDef]) -> Result<AiResult, AiError> {
-                Ok(AiResult { content: "fb".into(), tool_calls: vec![], reasoning: String::new() })
+                Ok(AiResult {
+                    content: "fb".into(),
+                    tool_calls: vec![],
+                    reasoning: String::new(),
+                    truncated: false,
+                })
             }
         }
         let set = ProviderSet::new(Box::new(Fail), Some(Box::new(Ok_)));
         assert_eq!(set.complete(&[], &[]).await.unwrap().content, "fb");
+    }
+
+    /// Stops at max_tokens on the normal budget, answers on the bigger one.
+    struct Thinker {
+        budgets: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+    #[async_trait]
+    impl Provider for Thinker {
+        fn name(&self) -> &str {
+            "thinker"
+        }
+        async fn complete(&self, _: &[AiMessage], _: &[ToolDef]) -> Result<AiResult, AiError> {
+            self.budgets.lock().unwrap().push(400);
+            Ok(AiResult {
+                content: String::new(),
+                tool_calls: vec![],
+                reasoning: "hmm".repeat(500),
+                truncated: true,
+            })
+        }
+        async fn complete_with_budget(
+            &self,
+            _: &[AiMessage],
+            _: &[ToolDef],
+            n: u32,
+        ) -> Result<AiResult, AiError> {
+            self.budgets.lock().unwrap().push(n);
+            Ok(AiResult {
+                content: "Here is the list.".into(),
+                tool_calls: vec![],
+                reasoning: String::new(),
+                truncated: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_off_by_max_tokens_is_retried_once_with_more() {
+        let budgets = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let set = ProviderSet::new(Box::new(Thinker { budgets: budgets.clone() }), None).with_max_tokens(400);
+        let r = set.complete(&[AiMessage::user("list some tools")], &[]).await.unwrap();
+        assert_eq!(r.content, "Here is the list.");
+        assert_eq!(
+            *budgets.lock().unwrap(),
+            vec![400, RETRY_BUDGET_MIN],
+            "one normal call, one bigger retry"
+        );
+    }
+
+    #[test]
+    fn cut_off_is_detected_from_finish_reason_or_broken_arguments() {
+        let reply = |finish: &str, args: &str| {
+            json!({"choices": [{"finish_reason": finish, "message": {"content": "", "tool_calls": [
+                {"id": "a", "function": {"name": "tool_create", "arguments": args}}]}}]})
+        };
+        assert!(parse_openai(&reply("length", "{}")).unwrap().truncated);
+        // Measured: finish_reason said "tool_calls" while the arguments were
+        // cut mid-string at exactly max_tokens.
+        assert!(
+            parse_openai(&reply(
+                "tool_calls",
+                r##"{"name": "screenshot", "script": "#!/usr/bin/env bash\ngr"##
+            ))
+            .unwrap()
+            .truncated
+        );
+        assert!(!parse_openai(&reply("tool_calls", r#"{"name": "x"}"#)).unwrap().truncated);
+        assert!(!parse_openai(&reply("tool_calls", "")).unwrap().truncated);
+        assert!(parse_anthropic(&json!({"stop_reason": "max_tokens", "content": []})).unwrap().truncated);
     }
 
     #[test]

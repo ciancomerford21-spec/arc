@@ -223,6 +223,34 @@ impl Agent {
                     text: note,
                 });
             }
+            if r.tool_calls.is_empty() && r.content.trim().is_empty() {
+                // Nothing to say, even after the provider's bigger-budget
+                // retry. Silence reads as Arc having died -- the user asked
+                // "why is your reply empty?" -- and the model, asked why, made
+                // up a reason. Say what actually happened.
+                let why = if r.truncated {
+                    "I ran out of room thinking before I got to an answer. Ask again, or ask for something smaller."
+                } else {
+                    "I came back with nothing to say to that. Try asking again."
+                };
+                tracing::warn!(round, truncated = r.truncated, "model returned an empty reply");
+                return Ok(AgentReply::Answer { text: why.into(), actions });
+            }
+            if r.tool_calls.is_empty() && claims_confirmation(&r.content) {
+                // The model copied Arc's own confirmation prompt out of the
+                // conversation history. Measured live: "Now recreate
+                // screenshot tool" was answered "I need your confirmation to
+                // delete my script tool `screenshot`" with nothing held --
+                // the tool was already gone, so there was nothing the user
+                // could approve. Only a real hold may say this.
+                tracing::warn!(round, "model imitated a confirmation prompt with nothing held");
+                msgs.push(AiMessage::assistant(r.content.clone(), vec![]));
+                msgs.push(AiMessage::user(
+                    "[system] Nothing is waiting for confirmation, so do not ask for one. \
+                     Do what the user asked now by calling the right tool, or say plainly why you can't.",
+                ));
+                continue;
+            }
             if r.tool_calls.is_empty() {
                 // Reword only a real answer. Confirmation prompts are built
                 // below and spoken verbatim, and a failed round should not be
@@ -294,6 +322,15 @@ impl Agent {
     }
 }
 
+/// Text that asks the user to approve something. Only Arc's own gate may
+/// produce this; from the model it is an imitation of an earlier turn.
+fn claims_confirmation(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["need your confirmation", "confirm with: arc confirm", "needs your go-ahead", "need your go-ahead"]
+        .iter()
+        .any(|p| t.contains(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +360,7 @@ mod tests {
                     content: "loop".into(),
                     tool_calls: vec![call("x", "network_status")],
                     reasoning: String::new(),
+                    truncated: false,
                 })
             } else {
                 Ok(r.remove(0))
@@ -363,7 +401,12 @@ mod tests {
             "phraser"
         }
         async fn complete(&self, _: &[AiMessage], _: &[ToolDef]) -> Result<AiResult, AiError> {
-            Ok(AiResult { content: self.0.into(), tool_calls: vec![], reasoning: String::new() })
+            Ok(AiResult {
+                content: self.0.into(),
+                tool_calls: vec![],
+                reasoning: String::new(),
+                truncated: false,
+            })
         }
     }
 
@@ -387,6 +430,7 @@ mod tests {
                 content: "Volume has been set to 40 percent successfully.".into(),
                 tool_calls: vec![],
                 reasoning: String::new(),
+                truncated: false,
             }],
             4,
             Some(Box::new(Fixed("Set it to forty."))),
@@ -403,6 +447,7 @@ mod tests {
                 content: "Memory usage is at sixty two percent.".into(),
                 tool_calls: vec![],
                 reasoning: String::new(),
+                truncated: false,
             }],
             4,
             Some(Box::new(Broken)),
@@ -412,11 +457,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_reply_is_explained_not_spoken_as_silence() {
+        let empty =
+            |t| AiResult {
+                content: String::new(), tool_calls: vec![], reasoning: "…".into(), truncated: t
+            };
+        for (cut, want) in [(true, "ran out of room"), (false, "nothing to say")] {
+            // Two: the provider set retries a cut-off reply once with a
+            // bigger budget, and here that comes back empty too.
+            let (a, _) = agent(vec![empty(cut), empty(cut)], 4);
+            let AgentReply::Answer { text, .. } = a.ask(&[], "list some tools").await.unwrap() else {
+                panic!()
+            };
+            assert!(text.contains(want), "{text}");
+        }
+    }
+
+    /// The model copying Arc's own "I need your confirmation" line with
+    /// nothing held is sent back to act instead.
+    #[tokio::test]
+    async fn an_imitated_confirmation_prompt_is_not_passed_on() {
+        let fake = AiResult {
+            content: "I need your confirmation to delete my script tool `screenshot`.".into(),
+            tool_calls: vec![],
+            reasoning: String::new(),
+            truncated: false,
+        };
+        let real = AiResult {
+            content: "Made it.".into(),
+            tool_calls: vec![],
+            reasoning: String::new(),
+            truncated: false,
+        };
+        let (a, seen) = agent(vec![fake, real], 4);
+        let AgentReply::Answer { text, .. } = a.ask(&[], "recreate the screenshot tool").await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(text, "Made it.");
+        let last = seen.lock().unwrap().last().unwrap().last().unwrap().content.clone();
+        assert!(last.contains("Nothing is waiting for confirmation"), "{last}");
+    }
+
+    #[tokio::test]
     async fn short_replies_are_not_reworded() {
         // "Cancelled." and similar are built elsewhere or are error paths;
         // rewording them would be noise.
         let (a, _) = agent_with(
-            vec![AiResult { content: "Done.".into(), tool_calls: vec![], reasoning: String::new() }],
+            vec![AiResult {
+                content: "Done.".into(),
+                tool_calls: vec![],
+                reasoning: String::new(),
+                truncated: false,
+            }],
             4,
             Some(Box::new(Fixed("something else entirely"))),
         );
@@ -432,6 +525,7 @@ mod tests {
                 content: String::new(),
                 tool_calls: vec![call("c1", "reboot")],
                 reasoning: String::new(),
+                truncated: false,
             }],
             4,
             Some(Box::new(Fixed("Should I restart now?"))),
@@ -451,6 +545,7 @@ mod tests {
                 content: "A perfectly ordinary answer.".into(),
                 tool_calls: vec![],
                 reasoning: String::new(),
+                truncated: false,
             }],
             4,
         );
@@ -461,8 +556,15 @@ mod tests {
 
     #[tokio::test]
     async fn plain_answer() {
-        let (a, _) =
-            agent(vec![AiResult { content: "42".into(), tool_calls: vec![], reasoning: String::new() }], 4);
+        let (a, _) = agent(
+            vec![AiResult {
+                content: "42".into(),
+                tool_calls: vec![],
+                reasoning: String::new(),
+                truncated: false,
+            }],
+            4,
+        );
         let AgentReply::Answer { text, actions } = a.ask(&[], "meaning?").await.unwrap() else { panic!() };
         assert_eq!(text, "42");
         assert!(actions.is_empty());
@@ -476,8 +578,14 @@ mod tests {
                     content: String::new(),
                     tool_calls: vec![call("c1", "no_such_tool")],
                     reasoning: String::new(),
+                    truncated: false,
                 },
-                AiResult { content: "done".into(), tool_calls: vec![], reasoning: String::new() },
+                AiResult {
+                    content: "done".into(),
+                    tool_calls: vec![],
+                    reasoning: String::new(),
+                    truncated: false,
+                },
             ],
             4,
         );
@@ -496,6 +604,7 @@ mod tests {
                 content: String::new(),
                 tool_calls: vec![call("c1", "reboot"), call("c2", "shutdown")],
                 reasoning: String::new(),
+                truncated: false,
             }],
             4,
         );
@@ -526,6 +635,7 @@ mod tests {
             content: String::new(),
             tool_calls: vec![call("f", "no_such_tool")],
             reasoning: String::new(),
+            truncated: false,
         };
         let (a, seen) = agent(
             vec![
@@ -536,6 +646,7 @@ mod tests {
                     content: "That app isn't installed.".into(),
                     tool_calls: vec![],
                     reasoning: String::new(),
+                    truncated: false,
                 },
             ],
             8,
@@ -623,8 +734,14 @@ mod tests {
                     content: "checking".into(),
                     tool_calls: vec![call("c1", "network_status")],
                     reasoning: "user wants network".into(),
+                    truncated: false,
                 },
-                AiResult { content: "All good.".into(), tool_calls: vec![], reasoning: String::new() },
+                AiResult {
+                    content: "All good.".into(),
+                    tool_calls: vec![],
+                    reasoning: String::new(),
+                    truncated: false,
+                },
             ],
             4,
         );

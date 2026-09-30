@@ -1,6 +1,6 @@
 {
   "name": "play_youtube_music",
-  "description": "Play a song. Hands the request to the daemon, which resolves it with yt-dlp and plays it through the player it owns -- so the track shows in the Arc overlay with working pause, skip and queue controls. Falls back to opening the YouTube Music search results in the browser when nothing can play locally. Use when the user asks to play or hear a track.",
+  "description": "Play a song. Hands the request to the daemon, which resolves it and plays it through the player it owns, so pause, skip and the queue all work in the Arc overlay. Falls back to opening a YouTube Music search page. Use when asked to play or hear a track.",
   "params": {
     "query": "song or artist to play, e.g. \"Hall of Fame\""
   },

@@ -241,7 +241,10 @@ fn write_player_stub(dir: &Path, log: &Path) -> PathBuf {
         format!(
             r#"#!/usr/bin/env python3
 import json, os, socket, sys
-sock = sys.argv[sys.argv.index("--input-ipc-server") + 1]
+# Only the `=` form. Given the space form this mpv reads the path as a file
+# to play rather than as the option's value, so accepting it here would let the
+# suite pass on a spawn that can never work on the real binary.
+sock = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--input-ipc-server="))
 log = open({log:?}, "a", buffering=1)
 if os.path.exists(sock):
     os.remove(sock)

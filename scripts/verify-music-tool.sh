@@ -40,10 +40,11 @@ else
 fi
 # The point of the rewrite: the script must not start its own player. A second
 # mpv is the original bug -- nothing can pause, skip or queue what Arc does not
-# own.
-if grep -Eq "(^|[^a-z_])mpv|yt-dlp" "$TOOLS/play_youtube_music/run.sh" 2>/dev/null; then
+# own. Comments are stripped first, or the sentence explaining that the script
+# used to start mpv matches itself.
+if grep -vE '^\s*#' "$TOOLS/play_youtube_music/run.sh" | grep -Eq "mpv|yt-dlp"; then
   echo "FAIL: the installed script still starts a player of its own:"; fail=1
-  grep -nE "mpv|yt-dlp" "$TOOLS/play_youtube_music/run.sh"
+  grep -vE '^\s*#' "$TOOLS/play_youtube_music/run.sh" | grep -nE "mpv|yt-dlp"
 else
   echo "ok: the installed script starts no player of its own"
 fi

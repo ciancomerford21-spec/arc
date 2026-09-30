@@ -194,9 +194,13 @@ impl MpvPlayer {
                 // Start with nothing: the queue arrives through the socket, so
                 // a track can be queued without racing a process launch.
                 "--playlist=/dev/null",
-                "--input-ipc-server",
+                // The `=` form, in one argument, is required. Given
+                // `--input-ipc-server /path/sock`, this mpv does not read the
+                // path as the option's value: it treats the path as a file to
+                // play, exits 1, and never creates the socket. The test stub
+                // accepted the space form, so only real mpv ever showed it.
+                &format!("--input-ipc-server={}", self.sock.display()),
             ])
-            .arg(&self.sock)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -164,12 +164,23 @@ costs an extra round trip per reply for no measured gain.
 
 ### The `code` tool
 
-`[code] enabled = true` hands multi-step tasks to `hermes chat -q`, which
-acts on the machine itself: build a project, debug a failing build,
-investigate a codebase. It writes files and runs commands, so it is always
-`Dangerous` and always confirms. The task is passed via `--query-file` so the
-shell cannot reinterpret what the model wrote, and the task text is screened
-for destructive commands. `workspace` bounds where it may write.
+`[code] enabled = true` hands multi-step tasks to Hermes, which acts on the
+machine itself: build a project, debug a failing build, investigate a
+codebase. The task is passed via `--query-file` so the shell cannot
+reinterpret what the model wrote, and the task text is screened for
+destructive commands. `workspace` bounds where it may write. It is
+`Dangerous` by nature, so it cannot be lowered in the picker;
+`[code] confirm = false` removes the per-task prompt, leaving the screen as
+the gate.
+
+It runs as `hermes chat --format stream-json`, so Arc is not blind while it
+works. Every tool call comes back as an event and becomes a
+`CodeProgress` update: the app draws a live tail of Hermes' work, and Arc
+speaks up to three lines — only for tools where something was written or
+run, never two within 25s, and the first names the work. The generic "still
+working" headsup stands down while a code task is running, so one turn never
+speaks twice in a few seconds. The answer comes from the final `result`
+event, which also carries the session id, step count and duration.
 
 ### Tools Arc makes for itself
 

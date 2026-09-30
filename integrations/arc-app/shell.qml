@@ -157,17 +157,29 @@ ShellRoot {
       return u
     })
     tools = next
-    Quickshell.execDetached([arcCmd, "tool", name, level])
-    reloadTimer.restart()
+    classSetter.command = [arcCmd, "tool", name, level]
+    classSetter.running = true
   }
 
-  // Re-read the tool list once the write has had time to land. The daemon is
-  // the authority on what was actually stored.
-  Timer {
-    id: reloadTimer
-    interval: 350
-    onTriggered: { toolLoader.running = false; toolLoader.running = true; classBusy = "" }
+  // Runs the change, then reloads the list from the daemon, which is the
+  // authority on what was stored. A refusal (lowering a dangerous-by-nature
+  // tool) is shown in the header rather than just snapping the row back.
+  Process {
+    id: classSetter
+    stderr: StdioCollector { id: classErr }
+    onExited: function(code) {
+      if (code !== 0) {
+        var msg = classErr.text.replace(/^Error:\s*/, "").trim()
+        shell.classNote = "✗ " + (msg || ("arc tool exited " + code))
+        noteClear.restart()
+      } else {
+        noteClear.restart()
+      }
+      toolLoader.running = false; toolLoader.running = true
+      shell.classBusy = ""
+    }
   }
+  Timer { id: noteClear; interval: 6000; onTriggered: shell.classNote = "" }
 
   function decide(step, yes) {
     // `step` may be a stale copy; mark the live one.
@@ -331,19 +343,16 @@ ShellRoot {
                     spacing: 8
                     Text { text: modelData.name; color: c.text; font.family: c.mono; font.pixelSize: 13; font.bold: true }
                     Text { text: modelData.category; color: c.muted; font.family: c.mono; font.pixelSize: 10; anchors.baseline: parent.children[0].baseline }
-                    Item { width: 4; height: 1 }
-                    // The per-tool safety selector. Three cells rather than a
-                    // dropdown: the choice is three items wide, and seeing all
-                    // three at once is the point — a collapsed menu hides the
-                    // fact that "dangerous" is one click away.
-                    RiskPicker {
-                      tool: modelData.name
-                      current: modelData.risk
-                      builtin: modelData.default_risk
-                      reclassified: modelData.reclassified
-                      enabled: !modelData.enabled || shell.classBusy === ""
-                      onPicked: function(level) { shell.setClass(modelData.name, level) }
-                    }
+                  }
+                  // The per-tool safety selector, on its own line so it can
+                  // never be pushed past the row edge by a long tool name.
+                  RiskPicker {
+                    tool: modelData.name
+                    current: modelData.risk
+                    builtin: modelData.default_risk || modelData.risk
+                    reclassified: modelData.reclassified === true
+                    enabled: shell.classBusy === ""
+                    onPicked: function(level) { shell.setClass(modelData.name, level) }
                   }
                   Text {
                     width: parent.width
@@ -613,67 +622,63 @@ ShellRoot {
     id: picker
     property string tool: ""
     property string current: "safe"     // effective level (what the runtime uses)
-    property string builtin: "safe"     // level the tool declares
+    property string builtin: "safe"     // level the tool ships with
     property bool reclassified: false
     signal picked(string level)
-    spacing: 0
-
-    readonly property real cellW: 30
+    spacing: 4
+    // Dangerous-by-nature tools (reboot, shutdown, code) can be raised but
+    // never lowered -- the daemon refuses it -- so offering the lower cells
+    // would be offering a button that cannot work.
+    readonly property bool locked: builtin === "dangerous"
 
     Repeater {
-      model: shell.levels
+      model: picker.locked ? [] : shell.levels
       delegate: Rectangle {
         required property string modelData
         readonly property bool active: modelData === picker.current
-        readonly property bool isBuiltin: modelData === picker.builtin
-        width: picker.cellW
+        readonly property color tint: shell.riskColor(modelData)
+        width: lbl.implicitWidth + 16
         height: 20
-        radius: 2
-        color: active ? Qt.rgba(shell.riskColor(modelData).r, shell.riskColor(modelData).g, shell.riskColor(modelData).b, 0.22) : "transparent"
-        border.color: active ? shell.riskColor(modelData) : c.line
-        border.width: active ? 1.5 : 1
+        radius: 3
+        color: active ? Qt.rgba(tint.r, tint.g, tint.b, 0.2) : cellMa.containsMouse ? c.panelHi : "transparent"
+        border.color: active ? tint : cellMa.containsMouse ? Qt.rgba(tint.r, tint.g, tint.b, 0.6) : c.line
         opacity: picker.enabled ? 1 : 0.4
-
         Text {
+          id: lbl
           anchors.centerIn: parent
-          text: isBuiltin ? "•" : modelData === "dangerous" ? "!" : modelData === "caution" ? "~" : "·"
-          color: active ? shell.riskColor(modelData) : c.muted
-          font.family: c.mono; font.pixelSize: 12; font.bold: true
+          text: (modelData === "dangerous" ? "DANGER" : modelData.toUpperCase()) + (modelData === picker.builtin ? " ·" : "")
+          color: active ? tint : c.muted
+          font.family: c.mono; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1
         }
         MouseArea {
+          id: cellMa
           anchors.fill: parent
           hoverEnabled: true
           cursorShape: Qt.PointingHandCursor
-          onEntered: parent.opacity = 1
-          onExited: parent.opacity = picker.enabled ? 1 : 0.4
-          onClicked: {
-            // Clicking the level it is already at is not a no-op: it clears
-            // the override and puts the tool back to what the code says.
-            if (picker.current === modelData)
-              picker.picked("default")
-            else
-              picker.picked(modelData)
-          }
+          // Clicking the active cell clears an override.
+          onClicked: picker.picked(active && picker.reclassified ? "default" : modelData)
         }
       }
     }
-
-    // A reset button, only while something is actually overridden. Without it
-    // the way back to the built-in level is "click the current value", which
-    // is discoverable exactly once.
     Rectangle {
-      visible: picker.reclassified
+      visible: picker.locked
+      width: lockLbl.implicitWidth + 16; height: 20; radius: 3
+      color: "transparent"; border.color: c.red
+      Text {
+        id: lockLbl
+        anchors.centerIn: parent
+        text: "DANGER  ·  ALWAYS ASKS"
+        color: c.red; font.family: c.mono; font.pixelSize: 9; font.bold: true; font.letterSpacing: 1
+      }
+    }
+    Rectangle {
+      visible: picker.reclassified && !picker.locked
       width: visible ? 20 : 0
       height: 20
-      radius: 2
+      radius: 3
       color: resetMa.containsMouse ? c.panelHi : "transparent"
       border.color: c.line
-      Text {
-        anchors.centerIn: parent
-        text: "↺"
-        color: resetMa.containsMouse ? c.cyan : c.muted
-        font.family: c.mono; font.pixelSize: 12
-      }
+      Text { anchors.centerIn: parent; text: "↺"; color: resetMa.containsMouse ? c.cyan : c.muted; font.family: c.mono; font.pixelSize: 12 }
       MouseArea {
         id: resetMa
         anchors.fill: parent
@@ -683,6 +688,7 @@ ShellRoot {
       }
     }
   }
+
 
   component Button_: Rectangle {
     id: btn

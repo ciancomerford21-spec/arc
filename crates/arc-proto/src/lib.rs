@@ -656,10 +656,12 @@ mod tests {
                 .unwrap();
         assert!(matches!(m.request, Request::SetToolClass { level: None, .. }));
         // A level the UI should never send is a parse error, not a default.
-        assert!(serde_json::from_value::<ClientMessage>(
-            json!({"id":6,"type":"set_tool_class","tool":"reboot","level":"spicy"})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<ClientMessage>(
+                json!({"id":6,"type":"set_tool_class","tool":"reboot","level":"spicy"})
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -158,9 +158,25 @@ impl Gate {
         tool: &str,
         level: Option<RiskLevel>,
     ) -> Result<(RiskLevel, bool), String> {
-        if self.tools.by_name(tool).is_none() {
+        let Some(t) = self.tools.by_name(tool) else {
             return Err(format!("unknown tool `{tool}`"));
+        };
+        // A tool that is dangerous by nature (reboot, shutdown, the code
+        // agent) can be made stricter but not looser. Lowering it would only
+        // look like it worked: classify() keeps any call the tool itself rates
+        // dangerous at dangerous, so the picker would show "safe" on a tool
+        // that still prompts. Refuse, and say why.
+        if let Some(l) = level {
+            if t.base_risk() == RiskLevel::Dangerous && l < RiskLevel::Dangerous {
+                return Err(format!(
+                    "`{tool}` is dangerous by nature and cannot be lowered; it can only be reset to default"
+                ));
+            }
         }
+        // Choosing the level the tool already ships with is a reset, not an
+        // override: storing it would mark the row "reclassified" and pin the
+        // tool to today's level if a later version of Arc changes its default.
+        let level = level.filter(|&l| l != t.base_risk());
         // Persist first: a classification the daemon could not write is one
         // that would silently vanish on restart, and a setting that does not
         // survive a restart is worse than an error.
@@ -172,26 +188,34 @@ impl Gate {
     /// The risk the runtime will actually apply to a call, after the user's
     /// classification.
     ///
-    /// A `dangerous` classification forces a confirmation even if a policy
-    /// would have allowed the call, and a `safe` classification drops the
-    /// call below the confirmation threshold. What it never does is rescue a
-    /// blocked call or override a `deny` rule: those are the layers that exist
-    /// to survive a mistaken click.
+    /// A classification replaces the tool's *baseline*, never its judgement of
+    /// a particular call.
+    ///
+    /// Raising is unconditional: `dangerous` forces a confirmation even where
+    /// a policy would have allowed the call. Lowering only moves ordinary
+    /// calls. If the tool rates *this* call dangerous (`shell_exec` looking at
+    /// `rm -rf` or `systemctl poweroff`), it stays dangerous and still asks;
+    /// and a confirmation the tool or config demands (`confirm_unlisted`,
+    /// `code.confirm`) is kept. The first version replaced the per-call risk
+    /// outright, so marking `shell_exec` "caution" let `systemctl poweroff`
+    /// run unasked -- found by actually powering the machine off.
+    ///
+    /// Blocked calls and `deny` rules are handled before and after this and
+    /// are never affected by it.
     fn classify(&self, tool: &str, a: &Assessment) -> (RiskLevel, bool) {
         match self.classification(tool) {
             None => (a.risk, a.force_confirm),
             Some(RiskLevel::Dangerous) => (RiskLevel::Dangerous, true),
-            Some(RiskLevel::Caution) => (RiskLevel::Caution, false),
-            Some(RiskLevel::Safe) => (RiskLevel::Safe, false),
+            Some(_) if a.risk == RiskLevel::Dangerous => (RiskLevel::Dangerous, a.force_confirm),
+            Some(l) => (l, a.force_confirm),
         }
     }
 
     /// True when this call ran under a `caution` classification, which the
     /// UI reports as a warning.
     fn caution_notice(&self, tool: &str) -> Option<String> {
-        (self.classification(tool) == Some(RiskLevel::Caution)).then(|| {
-            format!("{tool} is classified as caution, so it ran without asking")
-        })
+        (self.classification(tool) == Some(RiskLevel::Caution))
+            .then(|| format!("{tool} is classified as caution, so it ran without asking"))
     }
 
     async fn execute(
@@ -497,8 +521,7 @@ mod tests {
         // Reclassify a *safe* tool as caution: it ran freely before and must
         // still run freely now, but carrying a warning.
         g.set_classification("probe.safe", Some(RiskLevel::Caution)).unwrap();
-        let Outcome::Done { risk, warning, .. } =
-            g.run("probe.safe", JsonMap::new(), Json::Null).await
+        let Outcome::Done { risk, warning, .. } = g.run("probe.safe", JsonMap::new(), Json::Null).await
         else {
             panic!("caution must not hold a call for confirmation")
         };
@@ -524,15 +547,117 @@ mod tests {
     /// `safe` is the other direction: the user trusts a tool the code calls
     /// dangerous, and it stops prompting.
     #[tokio::test]
-    async fn a_tool_switched_to_safe_stops_prompting() {
+    async fn a_dangerous_by_nature_tool_cannot_be_lowered() {
         let (g, _, danger) = gate(&Config::default());
-        assert_eq!(g.base_risk_of("probe.danger"), Some(RiskLevel::Dangerous));
-        g.set_classification("probe.danger", Some(RiskLevel::Safe)).unwrap();
-        let Outcome::Done { risk, .. } = g.run("probe.danger", JsonMap::new(), Json::Null).await else {
-            panic!("a safe tool must run without a prompt")
+        for l in [RiskLevel::Safe, RiskLevel::Caution] {
+            let e = g.set_classification("probe.danger", Some(l)).unwrap_err();
+            assert!(e.contains("cannot be lowered"), "{e}");
+        }
+        assert_eq!(g.classification("probe.danger"), None, "a refused change must not persist");
+        assert!(matches!(
+            g.run("probe.danger", JsonMap::new(), Json::Null).await,
+            Outcome::NeedsConfirmation(_)
+        ));
+        assert_eq!(danger.load(Ordering::SeqCst), 0);
+        // Raising it, or resetting it, is fine.
+        g.set_classification("probe.danger", Some(RiskLevel::Dangerous)).unwrap();
+        g.set_classification("probe.danger", None).unwrap();
+    }
+
+    /// Picking the built-in level clears the override instead of storing a
+    /// no-op one that would show as "reclassified".
+    #[tokio::test]
+    async fn choosing_the_built_in_level_is_a_reset() {
+        let (g, _, _) = gate(&Config::default());
+        g.set_classification("probe.safe", Some(RiskLevel::Caution)).unwrap();
+        let (_, overridden) = g.set_classification("probe.safe", Some(RiskLevel::Safe)).unwrap();
+        assert!(!overridden);
+        assert_eq!(g.classification("probe.safe"), None);
+        // Also true for a dangerous-by-nature tool: picking dangerous is fine.
+        assert!(!g.set_classification("probe.danger", Some(RiskLevel::Dangerous)).unwrap().1);
+    }
+
+    /// A tool whose risk depends on the call, like shell_exec.
+    struct Judging {
+        runs: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for Judging {
+        fn name(&self) -> &str {
+            "probe.judging"
+        }
+        fn description(&self) -> &str {
+            "test probe"
+        }
+        fn base_risk(&self) -> RiskLevel {
+            RiskLevel::Caution
+        }
+        fn assess(&self, args: &JsonMap) -> arc_tools::Assessment {
+            let bad = args.get("cmd").and_then(|v| v.as_str()) == Some("boom");
+            arc_tools::Assessment::new(if bad { RiskLevel::Dangerous } else { RiskLevel::Caution }, "probe")
+        }
+        async fn execute(&self, _: &JsonMap) -> ToolResult {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            ToolResult::Ok(Json::Null)
+        }
+    }
+
+    /// Lowering a tool quiets its ordinary calls and nothing else: a call the
+    /// tool itself rates dangerous still waits for the click.
+    #[tokio::test]
+    async fn lowering_a_tool_never_lowers_a_call_it_rates_dangerous() {
+        let mut cfg = Config::default();
+        cfg.permissions.confirm_at = RiskLevel::Caution;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut tools = Tools::new();
+        tools.register(Arc::new(Judging { runs: runs.clone() }));
+        let g = Gate::new(Arc::new(tools), &cfg);
+        let arg = |c: &str| {
+            let mut m = JsonMap::new();
+            m.insert("cmd".into(), Json::String(c.into()));
+            m
         };
-        assert_eq!(risk, RiskLevel::Safe);
-        assert_eq!(danger.load(Ordering::SeqCst), 1);
+        assert!(matches!(g.run("probe.judging", arg("ls"), Json::Null).await, Outcome::NeedsConfirmation(_)));
+        g.set_classification("probe.judging", Some(RiskLevel::Safe)).unwrap();
+        assert!(matches!(g.run("probe.judging", arg("ls"), Json::Null).await, Outcome::Done { .. }));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let Outcome::NeedsConfirmation(p) = g.run("probe.judging", arg("boom"), Json::Null).await else {
+            panic!("a call the tool rates dangerous must still be held")
+        };
+        assert_eq!(p.risk, RiskLevel::Dangerous);
+        assert_eq!(g.risk_of("probe.judging", &arg("boom")), Some(RiskLevel::Dangerous));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "nothing dangerous ran");
+        assert!(g.cancel(&p.confirmation_id));
+    }
+
+    /// The regression, against the real shell_exec: nothing here executes,
+    /// because every call must come back held or denied. If one does not,
+    /// the test fails before anything runs -- risk_of is checked first.
+    #[tokio::test]
+    async fn real_shell_keeps_destructive_commands_held_when_lowered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.permissions.shell.enabled = true;
+        let tools = Arc::new(Tools::build(&cfg, None, "https://x/?q={query}".into()).unwrap());
+        let g = Gate::with_classes(tools, &cfg, ClassifiedTools::load_from(dir.path().join("c.json")));
+        for level in [RiskLevel::Caution, RiskLevel::Safe] {
+            g.set_classification("shell_exec", Some(level)).unwrap();
+            for cmd in ["systemctl poweroff", "rm -rf /tmp/arc-test-never-exists", "reboot"] {
+                let mut a = JsonMap::new();
+                a.insert("command".into(), Json::String(cmd.into()));
+                assert_eq!(
+                    g.risk_of("shell_exec", &a),
+                    Some(RiskLevel::Dangerous),
+                    "`{cmd}` must stay dangerous with shell_exec marked {level}"
+                );
+                match g.run("shell_exec", a, Json::Null).await {
+                    Outcome::NeedsConfirmation(p) => assert!(g.cancel(&p.confirmation_id)),
+                    Outcome::Denied { .. } => {}
+                    Outcome::Done { .. } => panic!("`{cmd}` ran unasked with shell_exec marked {level}"),
+                }
+            }
+        }
     }
 
     /// The setting has to outlive the process, or the dropdown is decoration.
@@ -560,15 +685,16 @@ mod tests {
     /// Clearing the classification puts the tool back to what the code says.
     #[tokio::test]
     async fn clearing_a_classification_restores_the_built_in_level() {
-        let (g, _, _) = gate(&Config::default());
-        g.set_classification("probe.danger", Some(RiskLevel::Safe)).unwrap();
-        assert!(matches!(g.run("probe.danger", JsonMap::new(), Json::Null).await, Outcome::Done { .. }));
-        g.set_classification("probe.danger", None).unwrap();
-        assert_eq!(g.classification("probe.danger"), None);
+        let (g, safe, _) = gate(&Config::default());
+        g.set_classification("probe.safe", Some(RiskLevel::Dangerous)).unwrap();
         assert!(matches!(
-            g.run("probe.danger", JsonMap::new(), Json::Null).await,
+            g.run("probe.safe", JsonMap::new(), Json::Null).await,
             Outcome::NeedsConfirmation(_)
         ));
+        g.set_classification("probe.safe", None).unwrap();
+        assert_eq!(g.classification("probe.safe"), None);
+        assert!(matches!(g.run("probe.safe", JsonMap::new(), Json::Null).await, Outcome::Done { .. }));
+        assert_eq!(safe.load(Ordering::SeqCst), 1);
     }
 
     /// A classification is not a permission. `rm -rf /` is refused by the shell
@@ -601,11 +727,11 @@ mod tests {
     #[tokio::test]
     async fn a_deny_rule_outranks_a_safe_classification() {
         let mut cfg = Config::default();
-        cfg.permissions.tools.insert("probe.danger".into(), arc_config::ToolPolicy::Deny);
-        let (g, _, danger) = gate(&cfg);
-        g.set_classification("probe.danger", Some(RiskLevel::Safe)).unwrap();
-        assert!(matches!(g.run("probe.danger", JsonMap::new(), Json::Null).await, Outcome::Denied { .. }));
-        assert_eq!(danger.load(Ordering::SeqCst), 0);
+        cfg.permissions.tools.insert("probe.safe".into(), arc_config::ToolPolicy::Deny);
+        let (g, safe, _) = gate(&cfg);
+        g.set_classification("probe.safe", Some(RiskLevel::Safe)).unwrap();
+        assert!(matches!(g.run("probe.safe", JsonMap::new(), Json::Null).await, Outcome::Denied { .. }));
+        assert_eq!(safe.load(Ordering::SeqCst), 0);
     }
 
     /// One tool's classification must not leak into another's.
@@ -613,7 +739,10 @@ mod tests {
     async fn classifications_are_per_tool() {
         let (g, safe, danger) = gate(&Config::default());
         g.set_classification("probe.safe", Some(RiskLevel::Dangerous)).unwrap();
-        assert!(matches!(g.run("probe.safe", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)));
+        assert!(matches!(
+            g.run("probe.safe", JsonMap::new(), Json::Null).await,
+            Outcome::NeedsConfirmation(_)
+        ));
         assert_eq!(safe.load(Ordering::SeqCst), 0);
         assert!(
             matches!(g.run("probe.danger", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)),

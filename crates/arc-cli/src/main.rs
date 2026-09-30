@@ -278,7 +278,7 @@ fn main() -> Result<()> {
                     // and what they overrode: otherwise the list disagrees with
                     // the code and there is no way to tell why.
                     if x["reclassified"] == true {
-                        format!("  [was {}]", x["default_risk"].as_str().unwrap_or("?"))
+                        format!("  [built-in {}]", x["default_risk"].as_str().unwrap_or("?"))
                     } else {
                         String::new()
                     }
@@ -296,9 +296,7 @@ fn main() -> Result<()> {
                 "safe" | "caution" | "dangerous" => {
                     json!({"type": "set_tool_class", "tool": name, "level": level})
                 }
-                other => bail!(
-                    "unknown classification `{other}` (safe, caution, dangerous, default, show)"
-                ),
+                other => bail!("unknown classification `{other}` (safe, caution, dangerous, default, show)"),
             };
             let r = Conn::open(&sock, Some(Duration::from_secs(5)))?.call(body)?;
             if cli.json {
@@ -326,10 +324,7 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            println!(
-                "{name} is now {}.",
-                r["risk"].as_str().unwrap_or("unchanged")
-            );
+            println!("{name} is now {}.", r["risk"].as_str().unwrap_or("unchanged"));
         }
         Cmd::Voice { action, text } => {
             let command = match action.as_str() {

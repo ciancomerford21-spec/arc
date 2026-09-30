@@ -60,9 +60,9 @@ pub fn automations_file() -> PathBuf {
 /// argument waiting to happen. A separate JSON file is only ever written by
 /// Arc.
 pub fn tool_classes_file() -> PathBuf {
-    std::env::var_os("ARC_TOOL_CLASSES").map(PathBuf::from).unwrap_or_else(|| {
-        config_dir().join("tool_classes.json")
-    })
+    std::env::var_os("ARC_TOOL_CLASSES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_dir().join("tool_classes.json"))
 }
 
 pub fn models_dir() -> PathBuf {

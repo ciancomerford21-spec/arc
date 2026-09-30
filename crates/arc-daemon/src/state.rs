@@ -274,7 +274,11 @@ impl Daemon {
             .into_iter()
             .map(|s| {
                 let default_risk = g.base_risk_of(&s.name).unwrap_or(arc_proto::RiskLevel::Safe);
-                let risk = g.risk_of(&s.name, &Default::default()).unwrap_or(default_risk);
+                // The tool's level, not the risk of calling it with no
+                // arguments: shell_exec with no command is harmless, which is
+                // why the list used to call it "safe" while it asks before
+                // most real commands.
+                let risk = g.classification(&s.name).unwrap_or(default_risk);
                 let enabled = !g.is_disabled(&s.name);
                 arc_proto::ToolInfo {
                     category: s.name.split('_').next().unwrap_or("").into(),
@@ -301,10 +305,7 @@ impl Daemon {
         let g = self.assistant.gate();
         g.set_classification(tool, level)?;
         tracing::info!(tool, level = %level.map(|l| l.to_string()).unwrap_or_else(|| "default".into()), "classification changed");
-        self.tool_list()
-            .into_iter()
-            .find(|t| t.name == tool)
-            .ok_or_else(|| format!("unknown tool `{tool}`"))
+        self.tool_list().into_iter().find(|t| t.name == tool).ok_or_else(|| format!("unknown tool `{tool}`"))
     }
 
     pub async fn confirm(&self, id: &str, approve: bool) -> AskResult {

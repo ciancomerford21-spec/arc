@@ -11,10 +11,13 @@
 >   rewrites this on every click; rewriting a file the user may be editing in
 >   a text editor is how comments get lost. The daemon is the only writer and
 >   loads the file once at start, so a classification survives a restart.
-> * **Precedence.** A classification replaces the tool's *own* risk level and
->   is applied before the permission policy, so `dangerous` always prompts even
->   if a policy would have allowed the call. It is not a permission: a call the
->   tool blocks (e.g. `rm -rf /`) is still refused, and a `deny` rule or a
+> * **Precedence.** Raising is unconditional: `dangerous` always prompts, even
+>   where a policy would have allowed the call. Lowering only changes a tool's
+>   *baseline*. Any call the tool itself judges dangerous stays dangerous, so
+>   marking `shell_exec` safe quiets `ls` but `rm -rf ~/x` or
+>   `systemctl poweroff` still ask. Tools that are dangerous by nature
+>   (`reboot`, `shutdown`, `code`) cannot be lowered at all. A classification is
+>   not a permission: blocked calls stay refused, and a `deny` rule or a
 >   disabled tool still wins.
 > * **Reset.** Clicking the already-active cell, or the `↺` button that appears
 >   only while overridden, clears the override and restores the built-in level.

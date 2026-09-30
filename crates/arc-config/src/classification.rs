@@ -73,10 +73,7 @@ impl ToolClasses {
         match std::fs::read_to_string(path) {
             Ok(text) => match serde_json::from_str(&text) {
                 Ok(c) => (c, None),
-                Err(e) => (
-                    Self::default(),
-                    Some(format!("{}: {e} (ignored)", path.display())),
-                ),
+                Err(e) => (Self::default(), Some(format!("{}: {e} (ignored)", path.display()))),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
             Err(e) => (Self::default(), Some(format!("{}: {e} (ignored)", path.display()))),
@@ -159,8 +156,6 @@ impl ClassifiedTools {
         Ok(true)
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

@@ -845,9 +845,9 @@ ShellRoot {
       // ---------------------------------------------------- media page
       //
       // A page, not a section. This is where everything about the current
-      // song lives: the art, the bubble, the playhead, every control, the
-      // full queue, and the search that fills it. The chat page keeps only
-      // the compact chip, so a glance at it still says what is playing.
+      // song lives: the art, the playhead, every control, the full queue, and
+      // the search that fills it. The chat page keeps only the compact chip,
+      // so a glance at it still says what is playing.
       Item {
         id: musicPane
         Layout.fillWidth: true
@@ -870,27 +870,26 @@ ShellRoot {
           anchors.margins: 14
           spacing: 18
 
-          // --- the stage: cover art with the bubble moving over it
+          // --- the stage: cover art, sized to the art
           //
           // Fixed width rather than proportional, because the art is a square
           // and a square in a fluid column is either letterboxed or cropped.
-          // The bubble sits on top of it rather than beside it so the motion
-          // reads as coming out of the record.
+          //
+          // The art square does NOT stretch to fill the column's height. It
+          // used to, which put a small square in the middle of a tall empty
+          // box: the single biggest source of dead space on this page, and it
+          // read as a layout bug rather than as breathing room.
           ColumnLayout {
             Layout.preferredWidth: 232
-            Layout.fillHeight: true
+            Layout.alignment: Qt.AlignTop
             spacing: 10
 
-            Item {
+            Rectangle {
+              id: artFrame
               Layout.fillWidth: true
-              Layout.fillHeight: true
-              Layout.minimumHeight: 200
-
-              Rectangle {
-                id: artFrame
-                anchors.centerIn: parent
-                width: Math.min(parent.width, parent.height)
-                height: width
+              // Square, capped by the width. Bounded rather than fluid, so a
+              // tall window does not turn the artwork into a poster.
+              height: Math.min(width, 232)
                 radius: 6
                 color: Qt.rgba(c.text.r, c.text.g, c.text.b, 0.05)
                 border.color: c.line
@@ -920,22 +919,12 @@ ShellRoot {
                   color: Qt.rgba(c.chromeDim.r, c.chromeDim.g, c.chromeDim.b, 0.5)
                   font.pixelSize: 46
                 }
-              }
-
-              // The spectrum. Bar lengths are a function of the playhead, so
-              // it reads the track rather than animating on its own clock.
-              Visualiser_ {
-                id: visualiser
-                anchors.fill: parent
-                visible: shell.music !== null
-                progress: shell.musicProgress
-                playing: shell.musicNow.state === "playing"
-                paused: shell.musicNow.state === "paused"
-              }
             }
 
-            // The one-line identity under the art, so the art is never the
-            // only way to know what is playing.
+            // The identity under the art: the ONE place the current track is
+            // named. It used to be stated three times on this page -- here,
+            // and twice over in the right-hand column -- which is most of why
+            // the page read as clutter rather than as three distinct things.
             ColumnLayout {
               Layout.fillWidth: true
               spacing: 2
@@ -963,58 +952,19 @@ ShellRoot {
             Layout.fillHeight: true
             spacing: 10
 
-            // --- the current track, or the field that starts one
+            // The current track is NOT named here. It is named once, under the
+            // artwork on the left. This column already carries the seek bar,
+            // the transport and the queue, and it used to also repeat the title
+            // twice at two different font sizes -- three copies of one fact on
+            // one page is what made the layout feel loose and unfinished rather
+            // than spacious.
+            //
+            // The states that are NOT in the title still need saying, and they
+            // are the reason this row still exists.
             RowLayout {
               Layout.fillWidth: true
               spacing: 8
-              visible: shell.music !== null
-              Text {
-                Layout.fillWidth: true
-                text: String(shell.music ? shell.music.now.title : "")
-                color: c.text
-                font.family: c.mono; font.pixelSize: 12; font.bold: true
-                elide: Text.ElideRight
-              }
-              Text {
-                text: String(shell.music ? (shell.music.now.artist || "") : "")
-                visible: text.length > 0
-                color: c.muted
-                font.family: c.mono; font.pixelSize: 11
-                elide: Text.ElideRight
-                Layout.maximumWidth: 220
-              }
-              Text {
-                text: shell.musicNow.state === "paused" ? "PAUSED" : ""
-                visible: shell.musicNow.state === "paused"
-                color: c.amber
-                font.family: c.mono; font.pixelSize: 9; font.bold: true
-              }
-            }
-
-            // --- the current track, stated rather than illustrated
-            RowLayout {
-              Layout.fillWidth: true
-              spacing: 8
-              visible: shell.music !== null
-              Text {
-                text: "\u266b"
-                color: c.magenta; font.pixelSize: 15
-              }
-              Text {
-                Layout.fillWidth: true
-                text: String(shell.music ? shell.music.now.title : "")
-                color: c.text
-                font.family: c.mono; font.pixelSize: 15; font.bold: true
-                elide: Text.ElideRight
-              }
-              Text {
-                text: String(shell.music ? (shell.music.now.artist || "") : "")
-                visible: text.length > 0
-                color: c.muted
-                font.family: c.mono; font.pixelSize: 12
-                elide: Text.ElideRight
-                Layout.maximumWidth: 260
-              }
+              visible: shell.music !== null && (shell.musicNow.state === "paused" || !shell.music.controllable)
               Text {
                 text: shell.musicNow.state === "paused" ? "PAUSED" : ""
                 visible: shell.musicNow.state === "paused"
@@ -1027,6 +977,7 @@ ShellRoot {
                 color: c.amber
                 font.family: c.mono; font.pixelSize: 9; font.bold: true
               }
+              Item { Layout.fillWidth: true }
             }
 
             // --- progress. Hidden until the player knows how long the track
@@ -1729,186 +1680,6 @@ ShellRoot {
   // is the worst possible failure for this component, because a blank square
   // looks like a design choice. Rectangles are ~288 items at 60fps, which is
   // nothing, and they actually paint.
-  component Visualiser_: Item {
-    id: vis
-    property real progress: 0     // 0..1 through the track
-    property bool playing: false
-    property bool paused: false
-
-    // The centre never moves. Every dimension below is a fraction of this, so
-    // the burst scales with its box and stays put inside it.
-    readonly property real cx: width / 2
-    readonly property real cy: height / 2
-    readonly property real size: Math.min(width, height)
-    readonly property real hub: size * 0.10
-    readonly property real inner: size * 0.20
-    readonly property real outer: size * 0.46
-
-    readonly property int bars: 96
-    readonly property int rings: 3
-
-    // Band radii: three concentric bands between `inner` and `outer`.
-    readonly property var bandInner: [0, 1, 2].map(function (i) {
-      return inner + (outer - inner) * (i / rings)
-    })
-    readonly property var bandLen: [0, 1, 2].map(function (i) {
-      return (outer - inner) / rings
-    })
-
-    // Bar length at one angle, -1..1.
-    //
-    // Summed sines over (angle, ring) rather than per-bar noise, so adjacent
-    // bars agree and the result has the lobed structure of a real spectrum
-    // instead of looking like static. The ring term offsets the bands so they
-    // are not three copies of one silhouette.
-    //
-    // Coprime lobe counts and differing phase rates are load-bearing. Two terms
-    // at the same rate hold their relationship for the whole track, which reads
-    // as one shape pulsing rather than a spectrum changing -- measured at
-    // "bars barely move" before this was fixed.
-    function spectrumAt(angle, ring) {
-      var t = vis.progress
-      return Math.sin(angle * 2 + t * Math.PI * 2 + ring * 0.9) * 0.42
-           + Math.sin(angle * 3 - t * Math.PI * 3.7 + ring * 1.7) * 0.30
-           + Math.sin(angle * 5 + t * Math.PI * 5.3 + ring * 2.3) * 0.18
-           + Math.sin(angle * 7 - t * Math.PI * 8.9 + ring * 3.1) * 0.10
-    }
-
-    // Bar length as a fraction of its band, 0.12..1.
-    //
-    // The 2.2 power expands the middle of the range. A linear map leaves most
-    // bars within a few percent of the mean, which reads as a static ring even
-    // though every bar technically changed. The floor of 0.12 stops any bar
-    // collapsing to nothing: a spectrum with gaps in it looks broken, not quiet.
-    function levelAt(angle, ring) {
-      var l = 0.12 + 0.88 * Math.pow(vis.spectrumAt(angle, ring) * 0.5 + 0.5, 2.2)
-      return vis.paused ? 0.12 + 0.88 * 0.35 * l : l
-    }
-
-    // Cool at the hub, hot at the rim: brightness grows outward so the edge of
-    // the burst is the hottest part of it.
-    function rampAt(depth) {
-      var u = Math.max(0, Math.min(1, (depth - 0.4) / 0.6))
-      if (vis.paused) return Qt.rgba(c.chromeDim.r, c.chromeDim.g, c.chromeDim.b, 0.5)
-      if (depth < 0.4)
-        return Qt.rgba(0.59, 0.75, 1.0, 0.55 + 0.35 * (depth / 0.4))
-      return Qt.rgba(0.78 + 0.22 * u, 0.51 - 0.26 * u, 0.90 - 0.29 * u, 0.55 + 0.40 * u)
-    }
-
-    // --- the bars
-    //
-    // One Repeater over bars * rings rather than a Repeater per ring, so the
-    // whole spectrum is a single flat list: `index` divides into band and
-    // spoke, and the binding engine sees one model rather than three nested
-    // ones.
-    Repeater {
-      model: vis.bars * vis.rings
-      // A wrapper Item positioned AT the centre with its origin at its own
-      // top-left, so rotating it pivots about the centre. The bar inside then
-      // hangs off the top edge, extending outward along -y.
-      //
-      // Both halves of this are load-bearing, and both were wrong first:
-      //
-      //  - Rotating the bar directly pivots about the *bar's* origin, not the
-      //    centre, so each bar swings in place and all 96 stack at 12 o'clock.
-      //    That is what the first screenshot showed: one vertical chain of bars
-      //    at the top of an otherwise empty ring.
-      //  - Anchoring the bar's own inner end at r0 fails the same way by
-      //    another route -- every inner end lands on the same point, so there
-      //    is nothing for the rotation to sweep.
-      //
-      // A Rectangle, not an Item: the bar needs `color`, and an Item silently
-      // drops the assignment, leaving nothing drawn but a load-time warning.
-      delegate: Item {
-        id: sp
-        required property int index
-        readonly property int ring: Math.floor(index / vis.bars)
-        readonly property int spoke: index % vis.bars
-        readonly property real a: (spoke / vis.bars) * Math.PI * 2
-        readonly property real bandLen: vis.bandLen[ring]
-        // Inset from the band edge so a bar never bleeds into the next band.
-        readonly property real r0: vis.bandInner[ring] + bandLen * 0.06
-        // Animated so the spectrum moves smoothly between 1 Hz playhead
-        // updates rather than stepping. The duration is shorter than the poll
-        // interval on purpose: a bar should finish its move well before the
-        // next one starts, or the animation lags the playhead visibly.
-        readonly property real length:
-          r0 + (bandLen * 0.94) * vis.levelAt(a, ring)
-
-        width: 0
-        height: 0
-        x: vis.cx
-        y: vis.cy
-        transformOrigin: Item.TopLeft
-        rotation: sp.a * 180 / Math.PI
-
-        Rectangle {
-          // -length to -r0, so the bar spans radii r0..length and grows
-          // outward from the centre.
-          x: -width / 2
-          y: -sp.length
-          width: vis.size * 0.02
-          height: Math.max(1, sp.length - sp.r0)
-          color: vis.rampAt((sp.ring + vis.levelAt(sp.a, sp.ring)) / (vis.rings + 1))
-          Behavior on height {
-            NumberAnimation { duration: 220; easing.type: Easing.OutQuad }
-          }
-          Behavior on color {
-            ColorAnimation { duration: 220 }
-          }
-        }
-      }
-    }
-
-    // --- the resting rim and band guides
-    //
-    // The continuous ring at the outer edge is the fixed silhouette: every bar
-    // moves, and this does not, so the burst reads as one object rather than a
-    // cloud of loose spokes.
-    Repeater {
-      model: vis.rings + 1
-      delegate: Rectangle {
-        required property int index
-        // The outermost ring is the rim and is drawn brighter and thicker; the
-        // inner ones are faint guides, structure the bars are built on.
-        readonly property real r: vis.inner + (vis.outer - vis.inner) * (index / vis.rings)
-        readonly property bool isRim: index === vis.rings
-        width: r * 2
-        height: r * 2
-        x: vis.cx - r
-        y: vis.cy - r
-        radius: r
-        color: "transparent"
-        border.width: isRim ? Math.max(1.5, vis.size * 0.016) : 1
-        border.color: isRim
-          ? Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, vis.paused ? 0.45 : 0.9)
-          : Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.16)
-      }
-    }
-
-    // --- the hub
-    //
-    // A solid core with a halo, so the burst has a centre of gravity. Without
-    // one the spokes read as floating debris.
-    Rectangle {
-      width: vis.hub * 2
-      height: vis.hub * 2
-      x: vis.cx - vis.hub
-      y: vis.cy - vis.hub
-      radius: vis.hub
-      color: Qt.rgba(0.98, 0.94, 1.0, vis.paused ? 0.4 : 0.95)
-    }
-    Rectangle {
-      width: vis.hub * 3.2
-      height: vis.hub * 3.2
-      x: vis.cx - vis.hub * 1.6
-      y: vis.cy - vis.hub * 1.6
-      radius: vis.hub * 1.6
-      color: "transparent"
-      border.width: 1
-      border.color: Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, 0.35)
-    }
-  }
   component Pane_: Rectangle {
     id: pane
     property string title: ""

@@ -232,10 +232,36 @@ ShellRoot {
   property int selected: -1          // index into turns; -1 = follow latest
   property int rev: 0                // bump to refresh bindings on mutation
   property string toolFilter: ""
-  // The track the daemon says is playing, or null. Fed by `now_playing` events
-  // and read once on start, so a track that was already playing when the app
-  // opened shows up without waiting for the next request.
-  property var nowPlaying: null
+  // The music section's state, exactly as the daemon reports it: the current
+  // track, what is queued behind it, and whether Arc is the one playing it.
+  // Null when nothing is playing -- the section then collapses to a search box
+  // rather than disappearing, because an empty queue is where you add to it.
+  property var music: null
+  // Playhead, in seconds. Polled rather than evented: it is the only part of
+  // the status that changes on its own every second, and an event per second
+  // would repaint the whole app for a progress bar that can tick locally.
+  property real position: 0
+  property real duration: 0
+  // True once the section has been expanded by the user. The position poll
+  // only runs while it is open -- a widget nobody is looking at should not
+  // spawn a process every second.
+  property bool musicOpen: false
+  // A command that is in flight, so the buttons can ignore a second click
+  // rather than queueing two skips.
+  property string musicBusy: ""
+  // The daemon's refusal of the last action, shown next to the buttons.
+  property string musicNote: ""
+
+  // `music.now` reached through one accessor. The panes read it in bindings
+  // that also run while the section is collapsed and nothing is playing, and
+  // `music.now.state` on a null music is a TypeError that blanks the window
+  // rather than failing one row.
+  readonly property var musicNow: (music && music.now) ? music.now : { state: "stopped", title: "", artist: "" }
+  // Same for the queue. Reading `music.queue` in a binding that also runs
+  // while nothing is playing throws "Cannot read property 'queue' of null" --
+  // and a binding that throws is a binding the engine keeps re-evaluating, so
+  // it spams the log once a second rather than failing once.
+  readonly property var musicQueue: (music && music.queue) ? music.queue : []
 
   readonly property int shownIndex: selected >= 0 && selected < turns.length ? selected : turns.length - 1
   readonly property var shownTurn: { rev; return shownIndex >= 0 ? turns[shownIndex] : null }
@@ -272,11 +298,11 @@ ShellRoot {
     // Not a turn event: the music strip is independent of any request, so it
     // is handled before the "which turn does this belong to" logic below --
     // a track starting playback must not conjure an empty turn.
-    if (e === "now_playing") {
-      var n = v.status || {}
-      // `playing` comes from the daemon rather than being re-derived here, so
-      // a stopped report with a stale title still clears the strip.
-      nowPlaying = (n.playing === true) ? n : null
+    if (e === "music") {
+      // The daemon sends the whole status, including whether anything is
+      // playing, so this never re-derives it -- a stopped status with a stale
+      // title still clears the section.
+      applyMusic(v.status || {})
       return
     }
     var t = current()
@@ -391,30 +417,120 @@ ShellRoot {
   }
 
   // ------------------------------------------------------------ processes
-  // Read what is playing once at start and on every reconnect. Without this
-  // the strip only appears when a track is requested after the app opened --
-  // which is exactly the case the user is not looking at.
+  // Adopt a status from the daemon.
+  function applyMusic(s) {
+    var now = s.now || {}
+    music = (now.playing === true) ? s : null
+    // Position is not in the event: it is polled. Keeping the last known value
+    // means the bar does not jump back to zero on every track change.
+    duration = Number(s.duration || 0)
+  }
+
+  // Read the whole status at start and on every reconnect, so a track already
+  // playing when the app opened shows up without waiting for the next change.
   Process {
     id: musicLoader
-    command: [shell.arcCmd, "--json", "now-playing", "show"]
+    command: [shell.arcCmd, "--json", "music", "show"]
     running: true
     stdout: StdioCollector {
       onStreamFinished: {
-        try {
-          var n = JSON.parse(text)
-          shell.nowPlaying = (n && n.playing === true) ? n : null
-        } catch (e) {}
+        try { shell.applyMusic(JSON.parse(text)) } catch (e) {}
       }
     }
   }
 
-  function stopPlayback() {
-    // Optimistic, then the daemon's own event confirms it: an IPC round trip
-    // is fast but not instant, and a strip that lingers a beat after a stop
-    // click looks broken.
-    nowPlaying = null
-    Quickshell.execDetached([arcCmd, "now-playing", "stop"])
+  // Poll the playhead, but only while the section is open and something is
+  // playing. Otherwise there is nothing to animate and nothing to ask.
+  Process {
+    id: positionLoader
+    command: [shell.arcCmd, "--json", "music", "position"]
+    running: shell.musicOpen && shell.music !== null && shell.positionTick
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var p = JSON.parse(text)
+          shell.position = Number(p.position || 0)
+          if (p.duration) shell.duration = Number(p.duration)
+        } catch (e) {}
+      }
+    }
   }
+  // The tick is a separate property from `running` so the one-second Timer can
+  // re-arm the poll by flipping it: a Process that is already running does not
+  // restart when its command is unchanged.
+  property bool positionTick: true
+  Timer {
+    id: positionPulse
+    interval: 1000
+    repeat: true
+    running: shell.musicOpen && shell.music !== null
+    onTriggered: { shell.positionTick = false; shell.positionTick = true }
+  }
+
+  // One transport action. `musicCmd` is set and re-armed so repeated clicks
+  // restart the process rather than being ignored -- skipping three times has
+  // to move three tracks.
+  property var musicCmd: []
+  Process {
+    id: musicAction
+    command: shell.musicCmd
+    running: shell.musicCmd.length > 0
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var r = JSON.parse(text)
+          if (r && r.now) shell.applyMusic(r)
+        } catch (e) {}
+      }
+    }
+    stderr: StdioCollector { id: musicErr }
+    onExited: function(code) {
+      if (code !== 0) {
+        var m = String(musicErr.text).replace(/^Error:\s*/, "").trim()
+        // A refusal is worth showing: "nothing is queued after this track" is
+        // the difference between a button that is broken and one that was
+        // pressed at a moment when it had nothing to do.
+        shell.musicNote = m || ("arc music exited " + code)
+        noteClear.restart()
+      } else {
+        shell.musicNote = ""
+      }
+      shell.musicCmd = []
+      shell.musicBusy = ""
+    }
+  }
+
+  function musicAction_(args) {
+    if (musicBusy) return
+    musicBusy = args[0]
+    musicCmd = [arcCmd, "music"].concat(args)
+  }
+
+  function musicAdd(query) {
+    var q = String(query || "").trim()
+    if (!q.length) return
+    musicOpen = true
+    musicAction_(["enqueue", q])
+  }
+
+  function musicClearQueue() { musicAction_(["clear"]) }
+  function musicToggle() { musicAction_(["toggle"]) }
+  function musicNext() { musicAction_(["next"]) }
+  function musicPrev() { musicAction_(["previous"]) }
+  function musicStop() { musicAction_(["stop"]) }
+  function musicRemove(i) { musicAction_(["remove", String(i)]) }
+
+  // Seconds as m:ss, for the progress bar. A negative or absent position
+  // would render as "-1:-3" otherwise.
+  function mmss(v) {
+    var s = Math.max(0, Math.floor(Number(v) || 0))
+    return Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2)
+  }
+
+  // How far through the track we are, 0..1. Clamped because a live position
+  // can briefly exceed the duration while a new file is being opened, and a
+  // bar that overflows its track is a bug that looks like a design choice.
+  readonly property real musicProgress: duration > 0 ? Math.min(1, Math.max(0, position / duration)) : 0
 
   Process {
     id: watcher
@@ -570,66 +686,330 @@ ShellRoot {
         Tag { visible: shell.classNote !== ""; label: shell.classNote; tint: c.amber }
         Tag { label: shell.turns.length + " TURNS"; tint: c.chromeDim }
 
-        // What's playing. In the header rather than a pane of its own: it is
-        // a one-line fact about the machine right now, not part of any turn,
-        // and it is the one thing on screen that stays true between requests.
-        // Capped in width so a long title cannot squeeze the tags out.
+        // The music section's compact form: just the track, so a glance at the
+        // header still tells you what is playing. Everything else -- transport,
+        // progress, the queue -- lives in the MUSIC pane, which this opens.
         Rectangle {
-          id: music
-          visible: shell.nowPlaying !== null
-          Layout.preferredWidth: Math.min(musicRow.implicitWidth + 34, Math.max(200, win.width * 0.34))
+          id: musicChip
+          visible: shell.music !== null
+          Layout.preferredWidth: Math.min(chipRow.implicitWidth + 34, Math.max(200, win.width * 0.34))
           Layout.minimumWidth: 120
           height: 24
           radius: 3
-          color: Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, 0.14)
+          color: chipMa.containsMouse
+            ? Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, 0.24)
+            : Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, 0.14)
           border.color: c.magenta
+          MouseArea {
+            id: chipMa
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: { shell.musicOpen = true }
+          }
           RowLayout {
-            id: musicRow
+            id: chipRow
             anchors.left: parent.left
             anchors.leftMargin: 10
             anchors.verticalCenter: parent.verticalCenter
             anchors.right: parent.right
             anchors.rightMargin: 10
             spacing: 6
-            Text { text: "♪"; color: c.magenta; font.pixelSize: 12 }
+            Text { text: "♫"; color: c.magenta; font.pixelSize: 12 }
             // Title and artist as separate items rather than the daemon's
             // combined label, so a long title elides and the artist survives.
             Text {
-              text: String(shell.nowPlaying ? shell.nowPlaying.title : "")
+              text: String(shell.music ? shell.music.now.title : "")
               color: c.text
               font.family: c.mono; font.pixelSize: 11; font.bold: true
               elide: Text.ElideRight
               Layout.maximumWidth: 260
             }
             Text {
-              text: String(shell.nowPlaying ? (shell.nowPlaying.artist || "") : "")
+              text: String(shell.music ? (shell.music.now.artist || "") : "")
               visible: text.length > 0
               color: c.muted
               font.family: c.mono; font.pixelSize: 11
               elide: Text.ElideRight
               Layout.maximumWidth: 200
             }
-            MouseArea {
-              id: stopMa
-              Layout.preferredWidth: 16
-              Layout.preferredHeight: 16
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              Text {
-                anchors.centerIn: parent
-                text: "✕"
-                color: stopMa.containsMouse ? c.red : c.muted
-                font.pixelSize: 10
-              }
-              // Clears the overlay's row. It does not kill the player -- that
-              // is the music tool's business, and killing another process from
-              // a UI click is not something to do by accident.
-              onClicked: shell.stopPlayback()
+            // A paused track says so here rather than looking identical to a
+            // playing one -- the glyph alone is ambiguous at 11px.
+            Text {
+              visible: shell.music && shell.music.now.state === "paused"
+              text: "PAUSED"
+              color: c.amber
+              font.family: c.mono; font.pixelSize: 9; font.bold: true
+            }
+            // How much is queued, which is the only number worth stealing
+            // header space for.
+            Text {
+              visible: shell.musicQueue.length > 0
+              text: "+" + shell.musicQueue.length
+              color: c.magenta
+              font.family: c.mono; font.pixelSize: 10
             }
           }
         }
       }
       Rectangle { Layout.fillWidth: true; height: 1; color: c.chrome; opacity: 0.35 }
+
+      // ---------------------------------------------------- music
+      //
+      // A section of its own rather than more header: pause, skip and the
+      // queue are controls with state, and a header chip is the wrong shape
+      // for a queue you can add to and remove from.
+      //
+      // Collapsed it is a single line -- an add-to-queue field and a
+      // disclosure. Expanded it takes the current track, a progress bar, the
+      // transport and the list of what is coming.
+      Rectangle {
+        id: musicPane
+        Layout.fillWidth: true
+        implicitHeight: musicBody.implicitHeight + 20
+        radius: 6
+        color: Qt.rgba(c.panel.r, c.panel.g, c.panel.b, 0.94)
+        border.color: shell.music !== null ? c.magenta : c.line
+        visible: shell.music !== null || shell.musicOpen
+
+        RowLayout {
+          id: musicBody
+          x: 14
+          y: 10
+          width: parent.width - 28
+          spacing: 12
+
+          Text {
+            text: "\u266b"
+            color: shell.music !== null ? c.magenta : c.chromeDim
+            font.pixelSize: 15
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          ColumnLayout {
+            Layout.fillWidth: true
+            spacing: 8
+
+            // --- the current track, or the field that starts one
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: 8
+              visible: shell.music !== null
+              Text {
+                Layout.fillWidth: true
+                text: String(shell.music ? shell.music.now.title : "")
+                color: c.text
+                font.family: c.mono; font.pixelSize: 12; font.bold: true
+                elide: Text.ElideRight
+              }
+              Text {
+                text: String(shell.music ? (shell.music.now.artist || "") : "")
+                visible: text.length > 0
+                color: c.muted
+                font.family: c.mono; font.pixelSize: 11
+                elide: Text.ElideRight
+                Layout.maximumWidth: 220
+              }
+              Text {
+                text: shell.musicNow.state === "paused" ? "PAUSED" : ""
+                visible: shell.musicNow.state === "paused"
+                color: c.amber
+                font.family: c.mono; font.pixelSize: 9; font.bold: true
+              }
+            }
+
+            // --- progress. Hidden until the player knows how long the track
+            // is: a bar that fills from 0 to 0 forever reads as broken.
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: 8
+              visible: shell.music !== null && shell.duration > 0
+              Text {
+                text: shell.mmss(shell.position)
+                color: c.muted; font.family: c.mono; font.pixelSize: 10
+              }
+              Rectangle {
+                Layout.fillWidth: true
+                height: 4
+                radius: 2
+                color: Qt.rgba(c.text.r, c.text.g, c.text.b, 0.12)
+                Rectangle {
+                  width: Math.max(0, parent.width * shell.musicProgress)
+                  height: parent.height
+                  radius: 2
+                  color: shell.musicNow.state === "paused" ? c.amber : c.magenta
+                }
+              }
+              Text {
+                text: shell.mmss(shell.duration)
+                color: c.muted; font.family: c.mono; font.pixelSize: 10
+              }
+            }
+
+            // --- transport
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: 6
+              visible: shell.music !== null
+              enabled: shell.music !== null && shell.music.controllable
+              Transport_ {
+                glyph: "\u23ee"; tip: "previous track"
+                onClicked: shell.musicPrev()
+              }
+              Transport_ {
+                glyph: shell.musicNow.state === "paused" ? "\u25b6" : "\u23f8"
+                tip: shell.musicNow.state === "paused" ? "resume" : "pause"
+                active: shell.musicNow.state === "paused"
+                onClicked: shell.musicToggle()
+              }
+              Transport_ {
+                glyph: "\u23ed"; tip: "next track"
+                enabled: shell.musicQueue.length > 0
+                onClicked: shell.musicNext()
+              }
+              Transport_ { glyph: "\u2715"; tip: "stop"; tint: c.red; onClicked: shell.musicStop() }
+              Item { Layout.fillWidth: true }
+              // The refusal, not a silent no-op. It has to be visible here:
+              // these buttons do nothing when there is nothing queued, and a
+              // button that silently does nothing is indistinguishable from a
+              // broken one.
+              Text {
+                Layout.maximumWidth: Math.max(160, win.width * 0.3)
+                visible: shell.musicNote !== ""
+                text: shell.musicNote
+                color: c.amber
+                font.family: c.mono; font.pixelSize: 10
+                elide: Text.ElideRight
+              }
+              Button_ {
+                label: "CLEAR QUEUE"
+                visible: shell.musicQueue.length > 0
+                onClicked: shell.musicClearQueue()
+              }
+            }
+
+            // --- what is coming
+            ListView {
+              id: queueList
+              Layout.fillWidth: true
+              Layout.preferredHeight: Math.min(visibleCount, 5) * 24 + (visibleCount > 0 ? 6 : 0)
+              visible: count > 0
+              clip: true
+              spacing: 2
+              model: shell.musicQueue
+              ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+              readonly property int visibleCount: Math.min(count, 5)
+              delegate: Rectangle {
+                required property int index
+                required property var modelData
+                width: queueList.width - 6
+                height: 22
+                radius: 3
+                color: rowMa.containsMouse ? c.panelHi : "transparent"
+                MouseArea {
+                  id: rowMa
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  onClicked: shell.musicRemove(index)
+                }
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: 8
+                  anchors.rightMargin: 6
+                  spacing: 8
+                  Text {
+                    text: String(index + 1) + "."
+                    color: c.chromeDim
+                    font.family: c.mono; font.pixelSize: 10
+                  }
+                  Text {
+                    Layout.fillWidth: true
+                    text: String(modelData.title || "")
+                    color: c.muted
+                    font.family: c.mono; font.pixelSize: 11
+                    elide: Text.ElideRight
+                  }
+                  Text {
+                    Layout.maximumWidth: 180
+                    text: String(modelData.artist || "")
+                    visible: text.length > 0
+                    color: c.chromeDim
+                    font.family: c.mono; font.pixelSize: 10
+                    elide: Text.ElideRight
+                  }
+                  // Remove is a click on the row, and says so on hover --
+                  // clicking a row to delete something is not a safe default
+                  // to leave unannounced.
+                  Text {
+                    text: "\u2715"
+                    color: rowMa.containsMouse ? c.red : c.chromeDim
+                    font.pixelSize: 10
+                  }
+                }
+              }
+            }
+          }
+
+          // --- add to the queue
+          ColumnLayout {
+            Layout.preferredWidth: Math.max(260, win.width * 0.22)
+            spacing: 6
+            Field {
+              id: musicQuery
+              Layout.fillWidth: true
+              placeholder: "add to the queue \u2014 artist, track, anything"
+              onAccepted: function(t) { shell.musicAdd(t); clear() }
+            }
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: 6
+              Button_ {
+                label: "ADD"
+                onClicked: { shell.musicAdd(musicQuery.value); musicQuery.clear() }
+              }
+              Button_ {
+                label: "PLAY NOW"
+                onClicked: {
+                  var q = musicQuery.value.trim()
+                  if (!q.length) return
+                  // Play replaces the queue; enqueue does not. Both are here
+                  // because they are different intentions and guessing is how
+                  // you lose a queue.
+                  shell.musicAction_(["play", q])
+                  musicQuery.clear()
+                }
+              }
+              Item { Layout.fillWidth: true }
+              Text {
+                text: "queue \u00b7 " + shell.musicQueue.length
+                visible: shell.music !== null
+                color: c.chromeDim
+                font.family: c.mono; font.pixelSize: 10
+              }
+            }
+          }
+        }
+
+        // Collapse control, in the corner of the section. Closing it does not
+        // stop the music -- it only stops drawing it and stops the playhead
+        // poll, which is the whole reason the poll is gated on this.
+        MouseArea {
+          id: collapseMa
+          anchors.right: parent.right
+          anchors.top: parent.top
+          width: 22
+          height: 22
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: { shell.musicOpen = false }
+          Text {
+            anchors.centerIn: parent
+            text: "\u2301"
+            color: collapseMa.containsMouse ? c.text : c.chromeDim
+            font.pixelSize: 12
+          }
+        }
+      }
 
       // ---------------------------------------------------- panes
       RowLayout {
@@ -1059,6 +1439,58 @@ ShellRoot {
     border.color: tint
     Text { id: bl; anchors.centerIn: parent; text: btn.label; color: btn.tint; font.family: c.mono; font.pixelSize: 12; font.bold: true; font.letterSpacing: 2 }
     MouseArea { id: bma; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: btn.clicked() }
+  }
+
+  // A transport button: a glyph, a colour, a tooltip on hover. Sized square so
+  // the row of them lines up without each one measuring its own label.
+  component Transport_: Rectangle {
+    id: btn
+    property string glyph: ""
+    property string tip: ""
+    property color tint: c.chrome
+    property bool active: false
+    signal clicked()
+    implicitWidth: 28
+    implicitHeight: 24
+    radius: 3
+    color: active
+      ? Qt.rgba(tint.r, tint.g, tint.b, 0.22)
+      : bma.containsMouse ? c.panelHi : "transparent"
+    border.color: active ? tint : bma.containsMouse ? Qt.rgba(tint.r, tint.g, tint.b, 0.6) : c.line
+    opacity: enabled ? 1 : 0.35
+    Text {
+      anchors.centerIn: parent
+      text: btn.glyph
+      color: btn.active ? btn.tint : bma.containsMouse ? c.text : c.muted
+      font.pixelSize: 12
+    }
+    MouseArea {
+      id: bma
+      anchors.fill: parent
+      hoverEnabled: true
+      enabled: btn.enabled
+      cursorShape: Qt.PointingHandCursor
+      onClicked: btn.clicked()
+    }
+    Rectangle {
+      visible: bma.containsMouse && btn.tip.length > 0
+      anchors.bottom: parent.bottom
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.bottomMargin: 30
+      width: tipText.implicitWidth + 12
+      height: 18
+      radius: 3
+      color: c.bg
+      border.color: c.line
+      z: 50
+      Text {
+        id: tipText
+        anchors.centerIn: parent
+        text: btn.tip
+        color: c.muted
+        font.family: c.mono; font.pixelSize: 10
+      }
+    }
   }
 
   component Field: Rectangle {

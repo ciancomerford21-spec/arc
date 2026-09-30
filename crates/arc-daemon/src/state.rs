@@ -1,13 +1,14 @@
 //! Shared daemon state: the assistant, current state machine, event bus,
 //! status reporting and the bar status file.
 
+use crate::music::{self, Player, Queue, Resolver};
 use arc_config::Config;
 use arc_config::paths;
 use arc_core::{Assistant, InputSource as CoreSource, LastCall, NluInput, Reply, Route};
 use arc_memory::MemoryStore;
 use arc_proto::{
-    AskResult, AssistantState, BarStatus, ComponentStatus, Event, HealthStatus, InputSource,
-    NowPlaying, NowPlayingRequest, NowPlayingState, StatusReport, VoiceCommand, VoiceMode,
+    AskResult, AssistantState, BarStatus, ComponentStatus, Event, HealthStatus, InputSource, MusicRequest,
+    MusicStatus, NowPlaying, NowPlayingState, StatusReport, Track, VoiceCommand, VoiceMode,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +26,15 @@ pub struct Mutable {
     pub voice: Option<VoiceStatus>,
     /// The track the overlay shows. `None` when nothing is playing.
     pub now_playing: Option<NowPlaying>,
+    /// The whole music section's state, including what is queued behind the
+    /// current track. Kept here rather than in `music.rs` because every
+    /// projection (the bar file, the status report, the event stream) reads
+    /// it, and they must not disagree about what is playing.
+    pub music: MusicStatus,
+    /// How far through the current track, in seconds. The one field that
+    /// changes on its own every second, and the only reason the music
+    /// supervisor exists.
+    pub music_progress: (f64, f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +61,15 @@ pub struct Daemon {
     /// Name of the tool currently running, kept by `emit` so a turn that runs
     /// long can say what it is waiting on instead of shrugging.
     running_tool: Arc<Mutex<Option<String>>>,
+    /// The player Arc owns, and the resolver that fills its queue.
+    ///
+    /// Injected rather than constructed in place so the queue logic can be
+    /// tested against a recorded player: a test that starts mpv makes noise
+    /// on the user's speakers, and one that reaches YouTube depends on the
+    /// network. Neither belongs in a unit test.
+    player: Arc<dyn Player>,
+    resolver: Arc<dyn Resolver>,
+    queue: Mutex<Queue>,
 }
 
 /// A turn at least this long gets a spoken completion line.
@@ -518,6 +537,30 @@ fn route_name(r: Route) -> &'static str {
 
 impl Daemon {
     pub fn new(config: Config, bar_file: Option<PathBuf>) -> Result<Self, String> {
+        let music_cfg = config.music.clone();
+        let (player, resolver): (Arc<dyn Player>, Arc<dyn Resolver>) = if music_cfg.enabled {
+            (Arc::new(music::MpvPlayer::new(&music_cfg)), Arc::new(music::YtDlp::new(&music_cfg)))
+        } else {
+            tracing::info!("playback disabled in config; every music request will be refused");
+            (
+                Arc::new(music::NoPlayer::new("playback is disabled in the config")),
+                Arc::new(music::NoResolver::new("playback is disabled in the config")),
+            )
+        };
+        Self::with_music(config, bar_file, player, resolver)
+    }
+
+    /// The same daemon, with the player and resolver supplied.
+    ///
+    /// `new` is the only caller in production; this exists so tests can drive
+    /// the queue without mpv or the network.
+    pub fn with_music(
+        config: Config,
+        bar_file: Option<PathBuf>,
+        player: Arc<dyn Player>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<Self, String> {
+        let limit = config.music.queue_limit;
         let memory_path = std::env::var_os("ARC_MEMORY_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| paths::data_dir().join("memory"));
@@ -587,6 +630,9 @@ impl Daemon {
             utterance: AtomicU64::new(0),
             code_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             running_tool: Arc::new(Mutex::new(None)),
+            player,
+            resolver,
+            queue: Mutex::new(Queue::default().with_limit(limit)),
         })
     }
 
@@ -658,80 +704,266 @@ impl Daemon {
         self.publish_bar();
     }
 
-    /// Handle a now-playing report from a playback tool.
+    // -----------------------------------------------------------------
+    // Music
+    //
+    // Arc owns the player. Everything below either asks the player to do
+    // something or rebuilds the status the UI draws from what the player
+    // reports back, and the two are deliberately not the same thing: the
+    // daemon decides *what* plays (it holds the metadata), and the player
+    // decides *where it is* (it can skip an entry on its own when a track
+    // fails to open, and it is the only one that knows it did).
+    //
+    // -----------------------------------------------------------------
+
+    /// The status every client sees: current track, queue behind it, and how
+    /// far through it is.
+    pub fn music_status(&self) -> MusicStatus {
+        let mut status = self.m.lock().unwrap().music.clone();
+        let (position, duration) = self.m.lock().unwrap().music_progress;
+        status.position = position;
+        status.duration = duration;
+        status
+    }
+
+    /// Store a status and tell everyone, if it actually changed.
     ///
-    /// `set` is called by the tool once the player is actually running, so the
-    /// overlay never shows a track that failed to start. `stop` clears it.
-    /// Both are idempotent: a duplicate report publishes nothing, which is
-    /// what stops the overlay's row from flickering on every poll.
-    pub fn now_playing(&self, req: NowPlayingRequest) -> Result<NowPlaying, String> {
-        let next = match req {
-            // A read is not a state change: nothing is emitted, nothing is
-            // stored, the answer is whatever is already there.
-            NowPlayingRequest::Show => return Ok(self.now_playing_status()),
-            NowPlayingRequest::Set { title, artist, source, pid } => {
-                let title = title.trim();
-                if title.is_empty() {
-                    return Err("a now-playing report needs a title".into());
-                }
-                NowPlaying {
-                    state: NowPlayingState::Playing,
-                    title: title.chars().take(200).collect(),
-                    artist: artist.trim().chars().take(200).collect(),
-                    source: source.trim().chars().take(60).collect(),
-                    pid,
-                }
-            }
-            NowPlayingRequest::Stop => NowPlaying::default(),
-        };
-        let changed = {
+    /// The "if it changed" is what keeps the music section from flickering:
+    /// without it every poll would push an event and rewrite the bar file for
+    /// a state nobody could see differently.
+    fn publish_music(&self, status: MusicStatus) -> MusicStatus {
+        let (changed, published) = {
             let mut m = self.m.lock().unwrap();
-            let current = m.now_playing.clone().unwrap_or_default();
-            // An empty stop on an already-empty state is not a change: this
-            // is the common case (every script that finds no player), and it
-            // must not push an event each time.
-            if !next.is_playing() && !current.is_playing() {
-                return Ok(NowPlaying::default());
+            if !status.changed(&m.music) {
+                return m.music.clone();
             }
-            if next == current {
-                return Ok(next);
-            }
-            m.now_playing = if next.is_playing() { Some(next.clone()) } else { None };
-            true
+            m.now_playing = status.now.is_playing().then(|| status.now.clone());
+            m.music = status.clone();
+            (true, status)
         };
         if changed {
-            let published = next.clone();
-            self.emit(Event::NowPlaying { status: published });
+            self.emit(Event::Music { status: published.clone() });
             self.publish_bar();
         }
-        Ok(next)
+        published
     }
 
-    /// What the overlay should currently show.
+    /// Rebuild the status from the queue and the player's last known state.
+    fn music_from_queue(&self, state: NowPlayingState) -> MusicStatus {
+        let queue = self.queue.lock().unwrap();
+        let current = queue.current().map(|t| {
+            let mut now: NowPlaying = t.into();
+            now.state = state;
+            now.pid = self.player.pid().unwrap_or(0);
+            now
+        });
+        MusicStatus {
+            now: current.unwrap_or_default(),
+            queue: queue.upcoming().map(|(_, t)| t.clone()).collect(),
+            controllable: self.config.music.enabled,
+            ..MusicStatus::default()
+        }
+    }
+
+    /// Handle one playback request.
+    pub fn music(&self, req: MusicRequest) -> Result<MusicStatus, String> {
+        // Reads answer even with playback switched off. A widget asking "what
+        // is playing?" should get "nothing" rather than an error to display --
+        // the section is empty, and empty is the true answer.
+        if matches!(req, MusicRequest::Show | MusicRequest::Position) {
+            return Ok(match req {
+                MusicRequest::Position => {
+                    let s = self.music_status();
+                    MusicStatus { position: s.position, duration: s.duration, ..s }
+                }
+                _ => self.music_status(),
+            });
+        }
+        if !self.config.music.enabled {
+            return Err("playback is disabled in the config ([music] enabled = false)".into());
+        }
+        match req {
+            // A read is not a state change: it answers and emits nothing.
+            MusicRequest::Show => return Ok(self.music_status()),
+            MusicRequest::Position => {
+                let s = self.music_status();
+                return Ok(MusicStatus { position: s.position, duration: s.duration, ..s });
+            }
+            MusicRequest::Play { query } => {
+                let tracks = self.resolve(&query, 1)?;
+                self.player.replace(&tracks)?;
+                self.queue.lock().unwrap().set(tracks);
+                let status = self.music_from_queue(NowPlayingState::Playing);
+                return Ok(self.publish_music(status));
+            }
+            MusicRequest::Enqueue { query } => {
+                let tracks = self.resolve(&query, self.config.music.search_results)?;
+                let fresh = self.queue.lock().unwrap().is_empty();
+                if fresh {
+                    self.player.replace(&tracks)?;
+                    self.queue.lock().unwrap().set(tracks);
+                } else {
+                    self.player.append(&tracks)?;
+                    self.queue.lock().unwrap().push(tracks)?;
+                }
+                let status = self.music_from_queue(NowPlayingState::Playing);
+                return Ok(self.publish_music(status));
+            }
+            MusicRequest::Pause => {
+                self.require_playing()?;
+                self.player.set_paused(true)?;
+                let status = self.music_from_queue(NowPlayingState::Paused);
+                return Ok(self.publish_music(status));
+            }
+            MusicRequest::Resume => {
+                self.require_playing()?;
+                self.player.set_paused(false)?;
+                let status = self.music_from_queue(NowPlayingState::Playing);
+                return Ok(self.publish_music(status));
+            }
+            MusicRequest::Toggle => {
+                let paused = self.music_status().now.state == NowPlayingState::Paused;
+                return self.music(if paused { MusicRequest::Resume } else { MusicRequest::Pause });
+            }
+            MusicRequest::Next => {
+                // Refuse rather than claim: "skipping" with nothing queued
+                // would report success and leave the same track playing.
+                let index = self.queue.lock().unwrap().upcoming().next().map(|(i, _)| i);
+                let Some(index) = index else {
+                    return Err("nothing is queued after this track".into());
+                };
+                self.player.play_index(index)?;
+                self.queue.lock().unwrap().follow(Some(index));
+                let status = self.music_from_queue(NowPlayingState::Playing);
+                return Ok(self.publish_music(status));
+            }
+            MusicRequest::Previous => {
+                self.require_playing()?;
+                // The player decides: "back" restarts this track unless you
+                // are far enough into it to mean the one before. Guessing an
+                // index here would make two presses rewind two whole tracks.
+                self.player.previous()?;
+                // Whatever index it landed on is adopted on the next tick;
+                // for now the queue's idea is still right.
+                let status = self.music_from_queue(NowPlayingState::Playing);
+                return Ok(self.publish_music(status));
+            }
+            MusicRequest::Stop => {
+                self.player.shutdown();
+                self.queue.lock().unwrap().stop();
+                return Ok(self.publish_music(MusicStatus::default()));
+            }
+            MusicRequest::Clear => {
+                self.player.remove_remaining()?;
+                self.queue.lock().unwrap().clear();
+                let status = self.music_from_queue(NowPlayingState::Playing);
+                return Ok(self.publish_music(status));
+            }
+            MusicRequest::Remove { index } => {
+                // `index` counts tracks *after* the current one, so it has to
+                // be translated to an index into the whole list before it
+                // reaches either the player or the queue. Skipping that
+                // translation deletes the track that is playing.
+                let Some(absolute) = self.queue.lock().unwrap().upcoming().nth(index).map(|(i, _)| i) else {
+                    return Err(format!("nothing queued at position {index}"));
+                };
+                self.player.remove(absolute)?;
+                self.queue.lock().unwrap().remove(absolute)?;
+                let status = self.music_from_queue(NowPlayingState::Playing);
+                return Ok(self.publish_music(status));
+            }
+        }
+    }
+
+    fn require_playing(&self) -> Result<(), String> {
+        if self.queue.lock().unwrap().current().is_none() {
+            return Err("nothing is playing".into());
+        }
+        Ok(())
+    }
+
+    /// Turn a search string into tracks, falling back to a browser search
+    /// page when nothing can play locally.
+    ///
+    /// The fallback never claims a track is playing: Arc did not start it, so
+    /// the overlay stays empty rather than naming something in a browser tab.
+    fn resolve(&self, query: &str, count: usize) -> Result<Vec<Track>, String> {
+        match self.resolver.resolve(query, count) {
+            Ok(tracks) => Ok(tracks),
+            Err(e) => {
+                if self.config.music.browser_fallback && self.open_search(query) {
+                    return Err(format!(
+                        "{e}. Opened a YouTube Music search page instead -- click a result to play it"
+                    ));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn open_search(&self, query: &str) -> bool {
+        let url = format!("https://music.youtube.com/search?q={}", music::urlencode(query));
+        std::process::Command::new("xdg-open")
+            .arg(&url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+
+    /// Follow the player: once a second, adopt its index and note the
+    /// playhead, and clear the section when the queue has run out.
+    ///
+    /// Polling rather than listening on the player is deliberate. The player
+    /// emits events on the same socket its commands use, and reading them
+    /// reliably from a second place means holding that socket -- which is the
+    /// one thing a 1 Hz poll needs no machinery for. A poll cannot miss an
+    /// event that arrived while nobody was listening.
+    pub fn tick_music(&self) {
+        if !self.config.music.enabled || self.queue.lock().unwrap().is_empty() {
+            return;
+        }
+        let Ok(p) = self.player.progress() else {
+            // The player is gone. If the daemon never started it there is
+            // nothing to clear; if it did, the queue it was playing is over.
+            return;
+        };
+        {
+            let mut m = self.m.lock().unwrap();
+            m.music_progress = (p.position, p.duration);
+        }
+        let mut queue = self.queue.lock().unwrap();
+        queue.follow(p.index);
+        let state = if p.idle {
+            NowPlayingState::Stopped
+        } else if p.paused {
+            NowPlayingState::Paused
+        } else {
+            NowPlayingState::Playing
+        };
+        // Idle with nothing loaded is how the end of the queue looks.
+        if p.idle && p.index.is_none() {
+            queue.stop();
+        }
+        drop(queue);
+        let status = self.music_from_queue(state);
+        self.publish_music(status);
+    }
+
+    /// Stop the player on shutdown, so an owned process cannot outlive the
+    /// daemon that started it.
+    ///
+    /// Unconditional rather than only when something is queued: the queue is
+    /// cleared the moment playback ends, and a player sitting idle with an
+    /// empty playlist is still a process the daemon started.
+    pub fn shutdown_music(&self) {
+        self.player.shutdown();
+    }
+
+    /// The track the overlay shows. Kept as its own method because the bar
+    /// and the status report both project from it.
     pub fn now_playing_status(&self) -> NowPlaying {
         self.m.lock().unwrap().now_playing.clone().unwrap_or_default()
-    }
-
-    /// Clear the now-playing row when the player process is gone.
-    ///
-    /// A tool that starts a player in the background cannot tell anyone when
-    /// the track ends -- it has already exited by then. Watching the pid is
-    /// the only signal that exists, so this runs on a timer rather than being
-    /// left to the script. `pid == 0` means the reporter did not say, and
-    /// nothing is reaped: mpv is a long-lived process in other setups and
-    /// killing the row because pid 0 looked dead would be wrong.
-    pub fn reap_now_playing(&self) {
-        let dead = {
-            let m = self.m.lock().unwrap();
-            match &m.now_playing {
-                Some(n) if n.is_playing() && n.pid != 0 => !process_alive(n.pid),
-                _ => false,
-            }
-        };
-        if dead {
-            tracing::debug!("player process gone; clearing now-playing");
-            let _ = self.now_playing(NowPlayingRequest::Stop);
-        }
     }
 
     /// Push the bar status to subscribers and the bar file.
@@ -1056,6 +1288,7 @@ impl Daemon {
             last_action: m.last_action,
             recent_errors: m.recent_errors,
             now_playing: m.now_playing.filter(|n| n.is_playing()),
+            music_queue: m.music.queue.clone(),
             rss_kb: rss_kb(),
         }
     }
@@ -1124,25 +1357,11 @@ fn rss_kb() -> Option<u64> {
     s.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Is this pid still running? `kill -0` is the check, but only after
-/// confirming it is not our own group leader, which would signal us.
-/// Signals are checked through the `kill` return value; EPERM means the
-/// process exists but belongs to someone else, which for a player we started
-/// cannot happen and so counts as gone.
-fn process_alive(pid: u32) -> bool {
-    // A pid wider than pid_t cannot be converted without wrapping, and the
-    // wrapped value is a *negative* pid -- where kill(-1, 0) means "every
-    // process I may signal" and cheerfully reports success for a pid that has
-    // never existed. Cast a pid_t through u32, not i32, and refuse the ones
-    // that would wrap.
-    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: signal 0 performs the existence/permission check only; it
-    // delivers nothing and cannot kill the caller.
-    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
-}
+// A pid-liveness check used to live here, to clear the music row when a
+// backgrounded player exited. It is gone because the daemon owns the player
+// now: it asks the player directly whether it is idle, which is a better
+// answer than "is that process still there" -- a player that is alive with an
+// empty playlist is not playing anything either.
 
 #[cfg(test)]
 mod tests {
@@ -1574,185 +1793,440 @@ mod tests {
     }
 
     #[test]
-        fn a_reported_ok_task_still_announces_completion() {
-            let mut a = act("code", ActionOutcome::Success, 40_000);
-            a.data = serde_json::json!({"status": "done", "steps": 5, "took_s": 40});
-            let line = completion_line(&[a]).unwrap();
-            assert!(line.contains('5') && line.contains("40"), "the task's own numbers should be used: {line}");
+    fn a_reported_ok_task_still_announces_completion() {
+        let mut a = act("code", ActionOutcome::Success, 40_000);
+        a.data = serde_json::json!({"status": "done", "steps": 5, "took_s": 40});
+        let line = completion_line(&[a]).unwrap();
+        assert!(line.contains('5') && line.contains("40"), "the task's own numbers should be used: {line}");
+    }
+
+    // ------------------------------------------------------------ music
+
+    /// A player that records what it was told and answers with whatever
+    /// the test sets.
+    ///
+    /// Deliberately not a real mpv: a test that starts one makes noise on
+    /// the user's speakers, and the queue logic is worth testing precisely
+    /// because it does not need a player to be wrong in interesting ways.
+    #[derive(Debug, Default)]
+    struct FakePlayer {
+        /// What the daemon asked for, in order.
+        log: std::sync::Mutex<Vec<String>>,
+        /// The state the player reports back.
+        progress: std::sync::Mutex<music::Progress>,
+        /// Refuse everything, to test the failure paths.
+        broken: std::sync::atomic::AtomicBool,
+        stopped: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakePlayer {
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
         }
-
-        // ------------------------------------------------------------ now playing
-
-        /// A daemon with no model and a scratch memory file, so these tests touch
-            /// neither the user's memory nor a real provider.
-            fn daemon() -> std::sync::Arc<Daemon> {
-                let dir = tempfile::tempdir().unwrap();
-                // Keep the TempDir alive for the life of the daemon.
-                std::mem::forget(dir);
-                let mut cfg = Config::default();
-                cfg.ai.provider = arc_config::ProviderKind::None;
-                let daemon =
-                    Daemon::new(cfg, None).map_err(|e| panic!("could not build a test daemon: {e}")).unwrap();
-                std::sync::Arc::new(daemon)
+        fn set_progress(&self, p: music::Progress) {
+            *self.progress.lock().unwrap() = p;
+        }
+        fn note(&self, s: impl Into<String>) -> Result<(), String> {
+            if self.broken.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("the player is on fire".into());
             }
-
-        fn set(title: &str, artist: &str, pid: u32) -> NowPlayingRequest {
-            NowPlayingRequest::Set {
-                title: title.into(),
-                artist: artist.into(),
-                source: "youtube music".into(),
-                pid,
-            }
-        }
-
-        /// Collect events published while `f` runs. The bus is a broadcast channel,
-        /// so this is the only way to see what the overlay would have received.
-        fn events_while(d: &Daemon, f: impl FnOnce()) -> Vec<arc_proto::ServerMessage> {
-            let mut rx = d.events.subscribe();
-            f();
-            let mut out = vec![];
-            while let Ok(e) = rx.try_recv() {
-                out.push(arc_proto::ServerMessage::Event { event: e });
-            }
-            out
-        }
-
-        fn now_playing_events(msgs: &[arc_proto::ServerMessage]) -> Vec<arc_proto::NowPlaying> {
-            msgs.iter()
-                .filter_map(|m| match m {
-                    arc_proto::ServerMessage::Event { event: arc_proto::Event::NowPlaying { status } } => {
-                        Some(status.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
-
-        #[test]
-            fn a_reported_track_is_shown_and_a_stop_clears_it() {
-                let d = daemon();
-                let msgs = events_while(&d, || {
-                    d.now_playing(set("Hall of Fame", "Boards of Canada", 0)).unwrap();
-                    assert!(d.now_playing_status().is_playing());
-                    assert_eq!(d.now_playing_status().label(), "Hall of Fame — Boards of Canada");
-                    d.now_playing(NowPlayingRequest::Stop).unwrap();
-                });
-                // The overlay learns about it from events, not by polling: one report,
-                // one clear. Both must arrive or the row either never appears or never
-                // goes away.
-                let ev = now_playing_events(&msgs);
-                assert_eq!(ev.len(), 2, "expected a set then a stop: {msgs:?}");
-                assert!(ev[0].is_playing(), "the track should be announced");
-                assert!(!ev[1].is_playing(), "the overlay must be told to clear, not left stale");
-                assert!(!d.now_playing_status().is_playing());
-            }
-
-        /// A track reported twice, or a stop with nothing playing, must not push
-        /// events: the overlay row would flicker on every poll otherwise.
-        #[test]
-        fn repeated_reports_are_idempotent() {
-            let d = daemon();
-            let set_again = set("Hall of Fame", "Boards of Canada", 0);
-            d.now_playing(set_again.clone()).unwrap();
-            let msgs = events_while(&d, || {
-                d.now_playing(set_again.clone()).unwrap();
-                d.now_playing(NowPlayingRequest::Stop).unwrap();
-                d.now_playing(NowPlayingRequest::Stop).unwrap();
-            });
-            assert_eq!(now_playing_events(&msgs).len(), 1, "one stop, not two: {msgs:?}");
-            assert!(!d.now_playing_status().is_playing());
-        }
-
-        /// A show is a read: it must not emit, and must not disturb what is there.
-        #[test]
-        fn show_reads_without_changing_or_announcing() {
-            let d = daemon();
-            d.now_playing(set("Teardrop", "Massive Attack", 0)).unwrap();
-            let msgs = events_while(&d, || {
-                let shown = d.now_playing(NowPlayingRequest::Show).unwrap();
-                assert_eq!(shown.title, "Teardrop");
-            });
-            assert!(now_playing_events(&msgs).is_empty(), "a read pushed an event: {msgs:?}");
-            assert!(d.now_playing_status().is_playing());
-        }
-
-        /// A blank title is a broken report, not a track. Storing it would put an
-        /// empty row on the overlay with no way to tell it from a rendering bug.
-        #[test]
-        fn a_report_without_a_title_is_refused() {
-            let d = daemon();
-            let e = d.now_playing(set("   ", "Nobody", 0)).unwrap_err();
-            assert!(e.contains("title"), "{e}");
-            assert!(!d.now_playing_status().is_playing());
-        }
-
-        /// The end of a track is not reported to anyone -- the tool that started it
-        /// has already exited -- so the pid is the only signal. Without the reap the
-        /// overlay keeps showing a track that ended minutes ago.
-        #[test]
-        fn a_dead_player_clears_the_row_and_a_live_one_does_not() {
-            let d = daemon();
-            // This process is definitely alive, so its pid must not reap.
-            d.now_playing(set("Still Playing", "Someone", std::process::id())).unwrap();
-            d.reap_now_playing();
-            assert!(d.now_playing_status().is_playing(), "a running player was reaped");
-
-            // pid 0 means "I did not say", which is not "dead": reaping on it would
-            // clear the row for any report that omits the pid.
-            d.now_playing(set("Unknown Player", "Someone", 0)).unwrap();
-            d.reap_now_playing();
-            assert!(d.now_playing_status().is_playing(), "pid 0 was treated as a dead process");
-
-            // A pid that cannot exist is reaped.
-            d.now_playing(set("Gone", "Someone", u32::MAX)).unwrap();
-            let msgs = events_while(&d, || d.reap_now_playing());
-            assert!(!d.now_playing_status().is_playing(), "a dead player was left on screen");
-            let cleared = now_playing_events(&msgs);
-            assert_eq!(cleared.len(), 1);
-            assert!(!cleared[0].is_playing());
-            // Idempotent: a second poll finds nothing to do.
-            let again = events_while(&d, || d.reap_now_playing());
-            assert!(now_playing_events(&again).is_empty());
-        }
-
-        /// The bar and status reports carry the track, and only while it plays.
-        #[test]
-        fn the_bar_carries_the_track_only_while_playing() {
-            let d = daemon();
-            assert!(d.bar_status().now_playing.is_none(), "an idle bar gained a field");
-            assert!(d.status().now_playing.is_none());
-            assert!(!d.bar_status().tooltip.contains('♪'));
-
-            d.now_playing(set("Windowlicker", "Aphex Twin", 0)).unwrap();
-            let bar = d.bar_status();
-            assert_eq!(bar.now_playing.as_ref().unwrap().label(), "Windowlicker — Aphex Twin");
-            assert!(bar.tooltip.contains("Windowlicker"), "the bar tooltip should mention it: {}", bar.tooltip);
-            assert_eq!(d.status().now_playing.unwrap().title, "Windowlicker");
-
-            d.now_playing(NowPlayingRequest::Stop).unwrap();
-            assert!(d.bar_status().now_playing.is_none());
-            assert!(d.status().now_playing.is_none());
-        }
-
-        /// Over-long metadata comes from a scraped web page, not from Arc. It goes
-        /// on one line of a header chip; it must not be able to fill the screen.
-        #[test]
-        fn absurdly_long_metadata_is_truncated() {
-            let d = daemon();
-            let long = "x".repeat(5000);
-            let n = d
-                .now_playing(set(&long, &long, 0))
-                .map_err(|e| panic!("a long title should still be reported: {e}"))
-                .unwrap();
-            assert_eq!(n.title.chars().count(), 200);
-            assert_eq!(n.artist.chars().count(), 200);
-        }
-
-        #[test]
-        fn process_alive_is_true_for_this_process_and_false_for_nonsense() {
-            assert!(process_alive(std::process::id()));
-            assert!(!process_alive(0));
-            // 0x7FFFFFFF is above the default pid_max and cannot exist.
-            assert!(!process_alive(0x7fff_ffff));
+            self.log.lock().unwrap().push(s.into());
+            Ok(())
         }
     }
+
+    impl Player for FakePlayer {
+        fn replace(&self, t: &[Track]) -> Result<(), String> {
+            self.note(format!("replace {}", t.len()))
+        }
+        fn append(&self, t: &[Track]) -> Result<(), String> {
+            self.note(format!("append {}", t.len()))
+        }
+        fn remove(&self, i: usize) -> Result<(), String> {
+            self.note(format!("remove {i}"))
+        }
+        fn play_index(&self, i: usize) -> Result<(), String> {
+            self.note(format!("play_index {i}"))
+        }
+        fn previous(&self) -> Result<(), String> {
+            self.note("previous")
+        }
+        fn remove_remaining(&self) -> Result<(), String> {
+            self.note("remove_remaining")
+        }
+        fn set_paused(&self, p: bool) -> Result<(), String> {
+            self.note(format!("pause {p}"))
+        }
+        fn progress(&self) -> Result<music::Progress, String> {
+            Ok(*self.progress.lock().unwrap())
+        }
+        fn pid(&self) -> Option<u32> {
+            Some(4242)
+        }
+        fn shutdown(&self) {
+            self.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A resolver that hands back fixed tracks.
+    #[derive(Debug)]
+    struct FakeResolver {
+        fail: bool,
+    }
+
+    impl Resolver for FakeResolver {
+        fn resolve(&self, query: &str, count: usize) -> Result<Vec<Track>, String> {
+            if self.fail {
+                return Err("the resolver is down".into());
+            }
+            Ok((0..count.max(1))
+                .map(|i| {
+                    Track::new(
+                        &format!("{query} {i}"),
+                        "Boards of Canada",
+                        "youtube music",
+                        &format!("https://example.invalid/{i}"),
+                    )
+                    .unwrap()
+                })
+                .collect())
+        }
+    }
+
+    /// A daemon with no model, a scratch memory file and a fake player.
+    fn daemon_with(player: Arc<FakePlayer>, resolver: Arc<dyn Resolver>) -> Arc<Daemon> {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep the TempDir alive for the life of the daemon.
+        std::mem::forget(dir);
+        let mut cfg = Config::default();
+        cfg.ai.provider = arc_config::ProviderKind::None;
+        // No browser fallback by default: these tests must not open a
+        // browser on the machine running them.
+        cfg.music.browser_fallback = false;
+        let d = Daemon::with_music(cfg, None, player.clone(), resolver)
+            .map_err(|e| panic!("could not build a test daemon: {e}"))
+            .unwrap();
+        Arc::new(d)
+    }
+
+    fn daemon() -> (Arc<Daemon>, Arc<FakePlayer>) {
+        let p = Arc::new(FakePlayer::default());
+        let d = daemon_with(p.clone(), Arc::new(FakeResolver { fail: false }));
+        (d, p)
+    }
+
+    /// Collect events published while `f` runs. The bus is a broadcast channel,
+    /// so this is the only way to see what the overlay would have received.
+    fn events_while(d: &Daemon, f: impl FnOnce()) -> Vec<arc_proto::ServerMessage> {
+        let mut rx = d.events.subscribe();
+        f();
+        let mut out = vec![];
+        while let Ok(e) = rx.try_recv() {
+            out.push(arc_proto::ServerMessage::Event { event: e });
+        }
+        out
+    }
+
+    fn music_events(msgs: &[arc_proto::ServerMessage]) -> Vec<MusicStatus> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                arc_proto::ServerMessage::Event { event: arc_proto::Event::Music { status } } => {
+                    Some(status.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn play(d: &Daemon, query: &str) -> MusicStatus {
+        d.music(MusicRequest::Play { query: query.into() }).unwrap()
+    }
+
+    #[test]
+    fn playing_resolves_shows_and_announces_once() {
+        let (d, _p) = daemon();
+        let msgs = events_while(&d, || {
+            let s = play(&d, "hall of fame");
+            assert_eq!(s.now.title, "hall of fame 0");
+            assert_eq!(s.now.state, NowPlayingState::Playing);
+            assert_eq!(s.now.label(), "hall of fame 0 — Boards of Canada");
+            assert!(s.controllable);
+            // Playing the same thing again changes nothing, so nothing is
+            // announced -- an event per request would flicker the row.
+            play(&d, "hall of fame");
+        });
+        let ev = music_events(&msgs);
+        assert_eq!(ev.len(), 1, "expected exactly one music event: {msgs:?}");
+        assert_eq!(ev[0].now.title, "hall of fame 0");
+        assert_eq!(d.music_status().now.title, "hall of fame 0");
+    }
+
+    /// The whole reason the daemon owns the player: pause reaches the real
+    /// process, and the row stays up showing it is paused rather than
+    /// disappearing like a stopped track.
+    #[test]
+    fn pausing_reaches_the_player_and_keeps_the_row() {
+        let (d, p) = daemon();
+        play(&d, "teardrop");
+        let s = d.music(MusicRequest::Pause).unwrap();
+        assert_eq!(s.now.state, NowPlayingState::Paused);
+        assert!(s.active(), "a paused track must stay on screen");
+        assert_eq!(p.log(), vec!["replace 1", "pause true"]);
+
+        let s = d.music(MusicRequest::Resume).unwrap();
+        assert_eq!(s.now.state, NowPlayingState::Playing);
+        assert_eq!(p.log().last().unwrap(), "pause false");
+
+        // Toggle is what a play/pause button sends, and it must land on
+        // the other side of wherever the player actually is.
+        d.music(MusicRequest::Toggle).unwrap();
+        assert_eq!(d.music_status().now.state, NowPlayingState::Paused);
+        d.music(MusicRequest::Toggle).unwrap();
+        assert_eq!(d.music_status().now.state, NowPlayingState::Playing);
+    }
+
+    #[test]
+    fn transport_controls_refuse_when_nothing_is_playing() {
+        let (d, _p) = daemon();
+        for req in [MusicRequest::Pause, MusicRequest::Resume, MusicRequest::Next, MusicRequest::Previous] {
+            let e = d.music(req).unwrap_err();
+            assert!(e.contains("nothing"), "a control on silence reported: {e}");
+        }
+        assert!(d.music_status().is_empty());
+    }
+
+    /// Enqueue must add to the queue rather than replace it, and must reach
+    /// the player as an append -- not a second `replace`, which would drop
+    /// the track that was already playing.
+    #[test]
+    fn enqueue_appends_to_the_queue_and_the_player() {
+        let (d, p) = daemon();
+        play(&d, "first");
+        let s = d.music(MusicRequest::Enqueue { query: "second".into() }).unwrap();
+        assert_eq!(s.now.title, "first 0", "the playing track changed on enqueue");
+        assert_eq!(s.queue.len(), 1);
+        assert_eq!(s.queue[0].title, "second 0");
+        assert_eq!(p.log(), vec!["replace 1", "append 1"]);
+    }
+
+    /// Enqueueing into silence plays, because a queue nothing will ever
+    /// hear is not what "add this to the queue" means.
+    #[test]
+    fn enqueue_into_silence_starts_the_player() {
+        let (d, p) = daemon();
+        let s = d.music(MusicRequest::Enqueue { query: "only".into() }).unwrap();
+        assert_eq!(s.now.title, "only 0");
+        assert!(s.active());
+        assert_eq!(p.log(), vec!["replace 1"]);
+    }
+
+    #[test]
+    fn next_skips_to_the_queued_track_and_refuses_past_the_end() {
+        let (d, p) = daemon();
+        play(&d, "a");
+        d.music(MusicRequest::Enqueue { query: "b".into() }).unwrap();
+        let s = d.music(MusicRequest::Next).unwrap();
+        assert_eq!(s.now.title, "b 0");
+        assert!(s.queue.is_empty());
+        assert!(p.log().contains(&"play_index 1".to_string()), "{:?}", p.log());
+
+        // Nothing left to skip to: an error, not a success that played
+        // the same track again.
+        assert!(d.music(MusicRequest::Next).is_err());
+    }
+
+    #[test]
+    fn previous_asks_the_player_rather_than_guessing_an_index() {
+        let (d, p) = daemon();
+        play(&d, "a");
+        d.music(MusicRequest::Enqueue { query: "b".into() }).unwrap();
+        d.music(MusicRequest::Previous).unwrap();
+        assert!(p.log().contains(&"previous".to_string()), "the player was not asked: {:?}", p.log());
+    }
+
+    #[test]
+    fn clearing_keeps_playing_the_current_track() {
+        let (d, p) = daemon();
+        play(&d, "a");
+        d.music(MusicRequest::Enqueue { query: "b".into() }).unwrap();
+        let s = d.music(MusicRequest::Clear).unwrap();
+        assert!(s.active());
+        assert!(s.queue.is_empty());
+        assert!(p.log().contains(&"remove_remaining".to_string()));
+    }
+
+    /// Removing a queued track is addressed relative to the *queue*, not
+    /// the player, so index 0 must mean "the first thing after this one".
+    #[test]
+    fn removing_a_queued_track_uses_a_queue_relative_index() {
+        let (d, p) = daemon();
+        play(&d, "a");
+        d.music(MusicRequest::Enqueue { query: "b".into() }).unwrap();
+        let s = d.music(MusicRequest::Remove { index: 0 }).unwrap();
+        assert!(s.queue.is_empty());
+        assert_eq!(s.now.title, "a 0", "the playing track was removed");
+        // The player's own indices start after the current track, so the
+        // same removal is index 1 there.
+        assert!(p.log().contains(&"remove 1".to_string()), "{:?}", p.log());
+        assert!(d.music(MusicRequest::Remove { index: 4 }).is_err());
+    }
+
+    #[test]
+    fn stopping_kills_the_player_and_clears_everything() {
+        let (d, p) = daemon();
+        play(&d, "a");
+        d.music(MusicRequest::Enqueue { query: "b".into() }).unwrap();
+        let msgs = events_while(&d, || {
+            let s = d.music(MusicRequest::Stop).unwrap();
+            assert!(s.is_empty());
+        });
+        assert!(p.stopped.load(std::sync::atomic::Ordering::Relaxed), "the player was left running");
+        let ev = music_events(&msgs);
+        assert_eq!(ev.len(), 1, "one clear event: {msgs:?}");
+        assert!(!ev[0].active(), "the overlay was not told to clear");
+        assert!(d.music_status().is_empty());
+    }
+
+    /// A read is a read: no event, no disturbance. The app calls this on
+    /// start and on every reconnect.
+    #[test]
+    fn show_answers_without_changing_or_announcing() {
+        let (d, p) = daemon();
+        play(&d, "teardrop");
+        let before = p.log().len();
+        let msgs = events_while(&d, || {
+            let s = d.music(MusicRequest::Show).unwrap();
+            assert_eq!(s.now.title, "teardrop 0");
+        });
+        assert!(music_events(&msgs).is_empty(), "a read pushed an event: {msgs:?}");
+        assert_eq!(p.log().len(), before, "a read touched the player");
+    }
+
+    /// The player is the authority on where it is: mpv skips an entry by
+    /// itself when a track cannot be opened, and the daemon must show what
+    /// is actually playing rather than what it queued.
+    #[test]
+    fn the_tick_follows_the_player_rather_than_the_queue() {
+        let (d, p) = daemon();
+        play(&d, "a");
+        d.music(MusicRequest::Enqueue { query: "b".into() }).unwrap();
+        p.set_progress(music::Progress {
+            index: Some(1),
+            paused: false,
+            position: 12.0,
+            duration: 240.0,
+            idle: false,
+        });
+        let msgs = events_while(&d, || d.tick_music());
+        let ev = music_events(&msgs);
+        assert_eq!(ev.len(), 1, "the track change was not announced: {msgs:?}");
+        assert_eq!(ev[0].now.title, "b 0");
+        // The playhead moves every tick but must not count as a change, or
+        // the bar file would be rewritten once a second.
+        assert!(d.music_status().position == 12.0);
+        let second = events_while(&d, || d.tick_music());
+        assert!(music_events(&second).is_empty(), "a still-playing tick announced itself: {second:?}");
+    }
+
+    /// The end of the queue is the player going idle with nothing loaded.
+    /// Nothing else reports it: the queue simply stops being played.
+    #[test]
+    fn the_queue_ending_clears_the_section() {
+        let (d, p) = daemon();
+        play(&d, "only");
+        p.set_progress(music::Progress { index: None, idle: true, ..music::Progress::default() });
+        let msgs = events_while(&d, || d.tick_music());
+        let ev = music_events(&msgs);
+        assert_eq!(ev.len(), 1, "the section was not cleared: {msgs:?}");
+        assert!(!ev[0].active());
+        assert!(d.music_status().is_empty());
+        // And the tick after that has nothing to do.
+        let again = events_while(&d, || d.tick_music());
+        assert!(music_events(&again).is_empty());
+    }
+
+    /// A tick that reaches a player which has gone away must not wedge the
+    /// section on screen forever.
+    #[test]
+    fn a_tick_with_nothing_playing_does_nothing_at_all() {
+        let (d, _p) = daemon();
+        let msgs = events_while(&d, || d.tick_music());
+        assert!(music_events(&msgs).is_empty(), "an idle tick announced something: {msgs:?}");
+    }
+
+    /// A player failure must surface as an error, and must leave the queue
+    /// alone rather than half-applied.
+    #[test]
+    fn a_failing_player_reports_the_failure() {
+        let p = Arc::new(FakePlayer::default());
+        p.broken.store(true, std::sync::atomic::Ordering::Relaxed);
+        let d = daemon_with(p, Arc::new(FakeResolver { fail: false }));
+        let e = d.music(MusicRequest::Play { query: "x".into() }).unwrap_err();
+        assert!(e.contains("on fire"), "{e}");
+        assert!(d.music_status().is_empty(), "a failed start left a track on screen");
+    }
+
+    #[test]
+    fn a_failing_resolver_reports_and_claims_nothing() {
+        let p = Arc::new(FakePlayer::default());
+        let d = daemon_with(p.clone(), Arc::new(FakeResolver { fail: true }));
+        let e = d.music(MusicRequest::Play { query: "x".into() }).unwrap_err();
+        assert!(e.contains("resolver"), "{e}");
+        assert!(d.music_status().is_empty(), "a failed resolve left a track on screen");
+        assert!(p.log().is_empty(), "a player was started for a track that could not be resolved");
+    }
+
+    /// With playback switched off, every control refuses with the same
+    /// message rather than quietly doing nothing.
+    #[test]
+    fn disabled_playback_refuses_with_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::mem::forget(dir);
+        let mut cfg = Config::default();
+        cfg.ai.provider = arc_config::ProviderKind::None;
+        cfg.music.enabled = false;
+        let d = Arc::new(Daemon::new(cfg, None).map_err(|e| panic!("{e}")).unwrap());
+        for req in [
+            MusicRequest::Play { query: "x".into() },
+            MusicRequest::Enqueue { query: "x".into() },
+            MusicRequest::Pause,
+            MusicRequest::Stop,
+        ] {
+            assert!(d.music(req).unwrap_err().contains("disabled"), "a control worked with playback off");
+        }
+        // A read still answers, or a widget would show an error instead of
+        // an empty music section.
+        assert!(d.music(MusicRequest::Show).unwrap().is_empty());
+    }
+
+    /// The bar and status reports carry the track, and only while it plays.
+    #[test]
+    fn the_bar_carries_the_track_only_while_it_plays() {
+        let (d, _p) = daemon();
+        assert!(d.bar_status().now_playing.is_none(), "an idle bar gained a field");
+        assert!(d.status().now_playing.is_none());
+
+        play(&d, "windowlicker");
+        let bar = d.bar_status();
+        assert_eq!(bar.now_playing.as_ref().unwrap().label(), "windowlicker 0 — Boards of Canada");
+        assert!(bar.tooltip.contains('♪'), "the bar tooltip should mention it: {}", bar.tooltip);
+        assert_eq!(d.status().now_playing.unwrap().title, "windowlicker 0");
+        // And the queue behind it, for anything that wants to show more
+        // than the current track.
+        d.music(MusicRequest::Enqueue { query: "next".into() }).unwrap();
+        assert_eq!(d.status().music_queue.len(), 1);
+
+        d.music(MusicRequest::Stop).unwrap();
+        assert!(d.bar_status().now_playing.is_none());
+        assert!(d.status().now_playing.is_none());
+        assert!(d.status().music_queue.is_empty());
+    }
+
+    #[test]
+    fn urlencoding_is_right_for_the_search_fallback() {
+        assert_eq!(music::urlencode("boards of canada"), "boards%20of%20canada");
+        assert_eq!(music::urlencode("a+b&c=d"), "a%2Bb%26c%3Dd");
+        assert_eq!(music::urlencode("caf\u{e9}"), "caf%C3%A9");
+        assert_eq!(music::urlencode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+}

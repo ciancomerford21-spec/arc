@@ -125,8 +125,8 @@ pub enum Request {
         #[serde(default)]
         args: Value,
     },
-    /// Now-playing status. Returns [`NowPlaying`].
-    NowPlaying(NowPlayingRequest),
+    /// Playback control and status. Returns [`MusicStatus`].
+    Music(MusicRequest),
     /// Full status report. Returns [`StatusReport`].
     Status,
     /// Compact status for status bars. Returns [`BarStatus`].
@@ -226,6 +226,10 @@ pub enum NowPlayingState {
     #[default]
     Stopped,
     Playing,
+    /// Started and then held. Distinct from `Stopped` because the row stays on
+    /// screen with a track's name on it -- a paused track is still the one the
+    /// user paused and the one they want to resume.
+    Paused,
 }
 
 /// One currently-playing track.
@@ -247,9 +251,11 @@ pub struct NowPlaying {
 }
 
 impl NowPlaying {
-    /// True when there is something to display.
+    /// True when there is something to display -- playing *or* paused. A
+    /// paused track keeps its row: it is the track the user paused, and the
+    /// one they want back.
     pub fn is_playing(&self) -> bool {
-        self.state == NowPlayingState::Playing && !self.title.trim().is_empty()
+        self.state != NowPlayingState::Stopped && !self.title.trim().is_empty()
     }
 
     /// `Title — Artist`, or just whichever of the two exists.
@@ -310,28 +316,153 @@ impl<'de> Deserialize<'de> for NowPlaying {
     }
 }
 
-/// `Request::NowPlaying` operations.
+/// One track in the queue, waiting or playing.
 ///
-/// `set` is what a playback script calls once the player is actually running;
-/// `stop` is what it calls when playback ends, and what the daemon calls for
-/// itself when the player process disappears.
+/// `url` is the direct stream the player was handed. It is deliberately not
+/// serialized: it is a several-hundred-character expiring googlevideo link,
+/// and no client has any use for it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Track {
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub source: String,
+    /// Not sent to clients.
+    #[serde(default, skip_serializing)]
+    pub url: String,
+}
+
+impl Track {
+    /// Truncate scraped metadata and refuse a blank title.
+    ///
+    /// One place, so every way a track enters the queue -- a script, the UI,
+    /// a future resolver -- is capped the same way. A track with no title is
+    /// rejected rather than stored: `NowPlaying::is_playing` treats a blank
+    /// title as nothing to show, so storing one produces a queue entry that
+    /// silently plays without ever being displayed.
+    pub fn new(title: &str, artist: &str, source: &str, url: &str) -> Result<Self, String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("a track needs a title".into());
+        }
+        Ok(Self {
+            title: title.chars().take(200).collect(),
+            artist: artist.trim().chars().take(200).collect(),
+            source: source.trim().chars().take(60).collect(),
+            url: url.trim().to_string(),
+        })
+    }
+}
+
+impl From<&Track> for NowPlaying {
+    fn from(t: &Track) -> Self {
+        Self {
+            state: NowPlayingState::Playing,
+            title: t.title.clone(),
+            artist: t.artist.clone(),
+            source: t.source.clone(),
+            pid: 0,
+        }
+    }
+}
+
+/// Everything a client needs to draw the music section.
+///
+/// `queue` is the tracks *after* the current one, so a client renders
+/// `now` followed by `queue` and never has to work out an index into a
+/// combined list -- and a skipped track is one `Vec::remove`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MusicStatus {
+    /// The current track. `state` is Stopped when nothing is playing, and the
+    /// title is empty then.
+    pub now: NowPlaying,
+    /// Tracks after the current one, in play order.
+    #[serde(default)]
+    pub queue: Vec<Track>,
+    /// Playback position in seconds. `0.0` when unknown or stopped.
+    #[serde(default)]
+    pub position: f64,
+    /// Track length in seconds, when the player knows it. `0.0` when unknown,
+    /// so a client can tell "no length" from "just started".
+    #[serde(default)]
+    pub duration: f64,
+    /// True when Arc is the one playing this, so transport controls apply.
+    /// False for a track a script reported but Arc did not start -- pausing
+    /// that is possible over MPRIS, queueing onto it is not.
+    #[serde(default)]
+    pub controllable: bool,
+}
+
+impl MusicStatus {
+    /// Whether there is anything at all to show. A paused track counts: the
+    /// user paused it, and the row they paused is what they want to un-pause.
+    pub fn active(&self) -> bool {
+        self.now.state != NowPlayingState::Stopped && !self.now.title.trim().is_empty()
+    }
+
+    /// Total tracks: the current one plus everything queued behind it.
+    pub fn len(&self) -> usize {
+        usize::from(self.active()) + self.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether anything about this status differs from `other` in a way worth
+    /// telling a client about.
+    ///
+    /// Position is deliberately excluded. It moves every second, and an event
+    /// per second would rewrite the bar file and every subscriber's view for
+    /// a progress bar that can animate on its own -- a client reads position
+    /// with [`MusicRequest::Position`] when it wants to draw one.
+    pub fn changed(&self, other: &Self) -> bool {
+        self.now != other.now || self.queue != other.queue || self.controllable != other.controllable
+    }
+}
+
+/// `Request::Music` operations.
+///
+/// The daemon owns the player, so these act on the real thing: `pause`
+/// pauses it and `enqueue` adds to the queue it is playing from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
-pub enum NowPlayingRequest {
-    Set {
-        title: String,
-        #[serde(default)]
-        artist: String,
-        #[serde(default)]
-        source: String,
-        #[serde(default)]
-        pid: u32,
+pub enum MusicRequest {
+    /// Resolve `query`, then play it, replacing whatever is queued.
+    Play {
+        query: String,
     },
-    /// Read the current status. Returns [`NowPlaying`] either way -- an empty
-    /// stopped one when nothing plays, rather than an error, so a widget can
-    /// call this on start and on reconnect without special cases.
+    /// Resolve `query` and add it to the end of the queue. Starts playback if
+    /// nothing is playing, because an enqueue into silence is a play.
+    Enqueue {
+        query: String,
+    },
+    /// Read the full status. Returns [`MusicStatus`] either way -- an empty
+    /// one when nothing plays, rather than an error, so a widget can call
+    /// this on start and on reconnect without special cases.
     Show,
+    /// Just the playback position and length. Cheap enough to poll once a
+    /// second for a progress bar, which is why it is not an event.
+    Position,
+    Pause,
+    Resume,
+    /// Pause if playing, resume if paused. What a play/pause button wants.
+    Toggle,
+    /// Skip to the next queued track. Fails if there is nothing queued --
+    /// silence is not an error to report as success.
+    Next,
+    /// Restart the current track, or go back one if there is one.
+    Previous,
+    /// Stop playback and empty the queue, killing the player Arc started.
     Stop,
+    /// Empty the queue but keep playing the current track.
+    Clear,
+    /// Drop the queued track at `index` (an index into [`MusicStatus::queue`],
+    /// which starts *after* the current track).
+    Remove {
+        index: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +755,9 @@ pub struct StatusReport {
     /// Present only while something is playing, like `BarStatus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now_playing: Option<NowPlaying>,
+    /// The queue behind the current track, when there is one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub music_queue: Vec<Track>,
     pub rss_kb: Option<u64>,
 }
 
@@ -685,11 +819,15 @@ pub enum Event {
         step: u32,
         elapsed_s: u64,
     },
-    /// The track that is playing right now, pushed whenever it changes.
-    /// A stopped state is pushed too -- that is how the overlay clears its
-    /// strip instead of showing a track that ended ten minutes ago.
-    NowPlaying {
-        status: NowPlaying,
+    /// The music section's state, pushed whenever it changes: a track starts,
+    /// the queue changes, playback pauses or stops. A stopped status is pushed
+    /// too -- that is how the overlay clears its section instead of showing a
+    /// track that ended ten minutes ago.
+    ///
+    /// Position is not in here. It moves every second; a client that wants a
+    /// progress bar polls `MusicRequest::Position` instead.
+    Music {
+        status: MusicStatus,
     },
     ToolStarted {
         tool: String,
@@ -730,7 +868,7 @@ impl Event {
             | Event::Heard { .. }
             | Event::Thought { .. }
             | Event::CodeProgress { .. }
-            | Event::NowPlaying { .. }
+            | Event::Music { .. }
             | Event::ToolStarted { .. }
             | Event::ToolFinished { .. }
             | Event::ConfirmationRequired { .. }
@@ -877,7 +1015,20 @@ mod tests {
         assert_eq!(Event::VoiceControl { command: VoiceCommand::StopSpeaking }.topic(), Topic::VoiceControl);
     }
 
-    // ------------------------------------------------------------ now playing
+    // ------------------------------------------------------------ music
+
+    fn track(title: &str, artist: &str) -> Track {
+        Track {
+            title: title.into(),
+            artist: artist.into(),
+            source: "youtube music".into(),
+            url: "https://example.invalid/stream".into(),
+        }
+    }
+
+    fn playing_status() -> MusicStatus {
+        MusicStatus { now: playing(), controllable: true, ..MusicStatus::default() }
+    }
 
     fn playing() -> NowPlaying {
         NowPlaying {
@@ -933,14 +1084,16 @@ mod tests {
     /// Both events and the bar status carry the same object, so a widget can
     /// render one line of QML for both.
     #[test]
-    fn now_playing_reaches_subscribers_and_the_bar() {
-        let ev = serde_json::to_value(ServerMessage::Event {
-            event: Event::NowPlaying { status: playing() },
-        })
-        .unwrap();
-        assert_eq!(ev["event"], "now_playing");
-        assert_eq!(ev["status"]["title"], "Hall of Fame");
-        assert_eq!(Event::NowPlaying { status: playing() }.topic(), Topic::Assistant);
+    fn music_status_reaches_subscribers_and_the_bar() {
+        let mut status = playing_status();
+        status.queue.push(track("Teardrop", "Massive Attack"));
+        let ev =
+            serde_json::to_value(ServerMessage::Event { event: Event::Music { status: status.clone() } })
+                .unwrap();
+        assert_eq!(ev["event"], "music");
+        assert_eq!(ev["status"]["now"]["title"], "Hall of Fame");
+        assert_eq!(ev["status"]["queue"][0]["artist"], "Massive Attack");
+        assert_eq!(Event::Music { status }.topic(), Topic::Assistant);
 
         let bar = serde_json::to_value(BarStatus {
             state: AssistantState::Idle,
@@ -968,28 +1121,111 @@ mod tests {
     }
 
     #[test]
-    fn now_playing_requests_parse() {
+    fn music_requests_parse() {
         let m: ClientMessage = serde_json::from_value(
-            json!({"id":1,"type":"now_playing","op":"set","title":"Windowlicker","artist":"Aphex Twin","pid":99}),
+            json!({"id":1,"type":"music","op":"play","query":"aphex twin windowlicker"}),
         )
         .unwrap();
         assert!(matches!(
             m.request,
-            Request::NowPlaying(NowPlayingRequest::Set { ref title, ref artist, pid: 99, .. })
-                if title == "Windowlicker" && artist == "Aphex Twin"
+            Request::Music(MusicRequest::Play { ref query }) if query == "aphex twin windowlicker"
         ));
-        // artist/source/pid are optional: a script that only knows the query
-        // still reports something.
+        for op in ["show", "position", "pause", "resume", "toggle", "next", "previous", "stop", "clear"] {
+            let v = json!({"id":2,"type":"music","op":op});
+            assert!(serde_json::from_value::<ClientMessage>(v).is_ok(), "music op `{op}` did not parse");
+        }
         let m: ClientMessage =
-            serde_json::from_value(json!({"id":2,"type":"now_playing","op":"set","title":"x"})).unwrap();
-        assert!(matches!(m.request, Request::NowPlaying(NowPlayingRequest::Set { .. })));
+            serde_json::from_value(json!({"id":5,"type":"music","op":"enqueue","query":"teardrop"})).unwrap();
+        assert!(
+            matches!(m.request, Request::Music(MusicRequest::Enqueue { ref query }) if query == "teardrop")
+        );
+        // An enqueue with nothing to add is a caller bug, not an empty queue.
+        assert!(
+            serde_json::from_value::<ClientMessage>(json!({"id":6,"type":"music","op":"enqueue"})).is_err()
+        );
         let m: ClientMessage =
-            serde_json::from_value(json!({"id":3,"type":"now_playing","op":"stop"})).unwrap();
-        assert!(matches!(m.request, Request::NowPlaying(NowPlayingRequest::Stop)));
-        // `set` without a title is a caller bug, not a blank track.
-        assert!(serde_json::from_value::<ClientMessage>(
-            json!({"id":4,"type":"now_playing","op":"set","artist":"nobody"})
-        )
-        .is_err());
+            serde_json::from_value(json!({"id":3,"type":"music","op":"remove","index":2})).unwrap();
+        assert!(matches!(m.request, Request::Music(MusicRequest::Remove { index: 2 })));
+        // An op nobody implements is a caller bug, not a silent no-op.
+        assert!(
+            serde_json::from_value::<ClientMessage>(json!({"id":4,"type":"music","op":"teleport"})).is_err()
+        );
+    }
+
+    /// The stream url is a several-hundred-character expiring link and no
+    /// client has a use for it. It stays on the daemon's side of the socket.
+    #[test]
+    fn a_queued_track_never_ships_its_stream_url() {
+        let mut t = track("Windowlicker", "Aphex Twin");
+        t.url = "https://rr6---sn.example.googlevideo.com/videoplayback?expire=1&sig=SECRET".into();
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("SECRET"), "the stream url leaked to clients: {json}");
+        // And it still round-trips, so a daemon that persisted a queue can
+        // read it back.
+        let back: Track = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.url, "");
+        assert_eq!(back.title, "Windowlicker");
+    }
+
+    /// A paused track keeps its row: `is_playing` means "has something to
+    /// show", not "is emitting sound", and the whole point of pausing is that
+    /// the row stays so it can be resumed.
+    #[test]
+    fn a_paused_track_is_still_shown() {
+        let mut t = playing();
+        t.state = NowPlayingState::Paused;
+        assert!(t.is_playing(), "a paused track vanished from the UI");
+        let stopped = NowPlaying { state: NowPlayingState::Stopped, ..t };
+        assert!(!stopped.is_playing(), "a stopped track is still on screen");
+        assert_eq!(stopped.state, NowPlayingState::Stopped);
+    }
+
+    /// Position moves every second. If it counted as a change, the daemon
+    /// would rewrite the bar file and push an event to every subscriber once
+    /// per second, for a progress bar that can animate on its own.
+    #[test]
+    fn a_moving_playhead_is_not_a_change() {
+        let a = playing_status();
+        let mut b = a.clone();
+        b.position = 1.0;
+        b.duration = 240.0;
+        assert!(!a.changed(&b), "the playhead was treated as a status change");
+        // But a real change still registers.
+        let mut c = b.clone();
+        c.now.state = NowPlayingState::Paused;
+        assert!(a.changed(&c), "pausing did not register as a change");
+        let mut d = b.clone();
+        d.queue.push(track("Teardrop", "Massive Attack"));
+        assert!(a.changed(&d), "queueing a track did not register as a change");
+    }
+
+    #[test]
+    fn queue_length_counts_the_current_track() {
+        let mut s = playing_status();
+        assert_eq!(s.len(), 1);
+        assert!(s.active());
+        s.queue.push(track("Teardrop", "Massive Attack"));
+        assert_eq!(s.len(), 2);
+        let empty = MusicStatus::default();
+        assert!(empty.is_empty());
+        assert!(!empty.active(), "an empty status claimed to be active");
+    }
+
+    /// Scraped metadata is bounded once, in one place, and a track with no
+    /// title is refused rather than silently played without ever being shown.
+    #[test]
+    fn track_metadata_is_capped_and_validated() {
+        assert!(Track::new("   ", "Nobody", "youtube", "u").is_err(), "a blank title was accepted");
+        let long = "x".repeat(500);
+        let t = Track::new(&long, &long, &long, "url").unwrap();
+        assert_eq!(t.title.chars().count(), 200);
+        assert_eq!(t.artist.chars().count(), 200);
+        assert_eq!(t.source.chars().count(), 60);
+        // Trimmed, so a metadata field that is all whitespace does not show up
+        // as a gap in the UI.
+        let t = Track::new("  Teardrop  ", "  Massive Attack ", " youtube music ", "u").unwrap();
+        assert_eq!(t.title, "Teardrop");
+        assert_eq!(t.artist, "Massive Attack");
+        assert_eq!(t.source, "youtube music");
     }
 }

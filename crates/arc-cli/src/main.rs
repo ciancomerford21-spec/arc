@@ -80,30 +80,39 @@ enum Cmd {
         #[arg(long)]
         follow: bool,
     },
-    /// Report or clear what is playing: `arc now-playing show|set|stop`.
-  ///
-  /// This is the IPC the playback scripts use. `set` is called once the player
-  /// is actually running, so the overlay never shows a track that failed to
-  /// start; `stop` clears it. `show` (the default) is a plain read -- the app
-  /// uses it on start so a track already playing appears without waiting for
-  /// the next change.
-  NowPlaying {
-    #[arg(value_name = "ACTION", default_value = "show")]
-    action: String,
-    /// Track title (with `set`).
-    #[arg(long)]
-    title: Option<String>,
-    /// Track artist (with `set`).
-    #[arg(long)]
-    artist: Option<String>,
-    /// Where it came from, e.g. "youtube music" (with `set`).
-    #[arg(long)]
-    source: Option<String>,
-    /// Player process, so the daemon can tell when playback ended.
-    #[arg(long)]
-    pid: Option<u32>,
-  },
-/// Stream daemon events (replies, state changes, confirmations).
+    /// Playback: `arc music <action>`.
+    ///
+    /// The daemon owns the player, so these act on the real thing rather than
+    /// reporting a status nobody can change:
+    ///
+    ///   show                    what is playing and what is queued (the default)
+    ///   play <query>            resolve and play, replacing the queue
+    ///   enqueue <query>         resolve and add to the end of the queue
+    ///   pause | resume | toggle stop, start or flip playback
+    ///   next | previous         skip through the queue
+    ///   stop                    stop playback and empty the queue
+    ///   clear                   empty the queue, keep playing
+    ///   remove <n>              drop the nth queued track
+    ///   position                the playhead, for a progress bar
+    ///
+    /// `position` is separate from `show` on purpose: it is the only part of the
+    /// status that changes on its own, so a client can poll it once a second
+    /// without also re-reading and re-rendering the whole queue.
+    Music {
+        #[arg(value_name = "ACTION", default_value = "show")]
+        action: String,
+        /// What to search for (with `play` and `enqueue`), or which queued track
+        /// to drop (with `remove`), counting from 0 after the track that is
+        /// playing.
+        ///
+        /// One positional, not two. With `query` and `index` as separate optional
+        /// positionals, clap filled the first with whatever came next, so
+        /// `arc music remove 0` put "0" in `query` and then refused for a
+        /// missing index.
+        #[arg(value_name = "QUERY_OR_INDEX")]
+        arg: Option<String>,
+    },
+    /// Stream daemon events (replies, state changes, confirmations).
     Watch {
         /// Topics: assistant, desktop, voice_activity, errors.
         #[arg(long, value_delimiter = ',', default_value = "assistant,errors")]
@@ -217,6 +226,67 @@ fn resolve_latest(conn: &mut Conn, approve: bool) -> Result<Value> {
 fn which(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// The search string for `play`/`enqueue`, or a message naming the argument
+/// that is missing rather than letting an empty search run.
+fn query_arg(action: &str, query: &Option<String>) -> Result<String> {
+    match query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        Some(q) => Ok(q.to_string()),
+        None => bail!(
+            "`arc music {action}` needs something to search for: `arc music {action} \"boards of canada\"`"
+        ),
+    }
+}
+
+/// What a person wants to read after asking for a playback action.
+///
+/// Deliberately not a JSON dump: these are the words the assistant and the
+/// user both see in a terminal. Every line here is something that actually
+/// happened -- a refused control says so rather than printing an empty status.
+fn print_music(action: &str, out: &Value) {
+    let now = &out["now"];
+    let label = now["label"].as_str().unwrap_or("");
+    let queued = out["queue"].as_array().map(|q| q.len()).unwrap_or(0);
+    match action {
+        "show" => {
+            if now["playing"] != true {
+                println!("nothing playing");
+                return;
+            }
+            println!(
+                "{}",
+                if now["state"] == "paused" { format!("{label}  (paused)") } else { label.to_string() }
+            );
+            for t in out["queue"].as_array().into_iter().flatten() {
+                // A queued track carries a title and an artist, not the
+                // combined `label` the current track has. Reading `label` here
+                // printed an empty line under every queued entry.
+                let title = t["title"].as_str().unwrap_or("");
+                let artist = t["artist"].as_str().unwrap_or("");
+                println!(
+                    "  queued: {title}{}",
+                    if artist.is_empty() { String::new() } else { format!(" — {artist}") }
+                );
+            }
+        }
+        "position" => {
+            println!(
+                "{:.0}s / {:.0}s",
+                out["position"].as_f64().unwrap_or(0.0),
+                out["duration"].as_f64().unwrap_or(0.0)
+            );
+        }
+        "play" | "enqueue" => {
+            println!("{label}");
+            if queued > 0 {
+                println!("{queued} more queued");
+            }
+        }
+        "stop" => println!("stopped"),
+        "clear" => println!("queue cleared"),
+        _ => println!("{label}"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -405,35 +475,53 @@ fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_secs(3));
             }
         }
-        Cmd::NowPlaying { action, title, artist, source, pid } => {
-            // `set` needs a title. Saying so here rather than letting the
-            // daemon's "needs a title" error come back keeps the message next
-            // to the flag that is missing.
+        Cmd::Music { action, arg } => {
             let req = match action.as_str() {
-                "show" | "get" => json!({"type": "now_playing", "op": "show"}),
-                "set" => {
-                    let Some(title) = title else {
-                        bail!("`arc now-playing set` needs --title \"Track name\"");
-                    };
-                    json!({
-                        "type": "now_playing", "op": "set", "title": title,
-                        "artist": artist.unwrap_or_default(),
-                        "source": source.unwrap_or_default(),
-                        "pid": pid.unwrap_or(0),
-                    })
+                "show" | "get" => json!({"type": "music", "op": "show"}),
+                "position" => json!({"type": "music", "op": "position"}),
+                "play" => json!({"type": "music", "op": "play", "query": query_arg(&action, &arg)?}),
+                "enqueue" | "queue" | "add" => {
+                    json!({"type": "music", "op": "enqueue", "query": query_arg(&action, &arg)?})
                 }
-                "stop" | "clear" => json!({"type": "now_playing", "op": "stop"}),
-                other => bail!("unknown now-playing action `{other}` (show, set, stop)"),
+                "pause" => json!({"type": "music", "op": "pause"}),
+                "resume" => json!({"type": "music", "op": "resume"}),
+                "toggle" => json!({"type": "music", "op": "toggle"}),
+                "next" | "skip" => json!({"type": "music", "op": "next"}),
+                "previous" | "back" => json!({"type": "music", "op": "previous"}),
+                "stop" => json!({"type": "music", "op": "stop"}),
+                "clear" => json!({"type": "music", "op": "clear"}),
+                "remove" => {
+                    // Parsed from the one positional rather than taken as a
+                    // second optional positional: with two, clap handed
+                    // `remove 0`'s "0" to `query` and this arm always saw
+                    // `index` as None.
+                    let index = arg
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .and_then(|a| a.parse::<usize>().ok())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "`arc music remove` needs which queued track to drop, counted from \
+                                 0 after the one playing: `arc music remove 0`"
+                            )
+                        })?;
+                    json!({"type": "music", "op": "remove", "index": index})
+                }
+                other => bail!(
+                    "unknown music action `{other}` (show, position, play, enqueue, pause, \
+                     resume, toggle, next, previous, stop, clear, remove)"
+                ),
             };
-            // Reading must work without the daemon: a playback script that
-            // finds no socket should still be able to clear a stale track, and
-            // a widget asking "what is playing?" should get "nothing" rather
-            // than an error dialog. Stopping is local state, so treat an
-            // unreachable daemon as already stopped.
-            let out = match Conn::open(&sock, Some(Duration::from_secs(5))).and_then(|mut c| c.call(req)) {
+            // Reading must work without the daemon: a widget asking "what is
+            // playing?" should get "nothing" rather than an error dialog, and
+            // stopping is local state, so an unreachable daemon counts as
+            // already stopped.
+            let out = match Conn::open(&sock, Some(Duration::from_secs(60))).and_then(|mut c| c.call(req)) {
                 Ok(v) => v,
-                Err(_) if action == "stop" || action == "clear" => json!({
-                    "state": "stopped", "title": "", "artist": "", "label": "", "playing": false,
+                Err(_) if action == "stop" => json!({
+                    "now": {"state": "stopped", "title": "", "artist": "", "label": "", "playing": false},
+                    "queue": [],
                 }),
                 Err(e) => return Err(e),
             };
@@ -441,11 +529,7 @@ fn main() -> Result<()> {
                 println!("{out}");
                 return Ok(());
             }
-            if out["playing"] == true {
-                println!("{}", out["label"].as_str().unwrap_or(""));
-            } else {
-                println!("nothing playing");
-            }
+            print_music(&action, &out);
         }
         Cmd::Watch { topics } => {
             let mut c = Conn::open(&sock, None)?;

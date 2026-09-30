@@ -33,9 +33,18 @@ if grep -qi "play_youtube_music" "$work/log"; then
 else
   echo "ok: the daemon logged no complaint about play_youtube_music"
 fi
-if grep -q "now-playing" "$TOOLS/play_youtube_music/run.sh" 2>/dev/null; then
-  echo "ok: the installed script reports the track"
+if grep -q "music play" "$TOOLS/play_youtube_music/run.sh" 2>/dev/null; then
+  echo "ok: the installed script delegates to the daemon"
 else
-  echo "FAIL: the installed script does not report the track"; fail=1
+  echo "FAIL: the installed script does not delegate to 'arc music play'"; fail=1
+fi
+# The point of the rewrite: the script must not start its own player. A second
+# mpv is the original bug -- nothing can pause, skip or queue what Arc does not
+# own.
+if grep -Eq "(^|[^a-z_])mpv|yt-dlp" "$TOOLS/play_youtube_music/run.sh" 2>/dev/null; then
+  echo "FAIL: the installed script still starts a player of its own:"; fail=1
+  grep -nE "mpv|yt-dlp" "$TOOLS/play_youtube_music/run.sh"
+else
+  echo "ok: the installed script starts no player of its own"
 fi
 exit "$fail"

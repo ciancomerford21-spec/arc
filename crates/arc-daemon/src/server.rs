@@ -197,7 +197,7 @@ pub async fn handle(d: &Daemon, msg: ClientMessage) -> ServerMessage {
             ServerMessage::ok(id, d.confirm(&confirmation_id, approve).await)
         }
         Request::CallTool { tool, args } => ServerMessage::ok(id, d.call_tool(&tool, args).await),
-        Request::NowPlaying(r) => match d.now_playing(r) {
+        Request::Music(r) => match d.music(r) {
             Ok(status) => ServerMessage::ok(id, status),
             Err(e) => ServerMessage::err(id, ErrorCode::BadRequest, e),
         },

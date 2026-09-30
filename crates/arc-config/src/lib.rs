@@ -59,6 +59,7 @@ pub struct Config {
     pub logging: Logging,
     pub tools: Tools,
     pub code: Code,
+    pub music: Music,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -454,6 +455,66 @@ impl Default for Code {
     }
 }
 
+/// Is `prog` an executable on PATH? Used to warn about a playback config
+/// that names a player or resolver this machine does not have -- a warning,
+/// because the browser fallback is exactly the case where that is fine.
+fn on_path(prog: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if prog.is_empty() || prog.contains('/') {
+        return false;
+    }
+    std::env::var_os("PATH").is_some_and(|p| {
+        std::env::split_paths(&p).any(|d| {
+            std::fs::metadata(d.join(prog))
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// Playback. Arc owns the player process, which is what makes pause, skip and
+/// a queue real rather than decorative: a player started and forgotten has no
+/// handle to control.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Music {
+    /// Master switch. Off means every `music` request is refused with a
+    /// message saying so, rather than silently doing nothing.
+    pub enabled: bool,
+    /// The player binary. Resolved on PATH; Arc starts it with an IPC socket
+    /// and drives pause/skip/queue through that socket.
+    pub player: String,
+    /// Turns a search string into a stream url plus title and artist.
+    pub resolver: String,
+    /// How long a resolution may take before it is called failed, in seconds.
+    /// yt-dlp normally answers in a couple of seconds; a hung one would
+    /// otherwise hold the daemon's socket handler open indefinitely.
+    pub resolve_timeout_s: u64,
+    /// How many tracks to pull back for one request, so `arc music enqueue`
+    /// can add an album's worth without five separate searches.
+    pub search_results: usize,
+    /// Most tracks that can sit in the queue.
+    pub queue_limit: usize,
+    /// Open a YouTube Music search page when nothing can play locally. The
+    /// old script did this by itself; it is here so both the voice tool and
+    /// the UI get the same behaviour, and so it is one switch.
+    pub browser_fallback: bool,
+}
+
+impl Default for Music {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            player: "mpv".into(),
+            resolver: "yt-dlp".into(),
+            resolve_timeout_s: 30,
+            search_results: 1,
+            queue_limit: 100,
+            browser_fallback: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Permissions {
@@ -745,6 +806,27 @@ pub fn validate(c: &Config) -> Result<Vec<String>, ConfigError> {
     }
     if c.files.allowed_roots.iter().any(|r| r.trim() == "/") {
         warnings.push("files.allowed_roots contains \"/\": file tools can reach the whole filesystem".into());
+    }
+    // A queue that cannot hold anything, or a resolver with no time to answer,
+    // are mistakes worth refusing rather than discovering on the first song.
+    if c.music.queue_limit == 0 {
+        errors.push("music.queue_limit must be at least 1".into());
+    }
+    if c.music.search_results == 0 {
+        errors.push("music.search_results must be at least 1".into());
+    }
+    if c.music.resolve_timeout_s == 0 {
+        errors.push("music.resolve_timeout_s must be at least 1".into());
+    }
+    // A warning, not an error: the whole point of the fallback is that a box
+    // without mpv still gets a search page, so a missing player is a degraded
+    // install rather than a broken config.
+    if c.music.enabled {
+        for (key, prog) in [("player", &c.music.player), ("resolver", &c.music.resolver)] {
+            if !on_path(prog) {
+                warnings.push(format!("music.{key} = {prog:?} is not on PATH; playback will fall back"));
+            }
+        }
     }
     if errors.is_empty() { Ok(warnings) } else { Err(ConfigError::Invalid(errors.join("; "))) }
 }

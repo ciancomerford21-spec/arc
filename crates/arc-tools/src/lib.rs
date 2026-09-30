@@ -11,7 +11,7 @@ use arc_hyprland::dispatch::{Dispatch, WindowSel};
 use arc_proto::RiskLevel;
 use arc_security::shell::ShellAnalyzer;
 use async_trait::async_trait;
-use serde_json::{Map, Value as Json};
+use serde_json::{Map, Value as Json, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -732,6 +732,58 @@ impl Tool for AudioVolumeGet {
 // Media tools
 // ---------------------------------------------------------------------------
 
+/// Send one request to the daemon over its socket and return `data`.
+///
+/// Blocking, and used from the media tools' async `execute`, so each call is
+/// wrapped in `spawn_blocking` at the call site rather than here.
+///
+/// Returns `None` when there is no daemon to talk to, which is the normal case
+/// in tests and in the one-off tool runner: a missing daemon must fall through
+/// to MPRIS, not fail.
+fn daemon_music(op: Json) -> Option<Result<Json, String>> {
+    use std::io::{BufRead, BufReader, Write};
+    let sock = arc_proto::socket_path();
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).ok()?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok()?;
+    let mut r = BufReader::new(s.try_clone().ok()?);
+    writeln!(s, "{}", json!({"id": 1, "type": "music", "op": op})).ok()?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if r.read_line(&mut line).ok()? == 0 {
+            return Some(Err("the daemon closed the connection".into()));
+        }
+        let v: Json = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v["kind"] == "response" && v["id"] == 1 {
+            return Some(if v["status"] == "ok" {
+                Ok(v["data"].clone())
+            } else {
+                Err(v["error"]["message"].as_str().unwrap_or("request failed").to_string())
+            });
+        }
+    }
+}
+
+/// Pause / resume / skip through the daemon's own player when one is playing
+/// there, and otherwise fall through to MPRIS.
+///
+/// Arc owns the player it starts, so it is the one place a pause can be a
+/// queue-aware, stateful operation rather than a D-Bus call to whichever
+/// process happens to have claimed the bus name. MPRIS stays as the path for
+/// Spotify, Chromium and anything else Arc did not start.
+async fn prefer_daemon(op: &'static str) -> Option<Result<Json, String>> {
+    // Ask first: if the daemon is playing something, the answer is its player.
+    let status = tokio::task::spawn_blocking(|| daemon_music(json!("show"))).await.ok()??;
+    let status = status.ok()?;
+    if status["now"]["controllable"] != true {
+        return None;
+    }
+    Some(tokio::task::spawn_blocking(move || daemon_music(json!(op))).await.ok()??)
+}
+
 struct MediaPlay;
 #[async_trait]
 impl Tool for MediaPlay {
@@ -757,6 +809,14 @@ impl Tool for MediaPlay {
             Ok(m) => m,
             Err(e) => return ToolResult::Error(format!("media player connection failed: {e}")),
         };
+        if name.is_none()
+            && let Some(r) = prefer_daemon("resume").await
+        {
+            return match r {
+                Ok(s) => ToolResult::Ok(s),
+                Err(e) => ToolResult::Error(format!("failed to resume: {e}")),
+            };
+        }
         match m.control(arc_system::media::MediaAction::Play, name.as_deref()).await {
             Ok(p) => ToolResult::Ok(serde_json::json!({
                 "player": p.name, "status": p.status, "title": p.title, "artist": p.artist,
@@ -783,6 +843,16 @@ impl Tool for MediaPause {
     }
     async fn execute(&self, args: &JsonMap) -> ToolResult {
         let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+        // The daemon's own player first: it is the one Arc started, and it
+        // knows what is queued behind the track it is playing.
+        if name.is_none()
+            && let Some(r) = prefer_daemon("pause").await
+        {
+            return match r {
+                Ok(s) => ToolResult::Ok(s),
+                Err(e) => ToolResult::Error(format!("failed to pause: {e}")),
+            };
+        }
         let m = match arc_system::media::Media::connect().await {
             Ok(m) => m,
             Err(e) => return ToolResult::Error(format!("media player connection failed: {e}")),
@@ -821,6 +891,14 @@ impl Tool for MediaNext {
             Ok(m) => m,
             Err(e) => return ToolResult::Error(format!("media player connection failed: {e}")),
         };
+        if name.is_none()
+            && let Some(r) = prefer_daemon("next").await
+        {
+            return match r {
+                Ok(s) => ToolResult::Ok(s),
+                Err(e) => ToolResult::Error(format!("failed to skip: {e}")),
+            };
+        }
         match m.control(arc_system::media::MediaAction::Next, name.as_deref()).await {
             Ok(p) => ToolResult::Ok(serde_json::json!({
                 "player": p.name, "status": p.status, "title": p.title, "artist": p.artist,

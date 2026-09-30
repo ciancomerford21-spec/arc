@@ -1,12 +1,13 @@
-> **Now playing.** The overlay shows the track that is playing, and clears it
-> when playback stops. A playback tool reports it over the socket
-> (`arc --json now-playing set …`, passing the player's pid), the daemon stores
-> it and pushes a `now_playing` event, and it appears in the app's header. The
-> row clears when the player process disappears — the daemon polls the pid,
-> because the tool that started the track has already exited by the time it ends
-> and is the only thing that knows. The bar widget gets it in its tooltip for
-> free. See [docs/now-playing.md](docs/now-playing.md) for the design and
-> `scripts/install-tools.sh` to sync the tool from the repo.
+> **Music.** The daemon owns the player. `arc music play <query>` resolves with
+> `yt-dlp` and drives mpv over its JSON IPC, so `pause`, `resume`, `toggle`,
+> `next`, `previous`, `stop`, `clear` and `remove` act on the thing actually
+> playing rather than on a status nobody can change. The overlay has a MUSIC
+> section with a progress bar, transport and the queue; the header chip shows the
+> current track and how much is queued behind it. Resolved stream URLs never
+> leave the daemon — YouTube's expire in hours. This replaced a script that
+> started a detached `mpv` and exited, which is why there were no handles to
+> pause. See [docs/now-playing.md](docs/now-playing.md) for the design and the
+> verified mpv command set.
 
 # Arc
 

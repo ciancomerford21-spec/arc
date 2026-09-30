@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# The playback script must report to the daemon only once something is really
-# playing, and must never leave a title up for a track that never started.
+# The playback tool is now a thin front door onto `arc music play`, so what is
+# worth testing is what it says and when it fails.
 #
-# The script is the only thing that knows what actually happened -- whether
-# yt-dlp found a stream, whether mpv launched -- so this runs the real script
-# with stub yt-dlp/mpv/arc on PATH and checks what it told the stub daemon.
+# It used to resolve the search and start mpv itself, which needed stub yt-dlp
+# and mpv on PATH plus a fake daemon to report to. All of that now happens
+# inside the daemon, which is covered end to end against a stub player that
+# speaks mpv's real IPC protocol (crates/arc-daemon/tests/daemon.rs). What is
+# left here is the part that is still a shell script: the argument it requires,
+# the exit code it returns, and the fact that a failure is said out loud rather
+# than swallowed into a success.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,135 +27,96 @@ check() {
     echo "  want: $want" >&2
   fi
 }
+contains() {
+  local what="$1" hay="$2" needle="$3"
+  case "$hay" in
+    *"$needle"*) pass=$((pass + 1)) ;;
+    *)
+      fail=$((fail + 1))
+      echo "FAIL: $what" >&2
+      echo "  output: $hay" >&2
+      echo "  wanted to contain: $needle" >&2
+      ;;
+  esac
+}
+nonzero() {
+  local what="$1" rc="$2"
+  if [ "$rc" -ne 0 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL: $what (exited 0)" >&2
+  fi
+}
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 bin="$work/bin"
 mkdir -p "$bin"
 
-# A stub `arc` that records every now-playing call as one line.
+# A stub `arc` that records how it was called and answers with whatever the
+# test told it to answer with.
 cat >"$bin/arc" <<EOF
 #!/usr/bin/env bash
-# \$*: the flags arc was called with, minus the leading --json
 if [ "\${1:-}" = "--json" ]; then shift; fi
 echo "\$*" >> "$work/calls"
-echo '{}'
-EOF
-chmod +x "$bin/arc"
-
-# A stub yt-dlp: -g prints a stream URL, --print prints one field per call.
-cat >"$bin/yt-dlp" <<'EOF'
-#!/usr/bin/env bash
-case "$*" in
-  *-g*) echo "https://example.invalid/stream.m4a" ;;
-  *"%(title)s"*) echo "Hall of Fame" ;;
-  *"%(uploader)s"*) echo "Boards of Canada" ;;
-esac
-EOF
-chmod +x "$bin/yt-dlp"
-
-# A stub mpv that records its pid and stays alive until told otherwise.
-cat >"$bin/mpv" <<EOF
-#!/usr/bin/env bash
-echo "\$\$" > "$work/mpv_pid"
-sleep 30
-EOF
-chmod +x "$bin/mpv"
-
-# A stub xdg-open, present but never wanted in the success case.
-cat >"$bin/xdg-open" <<EOF
-#!/usr/bin/env bash
-echo "\$*" > "$work/xdg_called"
-EOF
-chmod +x "$bin/xdg-open"
-
-export PATH="$bin:$PATH"
-export ARC_ARG_QUERY="Boards of Canada Hall of Fame"
-
-# ---------------------------------------------------------------- success
-out="$(bash "$SCRIPT")"
-calls="$(cat "$work/calls")"
-check "plays with mpv" "$(printf '%s' "$out" | grep -c 'Playing locally with mpv')" "1"
-check "uses the real title, not the query" \
-  "$(printf '%s' "$out" | grep -c 'Hall of Fame — Boards of Canada')" "1"
-check "reports one set" "$(printf '%s\n' "$calls" | grep -c 'now-playing set')" "1"
-check "reports the title" \
-  "$(printf '%s\n' "$calls" | grep -c -- '--title Hall of Fame')" "1"
-check "reports the artist" \
-  "$(printf '%s\n' "$calls" | grep -c -- '--artist Boards of Canada')" "1"
-check "reports the source" \
-  "$(printf '%s\n' "$calls" | grep -c -- '--source youtube music')" "1"
-# The pid must be mpv's own, or the daemon cannot tell when the track ends.
-mpv_pid="$(cat "$work/mpv_pid" 2>/dev/null)"
-check "reports mpv's pid" \
-  "$(printf '%s\n' "$calls" | grep -c -- "--pid $mpv_pid")" "1"
-check "the browser fallback was not used" \
-  "$([ -f "$work/xdg_called" ] && echo yes || echo no)" "no"
-# And nothing must kill it during the test; the stub mpv sleeps 30s.
-check "mpv is still running" "$(kill -0 "$mpv_pid" 2>/dev/null && echo yes || echo no)" "yes"
-kill "$mpv_pid" 2>/dev/null
-wait 2>/dev/null
-
-# A stale track must be cleared even when the request itself was unusable --
-# "play " with no query is exactly when the overlay would otherwise keep showing
-# the last thing that played.
-: >"$work/calls"
-out="$(ARC_ARG_QUERY="" bash "$SCRIPT")"
-check "an empty query fails" "$(printf '%s' "$out" | grep -c 'ERROR: no query')" "1"
-check "an empty query clears the row" \
-  "$(printf '%s\n' "$(cat "$work/calls")" | grep -c 'now-playing stop')" "1"
-check "an empty query never reports a track" \
-  "$(printf '%s\n' "$(cat "$work/calls")" | grep -c 'now-playing set')" "0"
-
-# ---------------------------------------- yt-dlp finds nothing: clear, don't set
-: >"$work/calls"
-cat >"$bin/yt-dlp" <<'EOF'
-#!/usr/bin/env bash
-case "$*" in
-  *"%(title)s"*) echo "Hall of Fame" ;;
-  *"%(uploader)s"*) echo "Boards of Canada" ;;
-  *-g*) : ;;
-esac
-EOF
-chmod +x "$bin/yt-dlp"
-out="$(bash "$SCRIPT")"
-check "no stream means no mpv" "$(printf '%s' "$out" | grep -c 'found no stream')" "1"
-check "a failed start reports stop" \
-  "$(printf '%s\n' "$(cat "$work/calls")" | grep -c 'now-playing stop')" "1"
-check "a failed start never reports a track" \
-  "$(printf '%s\n' "$(cat "$work/calls")" | grep -c 'now-playing set')" "0"
-
-# ---------------------------------------- browser fallback: clear, never claim
-: >"$work/calls"
-cat >"$bin/xdg-open" <<EOF
-#!/usr/bin/env bash
+cat "$work/reply"
+# The real CLI exits non-zero when the daemon answered with an error, and the
+# script branches on that exit code rather than on the JSON.
+grep -q '"error"' "$work/reply" && exit 1
 exit 0
 EOF
-chmod +x "$bin/xdg-open"
-# A PATH with no mpv and no yt-dlp at all. /usr/bin cannot be on it: on this
-# machine the real mpv and yt-dlp live there, and the test would silently
-# exercise the success path instead of the fallback it is meant to check. The
-# coreutils the script needs are symlinked in individually.
-bare="$work/bare"
-mkdir -p "$bare"
-for tool in bash python3 head cat tr sed grep; do
-  real="$(command -v "$tool" 2>/dev/null)" || continue
-  ln -sf "$real" "$bare/$tool"
-done
-ln -sf "$bin/arc" "$bare/arc"
-ln -sf "$bin/xdg-open" "$bare/xdg-open"
-check "the stub PATH really has no mpv" \
-  "$(PATH="$bare" command -v mpv >/dev/null 2>&1 && echo yes || echo no)" "no"
-check "the stub PATH really has no yt-dlp" \
-  "$(PATH="$bare" command -v yt-dlp >/dev/null 2>&1 && echo yes || echo no)" "no"
-out="$(PATH="$bare" ARC_COMMAND="$bare/arc" bash "$SCRIPT")"
-check "the browser is used when there is no player" \
-  "$(printf '%s' "$out" | grep -c 'Opened YouTube Music search')" "1"
-# Nothing Arc started is playing, so claiming a track would be a lie.
-check "the browser fallback reports stop" \
-  "$(printf '%s\n' "$(cat "$work/calls")" | grep -c 'now-playing stop')" "1"
-check "the browser fallback never reports a track" \
-  "$(printf '%s\n' "$(cat "$work/calls")" | grep -c 'now-playing set')" "0"
+chmod +x "$bin/arc"
+: >"$work/calls"
 
+PLAYING='{"now":{"state":"playing","title":"Windowlicker","artist":"Aphex Twin","label":"Windowlicker — Aphex Twin","playing":true},"queue":[]}'
+QUEUED='{"now":{"state":"playing","title":"Windowlicker","artist":"Aphex Twin","label":"Windowlicker — Aphex Twin","playing":true},"queue":[{"title":"Teardrop"},{"title":"Roygbiv"}]}'
+
+run() {
+  : >"$work/calls"
+  ARC_COMMAND="$bin/arc" ARC_ARG_QUERY="${1-}" bash "$SCRIPT" >"$work/out" 2>&1
+  RC=$?
+  OUT="$(cat "$work/out")"
+  CALLS="$(cat "$work/calls")"
+}
+
+# --- the happy path ---------------------------------------------------------
+printf '%s' "$PLAYING" >"$work/reply"
+run "aphex twin"
+check "a played track exits 0" "$RC" "0"
+contains "the real title is spoken, not the query" "$OUT" "Playing Windowlicker"
+check "it asks the daemon to play the query verbatim" "$CALLS" "music play aphex twin"
+
+# --- a queue behind the track is mentioned ----------------------------------
+printf '%s' "$QUEUED" >"$work/reply"
+run "aphex twin"
+contains "a queued count is reported" "$OUT" "2 more queued"
+
+# --- a refusal is a failure, and is said ------------------------------------
+printf '%s' '{"error":{"message":"no playable result for \"kjsdfh\""}}' >"$work/reply"
+run "kjsdfh"
+nonzero "a refused search exits non-zero" "$RC"
+contains "the daemon's reason survives to the user" "$OUT" "no playable result"
+
+# The browser-fallback message is the daemon's now, not this script's. Losing
+# it would mean silence after a request to play music, which reads as a bug.
+printf '%s' '{"error":{"message":"no stream. Opened a YouTube Music search page instead"}}' >"$work/reply"
+run "obscure thing"
+nonzero "the fallback is still a non-zero exit" "$RC"
+contains "the fallback is reported, not hidden" "$OUT" "search page"
+
+# --- a daemon that answers with no track ------------------------------------
+printf '%s' '{"now":{"state":"stopped","playing":false}}' >"$work/reply"
+run "aphex twin"
+nonzero "a reply with no track is a failure" "$RC"
+
+# --- no query ---------------------------------------------------------------
+printf '%s' "$PLAYING" >"$work/reply"
+run ""
+nonzero "no query exits non-zero" "$RC"
+contains "no query says so" "$OUT" "no query"
+check "no query does not reach the daemon" "$CALLS" ""
+
+echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

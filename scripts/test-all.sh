@@ -14,7 +14,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 steps=(
   "cargo test --workspace|cargo test --workspace"
   "scripts/test-music-tool.sh|bash scripts/test-music-tool.sh"
-  "scripts/test-now-playing-cli.sh|bash scripts/test-now-playing-cli.sh"
+  "scripts/test-music-cli.sh|bash scripts/test-music-cli.sh"
   "scripts/check-qml.sh|bash scripts/check-qml.sh"
 )
 

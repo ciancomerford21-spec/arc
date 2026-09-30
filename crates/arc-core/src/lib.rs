@@ -150,10 +150,46 @@ impl Router {
                     m
                 })),
             )?,
-            // Media
-            FixedRule::new(r"(?i)^next\s*track$", "media_next", 1.0, None)?,
-            FixedRule::new(r"(?i)^previous\s*track$", "media_previous", 1.0, None)?,
-            FixedRule::new(r"(?i)^pause$", "media_pause", 1.0, None)?,
+            // Media. The object of the verb is optional and may carry a
+            // determiner or a politeness word: "pause", "pause the music",
+            // "pause playback" and "can you pause the song" are all the same
+            // request. A rule anchored to the bare verb left every one of those
+            // to the model, which then had to work out what to do -- and could
+            // answer by talking about music instead of pausing it.
+            FixedRule::new(
+                r"(?i)^(?:can\s+you\s+|please\s+)?(?:next(?:\s+(?:track|song|one))?|skip(?:\s+(?:to\s+)?(?:the\s+)?(?:next\s+)?(?:track|song|one))?)\s*(?:please)?$",
+                "media_next",
+                1.0,
+                None,
+            )?,
+            FixedRule::new(
+                r"(?i)^(?:go\s+)?(?:previous|back|last)\s*(?:track|song|one)?\s*(?:please)?$",
+                "media_previous",
+                1.0,
+                None,
+            )?,
+            FixedRule::new(
+                r"(?i)^(?:can\s+you\s+|please\s+)?(?:pause|hold)\s+(?:the\s+|this\s+)?(?:music|playback|track|song|audio|it)\s*(?:please)?$",
+                "media_pause",
+                1.0,
+                None,
+            )?,
+            FixedRule::new(r"(?i)^(?:pause|hold)\s*(?:please)?$", "media_pause", 1.0, None)?,
+            FixedRule::new(
+                r"(?i)^(?:can\s+you\s+|please\s+)?(?:resume|unpause|continue)\s+(?:the\s+)?(?:music|playback|track|song|it)\s*(?:please)?$",
+                "media_play",
+                1.0,
+                None,
+            )?,
+            // The object is optional here: bare "resume" is as common as "resume the
+            // music", and without this it was the one transport phrase that
+            // still fell through to the model.
+            FixedRule::new(
+                r"(?i)^(?:resume|unpause)(?:\s+(?:the\s+)?(?:music|playback|track|song|it))?\s*(?:please)?$",
+                "media_play",
+                1.0,
+                None,
+            )?,
             FixedRule::new(r"(?i)^play$", "media_play", 1.0, None)?,
             FixedRule::new(r"(?i)^(?:what['\']s?\s+)?(?:now\s+)?play(?:ing)?$", "media_info", 1.0, None)?,
             // Self-made tools. Deterministic because the model got this wrong
@@ -1453,6 +1489,54 @@ mod tests {
         }
         // The preposition must survive: it is never the number word.
         assert_eq!(Router::number_words_to_digits("switch to workspace two"), "switch to workspace 2");
+    }
+
+    #[test]
+    fn media_control_phrasings_all_reach_the_transport() {
+        // Every one of these is a thing a person actually says, and every one
+        // of them used to reach the model instead of the transport -- which
+        // would then answer by talking about music rather than pausing it.
+        // The strings are the recogniser's, including the fused and trailing
+        // punctuation the voice layer produces.
+        for (said, want) in [
+            ("pause", "media_pause"),
+            ("Pause.", "media_pause"),
+            ("pause the music", "media_pause"),
+            ("can you pause the song", "media_pause"),
+            ("pause playback", "media_pause"),
+            ("please pause the track", "media_pause"),
+            ("resume", "media_play"),
+            ("resume the music", "media_play"),
+            ("unpause playback", "media_play"),
+            ("next track", "media_next"),
+            ("next", "media_next"),
+            ("skip", "media_next"),
+            ("skip to the next track", "media_next"),
+            ("skip the song", "media_next"),
+            ("previous track", "media_previous"),
+            ("go back", "media_previous"),
+            ("last track", "media_previous"),
+            ("play", "media_play"),
+        ] {
+            let out = router().route(&NluInput::text(said, InputSource::Voice));
+            // Assert the route variant, not just the tool: the model can call
+            // the same tool, so the name alone passes on the fallback path too.
+            assert_eq!(out.route, Route::FixedCommand, "{said:?} went to the model: {out:?}");
+            assert_eq!(out.tool_name.as_deref(), Some(want), "{said:?} -> {:?}", out.args);
+        }
+    }
+
+    #[test]
+    fn a_sentence_about_music_is_not_a_transport_command() {
+        // The widening above must not swallow real questions: these need the
+        // model, and a rule that claimed them would pause the music in answer
+        // to a question about it.
+        for said in
+            ["what song is this", "pause the video and tell me the time", "how do i pause playback in mpv"]
+        {
+            let out = router().route(&NluInput::text(said, InputSource::Voice));
+            assert_ne!(out.route, Route::FixedCommand, "{said:?} was taken as a fixed rule: {out:?}");
+        }
     }
 
     #[test]

@@ -185,6 +185,25 @@ reasoning = "medium"
 # killed mid-write.
 run_budget_s = 0
 
+[music]
+# Arc owns the player: it starts mpv with an IPC socket and drives pause,
+# skip and the queue through that socket. That is the whole reason those work --
+# a player started in the background and forgotten has no handle.
+enabled = true
+player = "mpv"
+# Turns a search string into a stream url plus a real title and artist, so the
+# overlay shows "Windowlicker - Aphex Twin" rather than your own words back.
+resolver = "yt-dlp"
+# A resolution that has not answered in this long is called failed rather than
+# left holding the request open.
+resolve_timeout_s = 30
+# Tracks pulled back per request, so one enqueue can add several.
+search_results = 1
+queue_limit = 100
+# When nothing can play locally, open a YouTube Music search page instead of
+# failing. Nothing is reported as playing in that case -- Arc did not start it.
+browser_fallback = true
+
 [personality]
 custom_prompt = """
 Relaxed, confident, a bit wry. You're a very capable friend who happens to live on this machine, not a corporate assistant. Use contractions: "yeah", "yep", "nope", "I'll", "that's". Never say "Certainly", "I would be happy to", or "The requested operation has completed". Say "Done." or "Yeah, give me a second." and mean it.

@@ -221,85 +221,261 @@ fn second_daemon_refuses_live_socket() {
     assert_eq!(Client::connect(&d.socket).data(json!({"type": "ping"}))["pong"], true);
 }
 
-/// The whole point of the feature, end to end: the playback script's report
-/// comes back out of the real socket as an event the overlay subscribes to,
-/// and the row clears when the player process is gone.
+// ---------------------------------------------------------------------------
+// Music
+// ---------------------------------------------------------------------------
+
+/// A stand-in for mpv that speaks mpv's JSON IPC protocol, and a stand-in for
+/// yt-dlp.
 ///
-/// The report is made over the socket rather than by running the script,
-/// because the script's `arc` call is the same call -- running mpv and yt-dlp
-/// in a test would need both, a network, and would actually play music.
+/// The point is that nothing above the player is faked: the daemon starts this
+/// as a real child process, connects to a real Unix socket, and speaks the real
+/// protocol to it. So these tests cover the wire format too -- if a command
+/// name or a property name is wrong, the stub answers `invalid parameter`
+/// exactly as mpv does, and the test fails. Starting a real mpv would play
+/// audio on whoever is running the suite.
+fn write_player_stub(dir: &Path, log: &Path) -> PathBuf {
+    let script = dir.join("fake-mpv");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, os, socket, sys
+sock = sys.argv[sys.argv.index("--input-ipc-server") + 1]
+log = open({log:?}, "a", buffering=1)
+if os.path.exists(sock):
+    os.remove(sock)
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(sock)
+srv.listen(1)
+conn, _ = srv.accept()
+buf = b""
+paused = False
+while True:
+    data = conn.recv(65536)
+    if not data:
+        break
+    buf += data
+    while b"\n" in buf:
+        line, buf = buf.split(b"\n", 1)
+        if not line.strip():
+            continue
+        req = json.loads(line)
+        cmd = req.get("command", [])
+        log.write(json.dumps(cmd) + "\n")
+        rid = req.get("request_id")
+        name = cmd[0] if cmd else ""
+        if name == "get_property":
+            prop = cmd[1]
+            data = {{"playlist-pos": 0, "playlist-count": 2, "pause": paused,
+                     "time-pos": 7.0, "duration": 233.0, "idle-active": False}}.get(prop)
+        elif name == "set_property" and cmd[1] == "pause":
+            paused = bool(cmd[2])
+            data = None
+        else:
+            data = None
+        reply = {{"data": data, "request_id": rid, "error": "success"}}
+        if name == "frobnicate":
+            reply["error"] = "invalid parameter"
+        conn.sendall((json.dumps(reply) + "\n").encode())
+"#,
+            log = log.display().to_string()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    script
+}
+
+/// A stand-in for yt-dlp: one line of `--print` output per result.
+fn write_resolver_stub(dir: &Path) -> PathBuf {
+    let script = dir.join("fake-yt-dlp");
+    std::fs::write(
+        &script,
+        "#!/usr/bin/env python3\nimport sys\n# Everything after \"ytsearchN:\" is the query the caller searched for.\nargs = sys.argv[1:]\nquery = \"\"\nfor a in args:\n    if a.startswith(\"ytsearch\"):\n        query = a.split(\":\", 1)[1]\nn = 1\nfor a in args:\n    if a.startswith(\"ytsearch\"):\n        n = int(a[len(\"ytsearch\"):].split(\":\")[0] or 1)\nfor i in range(n):\n    print(\"%s %d|||Boards of Canada|||https://example.invalid/stream%d\" % (query, i, i))\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    script
+}
+
+/// Start a daemon wired to the stubs, and hand back the command log path.
+fn start_with_music() -> (Arcd, PathBuf) {
+    // A directory that outlives this function: the daemon reads the stubs out
+    // of it for the whole run, and a TempDir would delete them mid-test.
+    // Unique per call, because these tests run in parallel in one binary and
+    // two daemons sharing one player stub would answer each other's commands.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("arc-music-stub-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("player.log");
+    let player = write_player_stub(&dir, &log);
+    let resolver = write_resolver_stub(&dir);
+    let cfg = format!(
+        "[music]\nenabled = true\nbrowser_fallback = false\nplayer = {:?}\nresolver = {:?}\n",
+        player.display().to_string(),
+        resolver.display().to_string()
+    );
+    let d = start(&cfg, &["--no-voice"]);
+    // Hold the TempDir open for as long as the daemon: the stubs are read from
+    // it for the whole run, and dropping it would delete them mid-test.
+    (d, log)
+}
+
+fn player_log(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log).unwrap_or_default().lines().map(str::to_string).collect()
+}
+
+/// The whole feature, end to end: a search resolves, the player is told to
+/// play it, a subscriber sees it, the transport reaches the player, and
+/// stopping clears everything.
 #[test]
-fn now_playing_reaches_subscribers_and_clears_when_the_player_dies() {
-    let d = start("", &["--no-voice"]);
+fn music_plays_pauses_queues_and_stops_through_the_real_socket() {
+    let (d, log) = start_with_music();
     let mut sub = Client::connect(&d.socket);
     sub.data(json!({"type": "subscribe", "topics": ["assistant"]}));
     let mut c = Client::connect(&d.socket);
 
-    // Nothing playing at first.
-    let empty = c.data(json!({"type": "now_playing", "op": "show"}));
-    assert_eq!(empty["state"], "stopped");
-    assert_eq!(empty["playing"], false);
-    assert_eq!(c.data(json!({"type": "bar_status"})).get("now_playing"), None);
+    // Nothing playing to begin with, and a read is a read.
+    let empty = c.data(json!({"type": "music", "op": "show"}));
+    assert_eq!(empty["now"]["state"], "stopped");
+    assert_eq!(empty["queue"].as_array().unwrap().len(), 0);
+    assert!(c.data(json!({"type": "bar_status"})).get("now_playing").is_none());
 
-    // A report from a playback tool.
-    let set = c.data(json!({
-        "type": "now_playing", "op": "set",
-        "title": "Hall of Fame", "artist": "Boards of Canada",
-        "source": "youtube music", "pid": 0,
-    }));
-    assert_eq!(set["playing"], true);
-    assert_eq!(set["label"], "Hall of Fame — Boards of Canada");
+    // Play something.
+    let s = c.data(json!({"type": "music", "op": "play", "query": "hall of fame"}));
+    assert_eq!(s["now"]["title"], "hall of fame 0");
+    assert_eq!(s["now"]["artist"], "Boards of Canada");
+    assert_eq!(s["now"]["state"], "playing");
+    assert_eq!(s["now"]["label"], "hall of fame 0 — Boards of Canada");
+    assert_eq!(s["controllable"], true);
+    // The stream url is never sent to a client.
+    assert!(!serde_json::to_string(&s).unwrap().contains("example.invalid/stream"));
 
-    let ev = sub.wait_event(|e| e["event"] == "now_playing", Duration::from_secs(5));
-    assert_eq!(ev["status"]["title"], "Hall of Fame");
-    assert_eq!(ev["status"]["artist"], "Boards of Canada");
-    assert_eq!(ev["status"]["label"], "Hall of Fame — Boards of Canada");
-    // The overlay's own read agrees with what it was told.
-    assert_eq!(c.data(json!({"type": "now_playing", "op": "show"}))["title"], "Hall of Fame");
-    let bar = c.data(json!({"type": "bar_status"}));
-    assert_eq!(bar["now_playing"]["title"], "Hall of Fame");
+    // The playhead is filled in by the supervisor, not by the play request:
+    // the request answers immediately and the player has not been asked where
+    // it is yet. Wait for a tick, which is also the only thing that proves the
+    // supervisor is running at all.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pos = c.data(json!({"type": "music", "op": "position"}));
+        if pos["duration"].as_f64().unwrap_or(0.0) > 0.0 {
+            assert_eq!(pos["duration"], 233.0, "the playhead was never picked up");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the supervisor never reported a position: {pos}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
-    // Stopping clears it and says so.
-    let stopped = c.data(json!({"type": "now_playing", "op": "stop"}));
-    assert_eq!(stopped["playing"], false);
+    let ev = sub.wait_event(|e| e["event"] == "music", Duration::from_secs(5));
+    assert_eq!(ev["status"]["now"]["title"], "hall of fame 0");
+    assert_eq!(c.data(json!({"type": "bar_status"}))["now_playing"]["title"], "hall of fame 0");
+
+    // The player was actually handed the resolved stream.
+    assert!(
+        player_log(&log).iter().any(|l| l.contains("example.invalid/stream0")),
+        "the player was never asked to load the track: {:?}",
+        player_log(&log)
+    );
+
+    // Pause reaches the player and the row says paused.
+    let s = c.data(json!({"type": "music", "op": "pause"}));
+    assert_eq!(s["now"]["state"], "paused");
+    assert_eq!(s["now"]["playing"], true, "a paused track must stay on screen");
     let ev = sub.wait_event(
-        |e| e["event"] == "now_playing" && e["status"]["playing"] == false,
+        |e| e["event"] == "music" && e["status"]["now"]["state"] == "paused",
         Duration::from_secs(5),
     );
-    assert_eq!(ev["status"]["title"], "", "a stop must not leave the old title attached: {ev}");
-    assert_eq!(c.data(json!({"type": "bar_status"})).get("now_playing"), None);
-}
+    assert_eq!(ev["status"]["now"]["title"], "hall of fame 0");
 
-/// A blank title is a client bug and must be an error, not an empty row on the
-/// overlay that nobody can tell apart from a rendering fault.
-#[test]
-fn a_now_playing_report_without_a_title_is_refused() {
-    let d = start("", &["--no-voice"]);
-    let mut c = Client::connect(&d.socket);
-    let v = c.call(json!({"type": "now_playing", "op": "set", "artist": "Nobody"}));
-    assert_eq!(v["status"], "error");
-    assert_eq!(v["error"]["code"], "bad_request");
-    assert!(c.data(json!({"type": "bar_status"})).get("now_playing").is_none());
-}
+    // Resume.
+    assert_eq!(c.data(json!({"type": "music", "op": "resume"}))["now"]["state"], "playing");
 
-/// The reap is the only thing that clears the row when a track ends on its own:
-/// the tool that started it has already exited by then. Report a pid that cannot
-/// exist and the row must clear on its own, within a second or two, with no
-/// further requests.
-#[test]
-fn a_dead_player_clears_the_row_without_being_asked() {
-    let d = start("", &["--no-voice"]);
-    let mut sub = Client::connect(&d.socket);
-    sub.data(json!({"type": "subscribe", "topics": ["assistant"]}));
-    let mut c = Client::connect(&d.socket);
-    // u32::MAX is above pid_t's range, so it can never be a real process.
-    c.data(json!({"type": "now_playing", "op": "set", "title": "Already Gone", "pid": u32::MAX}));
+    // Queue a second track; it must be appended, not replace what is playing.
+    let s = c.data(json!({"type": "music", "op": "enqueue", "query": "teardrop"}));
+    assert_eq!(s["now"]["title"], "hall of fame 0", "enqueue changed the playing track");
+    assert_eq!(s["queue"][0]["title"], "teardrop 0");
     let ev = sub.wait_event(
-        |e| e["event"] == "now_playing" && e["status"]["playing"] == false,
-        Duration::from_secs(10),
+        |e| e["event"] == "music" && !e["status"]["queue"].as_array().unwrap().is_empty(),
+        Duration::from_secs(5),
     );
-    assert_eq!(ev["status"]["title"], "", "{ev}");
-    assert_eq!(c.data(json!({"type": "now_playing", "op": "show"}))["playing"], false);
+    assert_eq!(ev["status"]["queue"][0]["title"], "teardrop 0");
+
+    // Removing queue position 0 must not touch the playing track.
+    let s = c.data(json!({"type": "music", "op": "remove", "index": 0}));
+    assert_eq!(s["now"]["title"], "hall of fame 0");
+    assert_eq!(s["queue"].as_array().unwrap().len(), 0);
+
+    // Stopping kills the player process and clears everything.
+    let s = c.data(json!({"type": "music", "op": "stop"}));
+    assert_eq!(s["now"]["state"], "stopped");
+    assert_eq!(s["queue"].as_array().unwrap().len(), 0);
+    let ev = sub.wait_event(
+        |e| e["event"] == "music" && e["status"]["now"]["state"] == "stopped",
+        Duration::from_secs(5),
+    );
+    assert_eq!(ev["status"]["now"]["title"], "", "a stop left the old title attached: {ev}");
+    assert!(c.data(json!({"type": "bar_status"})).get("now_playing").is_none());
+    assert!(player_log(&log).iter().any(|l| l.contains("\"quit\"")));
+
+    // And with nothing playing, the transport controls refuse rather than
+    // reporting a success that did nothing.
+    let v = c.call(json!({"type": "music", "op": "next"}));
+    assert_eq!(v["status"], "error");
+}
+
+/// Controls with nothing playing are errors, not silent successes.
+#[test]
+fn music_controls_refuse_when_nothing_is_playing() {
+    let (d, _log) = start_with_music();
+    let mut c = Client::connect(&d.socket);
+    for op in ["pause", "resume", "next", "previous"] {
+        let v = c.call(json!({"type": "music", "op": op}));
+        assert_eq!(v["status"], "error", "`{op}` on silence reported success");
+        assert!(v["error"]["message"].as_str().unwrap().contains("nothing"), "{v}");
+    }
+}
+
+/// A query with nothing to search for is refused before any process starts.
+#[test]
+fn music_refuses_an_empty_query() {
+    let (d, log) = start_with_music();
+    let mut c = Client::connect(&d.socket);
+    let v = c.call(json!({"type": "music", "op": "play", "query": "   "}));
+    assert_eq!(v["status"], "error");
+    assert!(player_log(&log).is_empty(), "a player was started for an empty query");
+}
+
+/// The daemon owns the player, so the player must not outlive it: on shutdown
+/// the process it started is gone.
+#[test]
+fn the_player_does_not_outlive_the_daemon() {
+    let (d, log) = start_with_music();
+    let mut c = Client::connect(&d.socket);
+    c.data(json!({"type": "music", "op": "play", "query": "gate"}));
+    let pid = c.data(json!({"type": "music", "op": "show"}))["now"]["pid"].as_u64();
+    assert!(pid.is_some_and(|p| p > 0), "no player pid was reported");
+    assert!(unsafe { libc::kill(pid.unwrap() as i32, 0) } == 0, "the player is not running");
+    drop(d);
+    // SIGTERM is async; the process gets a moment to exit on its own.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if unsafe { libc::kill(pid.unwrap() as i32, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the player outlived the daemon that started it; it was asked: {:?}", player_log(&log));
 }
 
 fn voice_available() -> bool {

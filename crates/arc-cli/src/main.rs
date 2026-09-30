@@ -57,6 +57,16 @@ enum Cmd {
     Status,
     /// List tools with their risk levels.
     Tools,
+    /// Change a tool's safety classification: `arc tool reboot dangerous`.
+    ///
+    /// The same thing the Arc app's dropdown does; the app shells out to this
+    /// rather than opening a socket itself. `default` restores the tool's own
+    /// level, and `show` prints it without changing anything.
+    Tool {
+        name: String,
+        #[arg(default_value = "show", value_name = "LEVEL")]
+        level: String,
+    },
     /// Voice control: start | stop | toggle | cancel | stop-speaking | say <text>.
     Voice {
         action: String,
@@ -259,13 +269,67 @@ fn main() -> Result<()> {
             }
             for x in t.as_array().into_iter().flatten() {
                 println!(
-                    "{:<20} {:<10} {}{}",
+                    "{:<20} {:<10} {}{}{}",
                     x["name"].as_str().unwrap_or(""),
                     x["risk"].as_str().unwrap_or(""),
                     x["description"].as_str().unwrap_or(""),
-                    if x["enabled"] == false { "  (disabled)" } else { "" }
+                    if x["enabled"] == false { "  (disabled)" } else { "" },
+                    // Say so when the user has overridden the tool's own level,
+                    // and what they overrode: otherwise the list disagrees with
+                    // the code and there is no way to tell why.
+                    if x["reclassified"] == true {
+                        format!("  [was {}]", x["default_risk"].as_str().unwrap_or("?"))
+                    } else {
+                        String::new()
+                    }
                 );
             }
+        }
+        Cmd::Tool { name, level } => {
+            // `show` is a read, so it must not need a level argument at all --
+            // the app uses it to render a row before the user has clicked.
+            let body = match level.as_str() {
+                "show" => json!({"type": "tools"}),
+                "default" | "reset" => {
+                    json!({"type": "set_tool_class", "tool": name, "level": Value::Null})
+                }
+                "safe" | "caution" | "dangerous" => {
+                    json!({"type": "set_tool_class", "tool": name, "level": level})
+                }
+                other => bail!(
+                    "unknown classification `{other}` (safe, caution, dangerous, default, show)"
+                ),
+            };
+            let r = Conn::open(&sock, Some(Duration::from_secs(5)))?.call(body)?;
+            if cli.json {
+                println!("{r}");
+                return Ok(());
+            }
+            if level == "show" {
+                // Print just this tool's row.
+                if let Some(x) =
+                    r.as_array().and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(name.as_str())))
+                {
+                    println!(
+                        "{:<20} {:<10} {}{}",
+                        x["name"].as_str().unwrap_or(""),
+                        x["risk"].as_str().unwrap_or(""),
+                        if x["enabled"] == false { "  (disabled)" } else { "" },
+                        if x["reclassified"] == true {
+                            format!("  (built-in {})", x["default_risk"].as_str().unwrap_or("?"))
+                        } else {
+                            String::new()
+                        }
+                    );
+                } else {
+                    bail!("no such tool `{name}`");
+                }
+                return Ok(());
+            }
+            println!(
+                "{name} is now {}.",
+                r["risk"].as_str().unwrap_or("unchanged")
+            );
         }
         Cmd::Voice { action, text } => {
             let command = match action.as_str() {

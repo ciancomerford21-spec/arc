@@ -1,7 +1,11 @@
 // Arc — standalone desktop app (Quickshell).
 //
 // Three panes, all live, no polling:
-//   TOOLS    every tool Arc can call, with its description and risk level
+//   TOOLS    every tool Arc can call, with its description and risk level, and
+//            a per-tool safety selector (safe | caution | dangerous) that the
+//            user drives directly. Setting it shells out to `arc tool <name>
+//            <level>`; the daemon persists it, so it is still there after a
+//            restart. Nothing here edits a config file.
 //            (`arc --json tools`, loaded once, refreshable)
 //   CHAT     what you said and what Arc answered
 //   TRACE    the thought process of the selected turn: the model's reasoning,
@@ -46,11 +50,18 @@ ShellRoot {
   function riskColor(r) {
     return r === "dangerous" ? c.red : r === "caution" ? c.amber : c.green
   }
+  readonly property var levels: ["safe", "caution", "dangerous"]
 
   // ------------------------------------------------------------ state
   property string arcState: "offline"
   property string model: ""
   property var tools: []
+  // Set while a classification is being written, so the row can show it and
+  // ignore further clicks until the daemon answers.
+  property string classBusy: ""
+  // Last classification change, shown in the header. Empty until the user
+  // touches one.
+  property string classNote: ""
   // turns: [{id, query, source, at, steps:[...], reply, done}]
   // step:  {kind: thought|tool|confirm|error, ...}
   property var turns: []
@@ -107,6 +118,7 @@ ShellRoot {
       if (!hit) { hit = { kind: "tool", tool: r.tool, args: r.args, risk: r.risk, at: now() }; t.steps.push(hit) }
       hit.status = String(r.outcome || "success")
       hit.summary = String(r.summary || "")
+      hit.warning = String(r.warning || "")
       hit.ms = r.duration_ms || 0
     } else if (e === "confirmation_required") {
       var p = v.pending || {}
@@ -125,6 +137,38 @@ ShellRoot {
     selected = -1
     Quickshell.execDetached([arcCmd, "ask", q])
   }
+
+  // Change one tool's safety classification.
+  //
+  // Optimistic on purpose: the write is a socket round trip plus a disk write,
+  // and a dropdown that lags a click behind feels broken. The row is patched
+  // in place immediately and reloaded from the daemon afterwards, so a
+  // failure corrects itself rather than leaving a lie on screen.
+  function setClass(name, level) {
+    if (classBusy) return
+    if (level !== "safe" && level !== "caution" && level !== "dangerous" && level !== "default") return
+    classBusy = name
+    classNote = name + " → " + level
+    var next = tools.map(function(t) {
+      if (t.name !== name) return t
+      var u = Object.assign({}, t)
+      u.risk = level === "default" ? t.default_risk : level
+      u.reclassified = level !== "default" && level !== t.default_risk
+      return u
+    })
+    tools = next
+    Quickshell.execDetached([arcCmd, "tool", name, level])
+    reloadTimer.restart()
+  }
+
+  // Re-read the tool list once the write has had time to land. The daemon is
+  // the authority on what was actually stored.
+  Timer {
+    id: reloadTimer
+    interval: 350
+    onTriggered: { toolLoader.running = false; toolLoader.running = true; classBusy = "" }
+  }
+
   function decide(step, yes) {
     // `step` may be a stale copy; mark the live one.
     for (var i = 0; i < turns.length; i++)
@@ -229,6 +273,9 @@ ShellRoot {
         Item { Layout.fillWidth: true }
         Tag { label: shell.arcState.toUpperCase(); tint: shell.arcState === "offline" ? c.red : shell.arcState === "idle" ? c.cyanDim : c.magenta }
         Tag { label: shell.tools.length + " TOOLS"; tint: c.cyanDim }
+        // Echoes the last classification change, so a click is confirmed
+        // somewhere other than in the row the user was looking at.
+        Tag { visible: shell.classNote !== ""; label: shell.classNote; tint: c.amber }
         Tag { label: shell.turns.length + " TURNS"; tint: c.cyanDim }
       }
       Rectangle { Layout.fillWidth: true; height: 1; color: c.cyan; opacity: 0.35 }
@@ -273,6 +320,10 @@ ShellRoot {
                 border.color: open ? c.cyanDim : c.line
                 opacity: modelData.enabled ? 1 : 0.45
                 Rectangle { width: 3; height: parent.height - 12; anchors.verticalCenter: parent.verticalCenter; x: 0; radius: 1; color: shell.riskColor(modelData.risk) }
+                // Declared before the content on purpose: a MouseArea takes
+                // clicks from anything painted above it, so the row-expander
+                // would otherwise eat every click on the safety picker.
+                MouseArea { id: ma; anchors.fill: parent; hoverEnabled: true; onClicked: parent.open = !parent.open }
                 Column {
                   id: tcol
                   x: 12; y: 8; width: parent.width - 20; spacing: 4
@@ -280,6 +331,19 @@ ShellRoot {
                     spacing: 8
                     Text { text: modelData.name; color: c.text; font.family: c.mono; font.pixelSize: 13; font.bold: true }
                     Text { text: modelData.category; color: c.muted; font.family: c.mono; font.pixelSize: 10; anchors.baseline: parent.children[0].baseline }
+                    Item { width: 4; height: 1 }
+                    // The per-tool safety selector. Three cells rather than a
+                    // dropdown: the choice is three items wide, and seeing all
+                    // three at once is the point — a collapsed menu hides the
+                    // fact that "dangerous" is one click away.
+                    RiskPicker {
+                      tool: modelData.name
+                      current: modelData.risk
+                      builtin: modelData.default_risk
+                      reclassified: modelData.reclassified
+                      enabled: !modelData.enabled || shell.classBusy === ""
+                      onPicked: function(level) { shell.setClass(modelData.name, level) }
+                    }
                   }
                   Text {
                     width: parent.width
@@ -301,11 +365,15 @@ ShellRoot {
                   }
                   Text {
                     visible: open
-                    text: modelData.risk.toUpperCase() + (modelData.enabled ? "" : "  ·  DISABLED")
+                    text: {
+                      var s = modelData.reclassified
+                        ? "CLASSIFIED " + modelData.risk.toUpperCase() + "  ·  BUILT-IN " + modelData.default_risk.toUpperCase()
+                        : modelData.risk.toUpperCase()
+                      return s + (modelData.enabled ? "" : "  ·  DISABLED")
+                    }
                     color: shell.riskColor(modelData.risk); font.family: c.mono; font.pixelSize: 10; font.letterSpacing: 1
                   }
                 }
-                MouseArea { id: ma; anchors.fill: parent; hoverEnabled: true; onClicked: parent.open = !parent.open }
               }
             }
           }
@@ -470,6 +538,14 @@ ShellRoot {
                       visible: text.length > 0; maximumLineCount: 8; elide: Text.ElideRight
                       text: step && step.kind === "tool" && step.summary ? "→ " + step.summary : ""
                     }
+                    // A caution-classified tool ran without a prompt, and the
+                    // user should be able to see that afterwards rather than
+                    // wondering why nothing asked.
+                    Text {
+                      width: parent.width; wrapMode: Text.Wrap; color: c.amber; font.family: c.mono; font.pixelSize: 11
+                      visible: step !== null && step.kind === "tool" && !!step.warning
+                      text: step && step.kind === "tool" && step.warning ? "⚠ " + step.warning : ""
+                    }
                   }
                 }
                 Row {
@@ -524,6 +600,88 @@ ShellRoot {
     height: 24; width: tl.implicitWidth + 20; radius: 3
     color: "transparent"; border.color: tint
     Text { id: tl; anchors.centerIn: parent; text: parent.label; color: parent.tint; font.family: c.mono; font.pixelSize: 11; font.bold: true; font.letterSpacing: 1 }
+  }
+
+  // Per-tool safety classification: three cells, one click each.
+  //
+  // A segmented control rather than a ComboBox on purpose. The whole point of
+  // the feature is that marking a read-only tool `dangerous` is a decision the
+  // user should make with all three options visible, not by opening a menu and
+  // scanning it. The tick marks the level the tool ships with, so an override
+  // is visible as an override and not mistaken for a mistake in the code.
+  component RiskPicker: Row {
+    id: picker
+    property string tool: ""
+    property string current: "safe"     // effective level (what the runtime uses)
+    property string builtin: "safe"     // level the tool declares
+    property bool reclassified: false
+    signal picked(string level)
+    spacing: 0
+
+    readonly property real cellW: 30
+
+    Repeater {
+      model: shell.levels
+      delegate: Rectangle {
+        required property string modelData
+        readonly property bool active: modelData === picker.current
+        readonly property bool isBuiltin: modelData === picker.builtin
+        width: picker.cellW
+        height: 20
+        radius: 2
+        color: active ? Qt.rgba(shell.riskColor(modelData).r, shell.riskColor(modelData).g, shell.riskColor(modelData).b, 0.22) : "transparent"
+        border.color: active ? shell.riskColor(modelData) : c.line
+        border.width: active ? 1.5 : 1
+        opacity: picker.enabled ? 1 : 0.4
+
+        Text {
+          anchors.centerIn: parent
+          text: isBuiltin ? "•" : modelData === "dangerous" ? "!" : modelData === "caution" ? "~" : "·"
+          color: active ? shell.riskColor(modelData) : c.muted
+          font.family: c.mono; font.pixelSize: 12; font.bold: true
+        }
+        MouseArea {
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onEntered: parent.opacity = 1
+          onExited: parent.opacity = picker.enabled ? 1 : 0.4
+          onClicked: {
+            // Clicking the level it is already at is not a no-op: it clears
+            // the override and puts the tool back to what the code says.
+            if (picker.current === modelData)
+              picker.picked("default")
+            else
+              picker.picked(modelData)
+          }
+        }
+      }
+    }
+
+    // A reset button, only while something is actually overridden. Without it
+    // the way back to the built-in level is "click the current value", which
+    // is discoverable exactly once.
+    Rectangle {
+      visible: picker.reclassified
+      width: visible ? 20 : 0
+      height: 20
+      radius: 2
+      color: resetMa.containsMouse ? c.panelHi : "transparent"
+      border.color: c.line
+      Text {
+        anchors.centerIn: parent
+        text: "↺"
+        color: resetMa.containsMouse ? c.cyan : c.muted
+        font.family: c.mono; font.pixelSize: 12
+      }
+      MouseArea {
+        id: resetMa
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: picker.picked("default")
+      }
+    }
   }
 
   component Button_: Rectangle {

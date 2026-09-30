@@ -9,6 +9,7 @@
 //! * Automations live in a separate file, see [`automations`].
 
 pub mod automations;
+pub mod classification;
 pub mod paths;
 
 use arc_proto::{RiskLevel, VoiceMode};

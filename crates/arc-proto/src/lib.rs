@@ -131,6 +131,15 @@ pub enum Request {
     BarStatus,
     /// List registered tools. Returns `Vec<ToolInfo>`.
     Tools,
+    /// Change one tool's safety classification from the UI.
+    ///
+    /// `level = null` clears the override and restores the tool's built-in
+    /// risk. Returns the updated [`ToolInfo`] for that tool.
+    SetToolClass {
+        tool: String,
+        /// `safe` | `caution` | `dangerous`, or null to reset.
+        level: Option<RiskLevel>,
+    },
     /// Current desktop snapshot. Returns the desktop state JSON.
     Desktop,
     /// Memory operations.
@@ -371,6 +380,11 @@ pub struct ActionRecord {
     pub outcome: ActionOutcome,
     /// Short human summary of the result or failure.
     pub summary: String,
+    /// Why this call carried a warning — set when the user has classified the
+    /// tool `caution`, so the UI and the CLI can say so out loud. Nothing
+    /// else populates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub data: Value,
     pub duration_ms: u64,
@@ -402,7 +416,15 @@ pub struct PendingConfirmation {
 pub struct ToolInfo {
     pub name: String,
     pub description: String,
+    /// The risk the runtime will actually apply: the user's classification if
+    /// they set one, otherwise the tool's own assessed level.
     pub risk: RiskLevel,
+    /// The level the tool declares in code. Shown next to `risk` so the UI
+    /// can mark a row as overridden.
+    pub default_risk: RiskLevel,
+    /// True when the user has classified this tool differently from its
+    /// built-in level.
+    pub reclassified: bool,
     pub category: String,
     pub parameters: Value,
     pub enabled: bool,
@@ -617,6 +639,27 @@ mod tests {
             let m: Result<ClientMessage, _> = serde_json::from_value(json!({"id":1,"type":t}));
             assert!(m.is_ok(), "{t} failed: {m:?}");
         }
+    }
+
+    /// The UI sends this when the user picks a level in the tool list. A null
+    /// level means "reset to the tool's own risk", which is a different
+    /// request from `"safe"` and must not decode as it.
+    #[test]
+    fn set_tool_class_roundtrip() {
+        let m: ClientMessage =
+            serde_json::from_value(json!({"id":4,"type":"set_tool_class","tool":"reboot","level":"safe"}))
+                .unwrap();
+        assert!(matches!(m.request, Request::SetToolClass { ref tool, level: Some(RiskLevel::Safe) }
+            if tool == "reboot"));
+        let m: ClientMessage =
+            serde_json::from_value(json!({"id":5,"type":"set_tool_class","tool":"reboot","level":null}))
+                .unwrap();
+        assert!(matches!(m.request, Request::SetToolClass { level: None, .. }));
+        // A level the UI should never send is a parse error, not a default.
+        assert!(serde_json::from_value::<ClientMessage>(
+            json!({"id":6,"type":"set_tool_class","tool":"reboot","level":"spicy"})
+        )
+        .is_err());
     }
 
     #[test]

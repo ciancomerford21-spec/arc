@@ -1,5 +1,26 @@
 # Arc
 
+> **Note on this change (per-tool safety classification).** The Arc app's
+> TOOLS pane now has a three-cell selector on every tool row — `safe`,
+> `caution`, `dangerous` — driven by `RiskPicker` in
+> `integrations/arc-app/shell.qml`. Choices made there, and the reasonable
+> defaults the task left open:
+>
+> * **Storage.** `~/.config/arc/tool_classes.json` (override:
+>   `$ARC_TOOL_CLASSES`), not a `[tools]` table in `config.toml`. The UI
+>   rewrites this on every click; rewriting a file the user may be editing in
+>   a text editor is how comments get lost. The daemon is the only writer and
+>   loads the file once at start, so a classification survives a restart.
+> * **Precedence.** A classification replaces the tool's *own* risk level and
+>   is applied before the permission policy, so `dangerous` always prompts even
+>   if a policy would have allowed the call. It is not a permission: a call the
+>   tool blocks (e.g. `rm -rf /`) is still refused, and a `deny` rule or a
+>   disabled tool still wins.
+> * **Reset.** Clicking the already-active cell, or the `↺` button that appears
+>   only while overridden, clears the override and restores the built-in level.
+> * **CLI equivalent.** `arc tool <name> {safe|caution|dangerous|default|show}`,
+>   which is what the app shells out to.
+
 A local-first voice assistant for Omarchy (Hyprland). Say **"Hey Arc, …"** and it
 controls your desktop, apps, audio, media and system, or just talks.
 

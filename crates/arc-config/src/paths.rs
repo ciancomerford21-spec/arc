@@ -51,6 +51,20 @@ pub fn automations_file() -> PathBuf {
     config_dir().join("automations.toml")
 }
 
+/// Per-tool safety classifications set from the Arc app
+/// (override: `$ARC_TOOL_CLASSES`).
+///
+/// Its own file rather than a `[tools]` table in config.toml: these are
+/// rewritten on every click in the UI, and a config file being rewritten
+/// while the user is editing it in a text editor is a lost-comment
+/// argument waiting to happen. A separate JSON file is only ever written by
+/// Arc.
+pub fn tool_classes_file() -> PathBuf {
+    std::env::var_os("ARC_TOOL_CLASSES").map(PathBuf::from).unwrap_or_else(|| {
+        config_dir().join("tool_classes.json")
+    })
+}
+
 pub fn models_dir() -> PathBuf {
     data_dir().join("models")
 }

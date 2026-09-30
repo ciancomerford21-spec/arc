@@ -199,28 +199,11 @@ pub async fn handle(d: &Daemon, msg: ClientMessage) -> ServerMessage {
         Request::CallTool { tool, args } => ServerMessage::ok(id, d.call_tool(&tool, args).await),
         Request::Status => ServerMessage::ok(id, d.status()),
         Request::BarStatus => ServerMessage::ok(id, d.bar_status()),
-        Request::Tools => {
-            let g = d.assistant.gate();
-            let tools: Vec<_> = g
-                .tools()
-                .specs()
-                .into_iter()
-                .map(|s| {
-                    let risk = g.risk_of(&s.name, &Default::default()).unwrap_or(arc_proto::RiskLevel::Safe);
-                    let enabled = !g.is_disabled(&s.name);
-                    arc_proto::ToolInfo {
-                        category: s.name.split('_').next().unwrap_or("").into(),
-                        unavailable_reason: (!enabled).then(|| "disabled in configuration".into()),
-                        name: s.name,
-                        description: s.description,
-                        risk,
-                        parameters: s.parameters,
-                        enabled,
-                    }
-                })
-                .collect();
-            ServerMessage::ok(id, tools)
-        }
+        Request::Tools => ServerMessage::ok(id, d.tool_list()),
+        Request::SetToolClass { tool, level } => match d.set_tool_class(&tool, level) {
+            Ok(info) => ServerMessage::ok(id, info),
+            Err(e) => ServerMessage::err(id, ErrorCode::NotFound, e),
+        },
         Request::Voice { command } => {
             if matches!(command, VoiceCommand::Speak { .. } | VoiceCommand::StopSpeaking)
                 || d.snapshot().voice.is_some()

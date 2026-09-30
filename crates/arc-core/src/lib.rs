@@ -592,8 +592,19 @@ impl Assistant {
     /// `ai.provider = "none"` (or a broken provider config) Arc still
     /// handles fixed commands.
     pub fn from_config(cfg: &Config, store: Option<Arc<MemoryStore>>) -> Result<Self, String> {
+        Self::from_config_with_classes(cfg, store, arc_config::classification::ClassifiedTools::in_memory())
+    }
+
+    /// As [`Assistant::from_config`], but with the user's saved per-tool
+    /// classifications attached, so the gate enforces them. The daemon passes
+    /// the store it loaded from disk; a library caller gets an empty one.
+    pub fn from_config_with_classes(
+        cfg: &Config,
+        store: Option<Arc<MemoryStore>>,
+        classes: arc_config::classification::ClassifiedTools,
+    ) -> Result<Self, String> {
         let tools = Arc::new(Tools::from_config_with_memory(cfg, store.clone())?);
-        let gate = Arc::new(Gate::new(tools, cfg));
+        let gate = Arc::new(Gate::with_classes(tools, cfg, classes));
         let (agent, provider_name) = match arc_ai::from_config(&cfg.ai) {
             Ok(p) => {
                 let name = p.primary_name().to_string();

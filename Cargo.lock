@@ -112,6 +112,7 @@ dependencies = [
  "thiserror",
  "toml",
  "toml_edit",
+ "tracing",
 ]
 
 [[package]]
@@ -128,6 +129,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

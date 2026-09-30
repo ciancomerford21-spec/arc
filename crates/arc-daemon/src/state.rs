@@ -130,7 +130,14 @@ impl Daemon {
             .map(PathBuf::from)
             .unwrap_or_else(|| paths::data_dir().join("memory"));
         let store = MemoryStore::new(memory_path);
-        let mut assistant = Assistant::from_config(&config, Some(Arc::new(store)))?;
+        // Per-tool classifications, edited from the Arc app's tool list. The
+        // file is the only place they live, so this is what makes a
+        // classification survive a daemon restart.
+        let classes = arc_config::classification::ClassifiedTools::load_default();
+        if !classes.map().is_empty() {
+            tracing::info!(path = %classes.path().display(), count = classes.map().len(), "tool classifications loaded");
+        }
+        let mut assistant = Assistant::from_config_with_classes(&config, Some(Arc::new(store)), classes)?;
         let path = std::env::var_os("ARC_AUTOMATIONS")
             .map(PathBuf::from)
             .unwrap_or_else(arc_config::paths::automations_file);
@@ -255,6 +262,49 @@ impl Daemon {
         let reply = self.assistant.handle(&NluInput::text(text, to_core(source))).await;
         watchdog.abort();
         self.finish(reply, start)
+    }
+
+    /// The full tool list as the UI and CLI see it: each tool's effective risk
+    /// (after the user's classification), the level the code declares, and
+    /// whether the two differ.
+    pub fn tool_list(&self) -> Vec<arc_proto::ToolInfo> {
+        let g = self.assistant.gate();
+        g.tools()
+            .specs()
+            .into_iter()
+            .map(|s| {
+                let default_risk = g.base_risk_of(&s.name).unwrap_or(arc_proto::RiskLevel::Safe);
+                let risk = g.risk_of(&s.name, &Default::default()).unwrap_or(default_risk);
+                let enabled = !g.is_disabled(&s.name);
+                arc_proto::ToolInfo {
+                    category: s.name.split('_').next().unwrap_or("").into(),
+                    unavailable_reason: (!enabled).then(|| "disabled in configuration".into()),
+                    reclassified: g.classification(&s.name).is_some(),
+                    name: s.name,
+                    description: s.description,
+                    risk,
+                    default_risk,
+                    parameters: s.parameters,
+                    enabled,
+                }
+            })
+            .collect()
+    }
+
+    /// Change one tool's classification, from the UI's dropdown. Persisted by
+    /// the gate before this returns, so a failure here means nothing changed.
+    pub fn set_tool_class(
+        &self,
+        tool: &str,
+        level: Option<arc_proto::RiskLevel>,
+    ) -> Result<arc_proto::ToolInfo, String> {
+        let g = self.assistant.gate();
+        g.set_classification(tool, level)?;
+        tracing::info!(tool, level = %level.map(|l| l.to_string()).unwrap_or_else(|| "default".into()), "classification changed");
+        self.tool_list()
+            .into_iter()
+            .find(|t| t.name == tool)
+            .ok_or_else(|| format!("unknown tool `{tool}`"))
     }
 
     pub async fn confirm(&self, id: &str, approve: bool) -> AskResult {
@@ -504,6 +554,7 @@ mod tests {
             risk: arc_proto::RiskLevel::Caution,
             outcome,
             summary: String::new(),
+            warning: None,
             data: serde_json::Value::Null,
             duration_ms: ms,
         }

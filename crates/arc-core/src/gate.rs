@@ -4,23 +4,41 @@
 //! 1. unknown tools are refused;
 //! 2. the tool assesses the concrete call (`Tool::assess`); blocked calls are
 //!    refused outright and can never be confirmed;
-//! 3. the permission [`Policy`] decides allow / confirm / deny;
-//! 4. `Confirm` stores the exact call behind a single-use, expiring id and
+//! 3. the user's classification for the tool (set in the Arc app) replaces the
+//!    tool's own risk level, so `dangerous` always asks and `safe` never does;
+//! 4. the permission [`Policy`] decides allow / confirm / deny;
+//! 5. `Confirm` stores the exact call behind a single-use, expiring id and
 //!    returns it — nothing runs until [`Gate::confirm`] is called with that id.
+//!
+//! Step 3 sits above the policy, not below it. A classification is a statement
+//! about the *tool* ("never let it run unattended"), while a policy is a
+//! statement about the *machine* ("no tool may be denied"), and the user's own
+//! click should decide how careful Arc is. A `deny` rule still wins, and a
+//! blocked call is still never runnable — see [`Gate::classify`].
 
 use arc_config::Config;
+use arc_config::classification::ClassifiedTools;
 use arc_proto::{ActionOutcome, ActionRecord, PendingConfirmation, RiskLevel};
 use arc_security::confirm::{ConfirmError, Confirmations};
 use arc_security::{Decision, Policy};
-use arc_tools::{JsonMap, ToolResult, Tools};
+use arc_tools::{Assessment, JsonMap, ToolResult, Tools};
 use serde_json::Value as Json;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
     /// The tool ran.
-    Done { tool: String, result: ToolResult, args: Json, risk: RiskLevel, duration_ms: u64 },
+    Done {
+        tool: String,
+        result: ToolResult,
+        args: Json,
+        risk: RiskLevel,
+        duration_ms: u64,
+        /// Set when the tool's classification is `caution`: the call ran
+        /// without a prompt, and the UI says so.
+        warning: Option<String>,
+    },
     /// Held for the user's confirmation. Nothing has run.
     NeedsConfirmation(PendingConfirmation),
     /// Refused; nothing ran.
@@ -50,7 +68,7 @@ impl Outcome {
     /// Protocol record of this outcome (for replies, events, audit).
     pub fn record(&self) -> ActionRecord {
         match self {
-            Outcome::Done { tool, result, args, risk, duration_ms } => {
+            Outcome::Done { tool, result, args, risk, duration_ms, warning } => {
                 let (outcome, summary, data) = match result {
                     ToolResult::Ok(v) => (ActionOutcome::Success, short(&v.to_string(), 200), v.clone()),
                     ToolResult::Error(e) => (ActionOutcome::Failed, short(e, 200), Json::Null),
@@ -61,6 +79,7 @@ impl Outcome {
                     risk: *risk,
                     outcome,
                     summary,
+                    warning: warning.clone(),
                     data,
                     duration_ms: *duration_ms,
                 }
@@ -71,6 +90,7 @@ impl Outcome {
                 risk: p.risk,
                 outcome: ActionOutcome::AwaitingConfirmation,
                 summary: p.explanation.clone(),
+                warning: None,
                 data: Json::Null,
                 duration_ms: 0,
             },
@@ -80,6 +100,7 @@ impl Outcome {
                 risk: *risk,
                 outcome: ActionOutcome::Denied,
                 summary: reason.clone(),
+                warning: None,
                 data: Json::Null,
                 duration_ms: 0,
             },
@@ -91,16 +112,28 @@ pub struct Gate {
     tools: Arc<Tools>,
     policy: Policy,
     pending: Mutex<Confirmations>,
+    /// The user's per-tool classifications, edited from the Arc app. Behind a
+    /// lock because the daemon changes them at runtime while turns are in
+    /// flight, and the next call has to see the new value.
+    classes: RwLock<ClassifiedTools>,
 }
 
 impl Gate {
     pub fn new(tools: Arc<Tools>, cfg: &Config) -> Self {
+        Self::with_classes(tools, cfg, ClassifiedTools::in_memory())
+    }
+
+    /// As [`Gate::new`], but with the user's saved classifications attached.
+    /// The daemon loads these from disk once at start; everything else (tests,
+    /// `Assistant::from_config` in a library context) uses [`Gate::new`].
+    pub fn with_classes(tools: Arc<Tools>, cfg: &Config, classes: ClassifiedTools) -> Self {
         Self {
             tools,
             policy: Policy::new(&cfg.permissions, &cfg.tools.disabled),
             pending: Mutex::new(Confirmations::new(Duration::from_secs(
                 cfg.permissions.confirmation_timeout_s.max(1),
             ))),
+            classes: RwLock::new(classes),
         }
     }
 
@@ -112,7 +145,62 @@ impl Gate {
         self.policy.is_disabled(tool)
     }
 
-    async fn execute(t: &Arc<dyn arc_tools::Tool>, tool: &str, args: &JsonMap, risk: RiskLevel) -> Outcome {
+    /// The classification the user has set for this tool, if any.
+    pub fn classification(&self, tool: &str) -> Option<RiskLevel> {
+        self.classes.read().unwrap().get(tool)
+    }
+
+    /// Set (or with `None`, clear) a tool's classification and persist it.
+    /// Returns the tool's built-in level alongside, so the UI can show what it
+    /// is overriding.
+    pub fn set_classification(
+        &self,
+        tool: &str,
+        level: Option<RiskLevel>,
+    ) -> Result<(RiskLevel, bool), String> {
+        if self.tools.by_name(tool).is_none() {
+            return Err(format!("unknown tool `{tool}`"));
+        }
+        // Persist first: a classification the daemon could not write is one
+        // that would silently vanish on restart, and a setting that does not
+        // survive a restart is worse than an error.
+        self.classes.write().unwrap().set(tool, level)?;
+        let base = self.tools.by_name(tool).map(|t| t.base_risk()).unwrap_or(RiskLevel::Safe);
+        Ok((base, self.classification(tool).is_some()))
+    }
+
+    /// The risk the runtime will actually apply to a call, after the user's
+    /// classification.
+    ///
+    /// A `dangerous` classification forces a confirmation even if a policy
+    /// would have allowed the call, and a `safe` classification drops the
+    /// call below the confirmation threshold. What it never does is rescue a
+    /// blocked call or override a `deny` rule: those are the layers that exist
+    /// to survive a mistaken click.
+    fn classify(&self, tool: &str, a: &Assessment) -> (RiskLevel, bool) {
+        match self.classification(tool) {
+            None => (a.risk, a.force_confirm),
+            Some(RiskLevel::Dangerous) => (RiskLevel::Dangerous, true),
+            Some(RiskLevel::Caution) => (RiskLevel::Caution, false),
+            Some(RiskLevel::Safe) => (RiskLevel::Safe, false),
+        }
+    }
+
+    /// True when this call ran under a `caution` classification, which the
+    /// UI reports as a warning.
+    fn caution_notice(&self, tool: &str) -> Option<String> {
+        (self.classification(tool) == Some(RiskLevel::Caution)).then(|| {
+            format!("{tool} is classified as caution, so it ran without asking")
+        })
+    }
+
+    async fn execute(
+        t: &Arc<dyn arc_tools::Tool>,
+        tool: &str,
+        args: &JsonMap,
+        risk: RiskLevel,
+        warning: Option<String>,
+    ) -> Outcome {
         let start = Instant::now();
         let result = t.execute(args).await;
         Outcome::Done {
@@ -121,6 +209,7 @@ impl Gate {
             args: to_json(args),
             risk,
             duration_ms: start.elapsed().as_millis() as u64,
+            warning,
         }
     }
 
@@ -139,27 +228,34 @@ impl Gate {
         if let Some(reason) = a.blocked {
             return Outcome::Denied { tool: tool.into(), reason, args: to_json(&args), risk: a.risk };
         }
-        let decision = match self.policy.decide(tool, a.risk) {
-            Decision::Allow if a.force_confirm => Decision::Confirm { reason: "unlisted command".into() },
+        // The user's classification replaces the tool's own level. Blocked is
+        // already handled above, so a `safe` classification cannot unblock a
+        // destructive call -- it only removes the prompt.
+        let (risk, force_confirm) = self.classify(tool, &a);
+        let decision = match self.policy.decide(tool, risk) {
+            Decision::Allow if force_confirm => Decision::Confirm { reason: "unlisted command".into() },
             d => d,
         };
         match decision {
             Decision::Deny { reason } => {
-                Outcome::Denied { tool: tool.into(), reason, args: to_json(&args), risk: a.risk }
+                Outcome::Denied { tool: tool.into(), reason, args: to_json(&args), risk }
             }
             Decision::Confirm { .. } => {
                 let p = self.pending.lock().unwrap().issue(
                     tool,
                     to_json(&args),
-                    a.risk,
+                    risk,
                     &a.explanation,
                     context,
                     Instant::now(),
                 );
-                tracing::info!(tool, risk = %a.risk, id = %p.confirmation_id, "held for confirmation");
+                tracing::info!(tool, risk = %risk, id = %p.confirmation_id, "held for confirmation");
                 Outcome::NeedsConfirmation(p)
             }
-            Decision::Allow => Self::execute(&t, tool, &args, a.risk).await,
+            Decision::Allow => {
+                let warning = self.caution_notice(tool);
+                Self::execute(&t, tool, &args, risk, warning).await
+            }
         }
     }
 
@@ -183,7 +279,10 @@ impl Gate {
             return Ok(Outcome::Denied { tool: p.tool, reason, args: p.args, risk: p.risk });
         }
         tracing::info!(tool = %p.tool, id, "confirmed; executing");
-        Ok(Self::execute(&t, &p.tool, &args, p.risk).await)
+        // Re-apply the classification: the user may have downgraded the tool
+        // between asking and clicking, and the stored call is what runs.
+        let warning = self.caution_notice(&p.tool);
+        Ok(Self::execute(&t, &p.tool, &args, p.risk, warning).await)
     }
 
     pub fn cancel(&self, id: &str) -> bool {
@@ -204,9 +303,20 @@ impl Gate {
         self.pending.lock().unwrap().latest(Instant::now()).map(|p| (p.id.clone(), p.risk))
     }
 
-    /// Effective risk of a call without running it (used by UIs).
+    /// Effective risk of a call without running it (used by UIs): the
+    /// classification if the user set one, else what the tool assesses.
     pub fn risk_of(&self, tool: &str, args: &JsonMap) -> Option<RiskLevel> {
-        self.tools.by_name(tool).map(|t| t.assess(args).risk)
+        self.tools.by_name(tool).map(|t| {
+            let a = t.assess(args);
+            // A blocked call is refused whatever the classification says, so
+            // reporting its risk as anything but the tool's own would be a lie.
+            if a.blocked.is_some() { a.risk } else { self.classify(tool, &a).0 }
+        })
+    }
+
+    /// The risk a tool declares in code, ignoring any classification.
+    pub fn base_risk_of(&self, tool: &str) -> Option<RiskLevel> {
+        self.tools.by_name(tool).map(|t| t.base_risk())
     }
 }
 
@@ -312,5 +422,226 @@ mod tests {
         assert!(matches!(g.run("probe.safe", JsonMap::new(), Json::Null).await, Outcome::Denied { .. }));
         assert!(matches!(g.run("nope", JsonMap::new(), Json::Null).await, Outcome::Denied { .. }));
         assert_eq!(safe.load(Ordering::SeqCst), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // User classifications (the Arc app's per-tool safety dropdown)
+    // -----------------------------------------------------------------------
+
+    /// The gate with a classifications store backed by a real file, so these
+    /// tests cover persistence as well as enforcement.
+    fn classified_gate() -> (Gate, Arc<AtomicUsize>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let classes = ClassifiedTools::load_from(dir.path().join("tool_classes.json"));
+        let (g, safe, _) = gate_with(&Config::default(), classes);
+        // probe.safe is registered as Safe; make it Dangerous and watch what
+        // the gate does about it.
+        g.set_classification("probe.safe", Some(RiskLevel::Dangerous)).unwrap();
+        (g, safe, dir)
+    }
+
+    fn gate_with(cfg: &Config, classes: ClassifiedTools) -> (Gate, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let safe = Arc::new(AtomicUsize::new(0));
+        let danger = Arc::new(AtomicUsize::new(0));
+        let mut tools = Tools::new();
+        tools.register(Arc::new(Probe { name: "probe.safe", risk: RiskLevel::Safe, runs: safe.clone() }));
+        tools.register(Arc::new(Probe {
+            name: "probe.danger",
+            risk: RiskLevel::Dangerous,
+            runs: danger.clone(),
+        }));
+        (Gate::with_classes(Arc::new(tools), cfg, classes), safe, danger)
+    }
+
+    /// The headline behaviour: a tool switched to `dangerous` in the UI must
+    /// stop running unattended, even though it is Safe in code and the policy
+    /// would otherwise let it straight through.
+    #[tokio::test]
+    async fn a_tool_switched_to_dangerous_needs_a_confirmation_click() {
+        let (g, safe, _dir) = classified_gate();
+        // Sanity: the code says Safe, and without a classification it runs.
+        assert_eq!(g.base_risk_of("probe.safe"), Some(RiskLevel::Safe));
+        assert_eq!(g.risk_of("probe.safe", &JsonMap::new()), Some(RiskLevel::Dangerous));
+        assert_eq!(g.classification("probe.safe"), Some(RiskLevel::Dangerous));
+
+        let Outcome::NeedsConfirmation(p) = g.run("probe.safe", JsonMap::new(), Json::Null).await else {
+            panic!("a dangerous tool must be held for confirmation")
+        };
+        assert_eq!(p.risk, RiskLevel::Dangerous, "the prompt must say what is at stake");
+        assert_eq!(p.tool, "probe.safe");
+        assert_eq!(safe.load(Ordering::SeqCst), 0, "nothing may run before the user clicks");
+
+        // The click is what runs it -- and it runs exactly once.
+        let Ok(Outcome::Done { .. }) = g.confirm(&p.confirmation_id).await else { panic!() };
+        assert_eq!(safe.load(Ordering::SeqCst), 1);
+        assert_eq!(g.confirm(&p.confirmation_id).await.unwrap_err(), ConfirmError::Unknown);
+        assert_eq!(safe.load(Ordering::SeqCst), 1, "the confirmation is single use");
+    }
+
+    /// Rejecting is still a rejection: the extra click is a gate, not a delay.
+    #[tokio::test]
+    async fn a_dangerous_tool_can_still_be_cancelled() {
+        let (g, safe, _dir) = classified_gate();
+        let Outcome::NeedsConfirmation(p) = g.run("probe.safe", JsonMap::new(), Json::Null).await else {
+            panic!()
+        };
+        assert!(g.cancel(&p.confirmation_id));
+        assert!(g.confirm(&p.confirmation_id).await.is_err());
+        assert_eq!(safe.load(Ordering::SeqCst), 0);
+    }
+
+    /// `caution` runs immediately and says so, rather than prompting.
+    #[tokio::test]
+    async fn a_caution_tool_runs_immediately_with_a_warning() {
+        let (g, safe, _dir) = classified_gate();
+        // Reclassify a *safe* tool as caution: it ran freely before and must
+        // still run freely now, but carrying a warning.
+        g.set_classification("probe.safe", Some(RiskLevel::Caution)).unwrap();
+        let Outcome::Done { risk, warning, .. } =
+            g.run("probe.safe", JsonMap::new(), Json::Null).await
+        else {
+            panic!("caution must not hold a call for confirmation")
+        };
+        assert_eq!(risk, RiskLevel::Caution);
+        assert_eq!(safe.load(Ordering::SeqCst), 1);
+        let w = warning.expect("a caution call must carry a warning for the UI");
+        assert!(w.contains("caution"), "{w}");
+    }
+
+    /// A tool with no classification gets no warning: a warning on every call
+    /// would be noise the user learns to ignore.
+    #[tokio::test]
+    async fn an_unclassified_tool_carries_no_warning() {
+        let (g, _, _) = gate(&Config::default());
+        let Outcome::Done { warning, risk, .. } = g.run("probe.safe", JsonMap::new(), Json::Null).await
+        else {
+            panic!()
+        };
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(risk, RiskLevel::Safe);
+    }
+
+    /// `safe` is the other direction: the user trusts a tool the code calls
+    /// dangerous, and it stops prompting.
+    #[tokio::test]
+    async fn a_tool_switched_to_safe_stops_prompting() {
+        let (g, _, danger) = gate(&Config::default());
+        assert_eq!(g.base_risk_of("probe.danger"), Some(RiskLevel::Dangerous));
+        g.set_classification("probe.danger", Some(RiskLevel::Safe)).unwrap();
+        let Outcome::Done { risk, .. } = g.run("probe.danger", JsonMap::new(), Json::Null).await else {
+            panic!("a safe tool must run without a prompt")
+        };
+        assert_eq!(risk, RiskLevel::Safe);
+        assert_eq!(danger.load(Ordering::SeqCst), 1);
+    }
+
+    /// The setting has to outlive the process, or the dropdown is decoration.
+    #[tokio::test]
+    async fn a_classification_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tool_classes.json");
+
+        {
+            let (g, _, _) = gate_with(&Config::default(), ClassifiedTools::load_from(file.clone()));
+            g.set_classification("probe.safe", Some(RiskLevel::Dangerous)).unwrap();
+        }
+
+        // Fresh process: fresh gate, same file.
+        let (g2, safe, _) = gate_with(&Config::default(), ClassifiedTools::load_from(file));
+        assert_eq!(g2.classification("probe.safe"), Some(RiskLevel::Dangerous));
+        let Outcome::NeedsConfirmation(p) = g2.run("probe.safe", JsonMap::new(), Json::Null).await else {
+            panic!("the classification did not survive the restart")
+        };
+        assert_eq!(safe.load(Ordering::SeqCst), 0);
+        assert!(g2.confirm(&p.confirmation_id).await.is_ok());
+        assert_eq!(safe.load(Ordering::SeqCst), 1);
+    }
+
+    /// Clearing the classification puts the tool back to what the code says.
+    #[tokio::test]
+    async fn clearing_a_classification_restores_the_built_in_level() {
+        let (g, _, _) = gate(&Config::default());
+        g.set_classification("probe.danger", Some(RiskLevel::Safe)).unwrap();
+        assert!(matches!(g.run("probe.danger", JsonMap::new(), Json::Null).await, Outcome::Done { .. }));
+        g.set_classification("probe.danger", None).unwrap();
+        assert_eq!(g.classification("probe.danger"), None);
+        assert!(matches!(
+            g.run("probe.danger", JsonMap::new(), Json::Null).await,
+            Outcome::NeedsConfirmation(_)
+        ));
+    }
+
+    /// A classification is not a permission. `rm -rf /` is refused by the shell
+    /// analyzer whatever the dropdown says, and marking the tool dangerous
+    /// must not turn a refusal into a prompt the user can click through.
+    #[tokio::test]
+    async fn a_classification_cannot_unblock_a_blocked_call() {
+        let (g, _, _) = gate(&Config::default());
+        g.set_classification("shell_exec", Some(RiskLevel::Safe)).unwrap();
+        let mut a = JsonMap::new();
+        a.insert("command".into(), Json::String("rm -rf /".into()));
+        assert!(
+            matches!(g.run("shell_exec", a, Json::Null).await, Outcome::Denied { .. }),
+            "a blocked command must stay blocked when the tool is marked safe"
+        );
+    }
+
+    /// Nor can it rescue a tool the user has disabled outright.
+    #[tokio::test]
+    async fn a_disabled_tool_stays_disabled_when_marked_dangerous() {
+        let mut cfg = Config::default();
+        cfg.tools.disabled = vec!["probe.safe".into()];
+        let (g, safe, _) = gate(&cfg);
+        g.set_classification("probe.safe", Some(RiskLevel::Dangerous)).unwrap();
+        assert!(matches!(g.run("probe.safe", JsonMap::new(), Json::Null).await, Outcome::Denied { .. }));
+        assert_eq!(safe.load(Ordering::SeqCst), 0);
+    }
+
+    /// A `deny` rule is the user saying "never", and it outranks a click.
+    #[tokio::test]
+    async fn a_deny_rule_outranks_a_safe_classification() {
+        let mut cfg = Config::default();
+        cfg.permissions.tools.insert("probe.danger".into(), arc_config::ToolPolicy::Deny);
+        let (g, _, danger) = gate(&cfg);
+        g.set_classification("probe.danger", Some(RiskLevel::Safe)).unwrap();
+        assert!(matches!(g.run("probe.danger", JsonMap::new(), Json::Null).await, Outcome::Denied { .. }));
+        assert_eq!(danger.load(Ordering::SeqCst), 0);
+    }
+
+    /// One tool's classification must not leak into another's.
+    #[tokio::test]
+    async fn classifications_are_per_tool() {
+        let (g, safe, danger) = gate(&Config::default());
+        g.set_classification("probe.safe", Some(RiskLevel::Dangerous)).unwrap();
+        assert!(matches!(g.run("probe.safe", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)));
+        assert_eq!(safe.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(g.run("probe.danger", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)),
+            "probe.danger is Dangerous in code and must still ask"
+        );
+        assert_eq!(danger.load(Ordering::SeqCst), 0);
+    }
+
+    /// The dropdown may only classify tools that exist.
+    #[test]
+    fn an_unknown_tool_cannot_be_classified() {
+        let (g, _, _) = gate(&Config::default());
+        let err = g.set_classification("nope", Some(RiskLevel::Dangerous)).unwrap_err();
+        assert!(err.contains("unknown tool"), "{err}");
+    }
+
+    /// A real tool, not just a test probe: `window_list` is Safe in code, and
+    /// marking it dangerous has to hold a real registry entry.
+    #[tokio::test]
+    async fn a_real_tool_can_be_classified_dangerous() {
+        let (g, _, _) = gate(&Config::default());
+        g.set_classification("window_list", Some(RiskLevel::Dangerous)).unwrap();
+        assert_eq!(g.risk_of("window_list", &JsonMap::new()), Some(RiskLevel::Dangerous));
+        // It is held, and cancelling means nothing happened -- which matters
+        // because confirming would really enumerate the user's windows.
+        let Outcome::NeedsConfirmation(p) = g.run("window_list", JsonMap::new(), Json::Null).await else {
+            panic!("window_list must be held once classified dangerous")
+        };
+        assert!(g.cancel(&p.confirmation_id));
     }
 }

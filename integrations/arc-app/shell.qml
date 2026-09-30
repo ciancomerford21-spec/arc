@@ -861,6 +861,72 @@ ShellRoot {
           border.color: shell.music !== null ? c.magenta : c.line
         }
 
+        // --- nothing playing
+        //
+        // With no track, every row inside musicBody hides itself and the page
+        // became an empty panel with a search box in it: no statement of what
+        // the page is for, and no hint of what to search for. This fills that
+        // case rather than leaving a hole.
+        ColumnLayout {
+          anchors.centerIn: parent
+          width: Math.min(420, musicPane.width - 80)
+          spacing: 10
+          visible: shell.music === null
+
+          Text {
+            Layout.fillWidth: true
+            horizontalAlignment: Text.AlignHCenter
+            text: "\u266b  nothing playing"
+            color: c.chrome
+            font.family: c.mono; font.pixelSize: 14; font.bold: true
+          }
+          Text {
+            Layout.fillWidth: true
+            horizontalAlignment: Text.AlignHCenter
+            text: "Search YouTube Music above, or ask Arc in chat \u2014 \"play something by Portishead\" goes through the same resolver."
+            color: c.muted
+            font.family: c.mono; font.pixelSize: 11
+            wrapMode: Text.Wrap
+          }
+          // Two real examples rather than a generic placeholder: they show the
+          // shape of a useful query (artist, then track) which "search..." does
+          // not.
+          RowLayout {
+            Layout.alignment: Qt.AlignHCenter
+            spacing: 6
+            Repeater {
+              model: [
+                { q: "portishead roads", label: "portishead roads" },
+                { q: "aphex twin windowlicker", label: "aphex twin windowlicker" }
+              ]
+              delegate: Rectangle {
+                required property var modelData
+                implicitWidth: exText.implicitWidth + 20
+                height: 26
+                radius: 13
+                color: exMa.containsMouse
+                  ? Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, 0.20)
+                  : Qt.rgba(c.text.r, c.text.g, c.text.b, 0.05)
+                border.color: c.line
+                Text {
+                  id: exText
+                  anchors.centerIn: parent
+                  text: modelData.label
+                  color: c.muted
+                  font.family: c.mono; font.pixelSize: 10
+                }
+                MouseArea {
+                  id: exMa
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: shell.musicAction_(["play", modelData.q])
+                }
+              }
+            }
+          }
+        }
+
         RowLayout {
           id: musicBody
           anchors.left: parent.left
@@ -880,16 +946,65 @@ ShellRoot {
           // box: the single biggest source of dead space on this page, and it
           // read as a layout bug rather than as breathing room.
           ColumnLayout {
-            Layout.preferredWidth: 232
+            Layout.preferredWidth: 264
             Layout.alignment: Qt.AlignTop
-            spacing: 10
+            spacing: 12
+            // Hidden entirely when nothing plays -- the empty state covers
+            // this area -- but kept in the layout so the search column on the
+            // right does not slide across the page.
+            visible: shell.music !== null
+
+            // The glow behind the artwork.
+            //
+            // The art is a small square in a tall column, and a square alone in
+            // a dark panel reads as a placeholder rather than as the subject of
+            // the page. A soft bloom behind it gives the artwork somewhere to
+            // sit, and makes the left column look composed rather than merely
+            // filled.
+            //
+            // Built from stacked translucent rounded rectangles, NOT a Gradient.
+            // `Gradient` does not exist in this Qt's QtQuick (checked against
+            // the installed plugins.qmltypes, not from memory): assigning
+            // `type`, `centerX`, `centerY`, `horizontalCenter` or
+            // `verticalCenter` to it are all load-time warnings, and it would
+            // have rendered as no bloom at all -- silently, since a missing
+            // gradient is indistinguishable from an intentional flat fill.
+            // Four rings fall off smoothly enough that the banding does not
+            // read at this size, and this cannot break on a Qt upgrade.
+            Item {
+              Layout.fillWidth: true
+              height: artFrame.height * 0.66
+              // Only when there is art to light.
+              visible: coverArt.status === Image.Ready
+
+              Repeater {
+                model: 4
+                delegate: Rectangle {
+                  required property int index
+                  // Each ring is a little smaller and fainter, so the stack
+                  // reads as one soft falloff rather than as four shapes.
+                  readonly property real shrink: 1 - index * 0.19
+                  width: parent.width * shrink
+                  height: parent.height * shrink
+                  x: (parent.width - width) / 2
+                  y: (parent.height - height) / 2
+                  radius: height / 2
+                  color: "transparent"
+                  border.width: parent.height * 0.13
+                  border.color: Qt.rgba(
+                    c.magenta.r, c.magenta.g, c.magenta.b,
+                    0.13 - index * 0.028
+                  )
+                }
+              }
+            }
 
             Rectangle {
               id: artFrame
               Layout.fillWidth: true
               // Square, capped by the width. Bounded rather than fluid, so a
               // tall window does not turn the artwork into a poster.
-              height: Math.min(width, 232)
+              height: Math.min(width, 264)
                 radius: 6
                 color: Qt.rgba(c.text.r, c.text.g, c.text.b, 0.05)
                 border.color: c.line
@@ -927,13 +1042,13 @@ ShellRoot {
             // the page read as clutter rather than as three distinct things.
             ColumnLayout {
               Layout.fillWidth: true
-              spacing: 2
+              spacing: 3
               visible: shell.music !== null
               Text {
                 Layout.fillWidth: true
                 text: String(shell.music ? shell.music.now.title : "")
                 color: c.text
-                font.family: c.mono; font.pixelSize: 13; font.bold: true
+                font.family: c.mono; font.pixelSize: 14; font.bold: true
                 elide: Text.ElideRight
               }
               Text {
@@ -941,8 +1056,33 @@ ShellRoot {
                 text: String(shell.music ? (shell.music.now.artist || "") : "")
                 visible: text.length > 0
                 color: c.muted
-                font.family: c.mono; font.pixelSize: 11
+                font.family: c.mono; font.pixelSize: 12
                 elide: Text.ElideRight
+              }
+
+              // Where it came from. The daemon has always sent this and the
+              // page never showed it, so "is this the real track or a 40
+              // minute mix?" had no answer on screen. It is the one fact on
+              // this page that tells you the resolver did its job.
+              Rectangle {
+                Layout.fillWidth: true
+                Layout.topMargin: 3
+                implicitHeight: srcText.implicitHeight + 8
+                radius: 3
+                visible: srcText.text.length > 0
+                color: Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.10)
+                border.color: Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.30)
+                Text {
+                  id: srcText
+                  x: 7
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - 14
+                  text: String(shell.music ? (shell.music.now.source || "") : "").toUpperCase()
+                  color: c.chrome
+                  font.family: c.mono; font.pixelSize: 9
+                  font.bold: true; font.letterSpacing: 1.5
+                  elide: Text.ElideRight
+                }
               }
             }
           }
@@ -951,6 +1091,7 @@ ShellRoot {
             Layout.fillWidth: true
             Layout.fillHeight: true
             spacing: 10
+            visible: shell.music !== null
 
             // The current track is NOT named here. It is named once, under the
             // artwork on the left. This column already carries the seek bar,
@@ -1109,6 +1250,32 @@ ShellRoot {
             }
 
             // --- what is coming
+            //
+            // A header, because the list alone gave no clue what it was: rows
+            // numbered 1, 2, 3 with no heading looked like an index into
+            // something rather than into the queue. The count is the useful
+            // part -- "6 queued" is what tells you whether an enqueue landed.
+            RowLayout {
+              Layout.fillWidth: true
+              Layout.topMargin: 4
+              spacing: 8
+              visible: shell.music !== null || shell.musicQueue.length > 0
+              Text {
+                text: "UP NEXT"
+                color: c.chrome
+                font.family: c.mono; font.pixelSize: 10
+                font.bold: true; font.letterSpacing: 2
+              }
+              Rectangle { Layout.fillWidth: true; height: 1; color: c.line }
+              Text {
+                text: shell.musicQueue.length === 0
+                  ? "empty"
+                  : shell.musicQueue.length + (shell.musicQueue.length === 1 ? " track" : " tracks")
+                color: c.chromeDim
+                font.family: c.mono; font.pixelSize: 10
+              }
+            }
+
             ListView {
               id: queueList
               Layout.fillWidth: true
@@ -1177,10 +1344,13 @@ ShellRoot {
           // --- search and actions
           //
           // Its own column because it is the only part of the page that is
-          // about *starting* something rather than about what is playing.
+          // about *starting* something rather than about what is playing, and
+          // for that reason it is the one column that does NOT hide when there
+          // is no track: a page whose only way to start music is to play music
+          // first is a page you cannot start music from.
           ColumnLayout {
             Layout.preferredWidth: Math.max(300, win.width * 0.26)
-            Layout.fillHeight: true
+            Layout.alignment: Qt.AlignTop
             spacing: 8
 
             Field {
@@ -1310,13 +1480,58 @@ ShellRoot {
               }
             }
 
-            Text {
+            // A stats row rather than two lines of prose.
+            //
+            // The footer used to say "queue \u00b7 0 waiting / resolved
+            // through the YouTube Music API": the queue count was already shown
+            // by the UP NEXT header, and the resolver claim is a fact about the
+            // daemon rather than about the music. What is worth the space is
+            // the shape of the session -- what is playing, how far through we
+            // are, how much is waiting.
+            Rectangle {
               Layout.fillWidth: true
-              text: "queue \u00b7 " + shell.musicQueue.length + (shell.musicQueue.length > 0 ? " waiting" : "")
-                + "\nresolved through the YouTube Music API"
-              color: c.chromeDim
-              font.family: c.mono; font.pixelSize: 10
-              wrapMode: Text.Wrap
+              implicitHeight: statRow.implicitHeight + 14
+              radius: 3
+              visible: shell.music !== null
+              color: Qt.rgba(c.text.r, c.text.g, c.text.b, 0.04)
+              border.color: c.line
+              RowLayout {
+                id: statRow
+                anchors.fill: parent
+                anchors.margins: 7
+                spacing: 16
+
+                // Each stat is label-then-value on one line, so the row reads
+                // across without being a sentence to parse.
+                Repeater {
+                  model: [
+                    {
+                      label: "STATE",
+                      value: shell.musicNow.state === "paused" ? "PAUSED"
+                        : shell.musicNow.state === "playing" ? "PLAYING" : "STOPPED"
+                    },
+                    { label: "AT", value: shell.mmss(shell.position) },
+                    { label: "OF", value: shell.mmss(shell.duration) },
+                    { label: "QUEUED", value: String(shell.musicQueue.length) }
+                  ]
+                  delegate: RowLayout {
+                    required property var modelData
+                    spacing: 5
+                    Text {
+                      text: modelData.label
+                      color: c.chromeDim
+                      font.family: c.mono; font.pixelSize: 8
+                      font.letterSpacing: 1
+                    }
+                    Text {
+                      text: modelData.value
+                      color: c.text
+                      font.family: c.mono; font.pixelSize: 10; font.bold: true
+                    }
+                  }
+                }
+                Item { Layout.fillWidth: true }
+              }
             }
           }
         }

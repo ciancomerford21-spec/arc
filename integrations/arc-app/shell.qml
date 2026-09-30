@@ -430,82 +430,68 @@ ShellRoot {
     visible: true
     onClosed: Qt.quit()
 
-    // Backdrop. Was a flat 32px graph-paper grid, which reads as a spreadsheet
-    // rather than an instrument. This is a lit space instead: a bloom of the
-    // theme's own accent for a light source, a floor grid lying down and
-    // receding to a horizon, and a vignette so the corners fall away. Every
-    // colour comes from the palette, so it re-tints with the theme.
+    // Backdrop. Two attempts at this drew lines -- a flat 32px graph paper,
+    // then a perspective floor -- and a grid is a grid however it is skewed.
+    // So there are no lines at all now. The depth comes from light: a bloom
+    // of the theme's accent from above, a soft band of it at the horizon with
+    // no hard edge, the sky darkening toward the floor, and a vignette. Every
+    // colour is mixed from the palette, so it re-tints with the theme.
     Canvas {
       id: backdrop
       anchors.fill: parent
-      // Repaint on a palette change, not only on resize. The grid version only
-      // repainted for width/height, so after `omarchy theme set` it kept
-      // drawing the previous theme's colour. Watched through Connections
-      // because these are properties of the palette object, not of the Canvas.
+      // Repaint on a palette change, not only on resize. The first version
+      // only repainted for width/height, so after `omarchy theme set` it kept
+      // drawing the previous theme's colour.
       Connections {
         target: c
-        function onLineChanged() { backdrop.requestPaint() }
         function onChromeChanged() { backdrop.requestPaint() }
         function onBgChanged() { backdrop.requestPaint() }
+        function onPanelChanged() { backdrop.requestPaint() }
       }
 
       onPaint: {
         var g = getContext("2d")
         var w = width, h = height
         g.clearRect(0, 0, w, h)
+        var accent = Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 1)
+        var horizon = h * 0.46
 
-        // 1. Light source: a wide, low bloom of the accent from above, so the
-        //    window has a direction to it rather than being evenly filled.
-        var bloom = g.createRadialGradient(w * 0.5, -h * 0.2, 0, w * 0.5, -h * 0.2, h * 0.95)
-        bloom.addColorStop(0, Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.13))
-        bloom.addColorStop(0.45, Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.045))
-        bloom.addColorStop(1, Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0))
+        // 1. Light source: a wide bloom from above and slightly ahead, so the
+        //    window has a direction to it instead of being evenly filled.
+        var bloom = g.createRadialGradient(w * 0.5, -h * 0.1, 0, w * 0.5, -h * 0.1, h * 1.05)
+        bloom.addColorStop(0, Qt.rgba(accent.r, accent.g, accent.b, 0.16))
+        bloom.addColorStop(0.4, Qt.rgba(accent.r, accent.g, accent.b, 0.055))
+        bloom.addColorStop(1, Qt.rgba(accent.r, accent.g, accent.b, 0))
         g.fillStyle = bloom
         g.fillRect(0, 0, w, h)
 
-        // 2. Horizon, a little above centre, with the floor grid below it.
-        var horizon = Math.round(h * 0.44) + 0.5
-        g.save()
-        g.beginPath(); g.rect(0, horizon, w, h - horizon); g.clip()
-        g.lineWidth = 1
-        // A third of the way from the border colour to the accent, so the
-        // floor carries a hint of the theme rather than being grey.
-        g.strokeStyle = c.blend(c.line, c.chrome, 0.35)
+        // 2. The horizon as atmosphere, not as a rule: a wide band of accent
+        //    that peaks at the horizon and falls off both ways. It reads as
+        //    distance without drawing a single edge.
+        var band = g.createLinearGradient(0, horizon - h * 0.30, 0, horizon + h * 0.34)
+        band.addColorStop(0.00, Qt.rgba(accent.r, accent.g, accent.b, 0))
+        band.addColorStop(0.46, Qt.rgba(accent.r, accent.g, accent.b, 0.085))
+        band.addColorStop(0.50, Qt.rgba(accent.r, accent.g, accent.b, 0.11))
+        band.addColorStop(0.54, Qt.rgba(accent.r, accent.g, accent.b, 0.085))
+        band.addColorStop(1.00, Qt.rgba(accent.r, accent.g, accent.b, 0))
+        g.fillStyle = band
+        g.fillRect(0, horizon - h * 0.30, w, h * 0.64)
 
-        // Receding lines: spaced widely at the bottom, bunching toward the
-        // horizon. Squaring the parameter is what sells the perspective.
-        for (var j = 0; j < 16; j++) {
-          var t = j / 15
-          var y = horizon + Math.pow(t, 2.2) * (h - horizon)
-          g.globalAlpha = 0.10 + t * 0.55
-          g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke()
-        }
-        // Converging verticals, fading out toward the edges of the window.
-        for (var i = -16; i <= 16; i++) {
-          var spread = Math.abs(i) / 16
-          g.globalAlpha = 0.62 * (1 - spread * 0.8)
-          g.beginPath()
-          g.moveTo(w * 0.5 + i * (w / 14), h)
-          g.lineTo(w * 0.5 + i * 3, horizon)
-          g.stroke()
-        }
-        g.restore()
-
-        // 3. The horizon itself, brighter than the grid it sits on.
-        g.globalAlpha = 0.7
-        g.strokeStyle = c.chrome
-        g.beginPath(); g.moveTo(0, horizon); g.lineTo(w, horizon); g.stroke()
+        // 3. Below the horizon the light falls off into the floor, so the lower
+        //    half has weight instead of being flat.
+        var floor = g.createLinearGradient(0, horizon, 0, h)
+        floor.addColorStop(0, Qt.rgba(c.bg.r, c.bg.g, c.bg.b, 0))
+        floor.addColorStop(1, Qt.rgba(c.bg.r, c.bg.g, c.bg.b, 0.55))
+        g.fillStyle = floor
+        g.fillRect(0, horizon, w, h - horizon)
 
         // 4. Vignette in the background's own colour rather than black, so it
         //    darkens a dark theme and does nothing ugly to a light one.
-        g.globalAlpha = 1
-        // Kept light and pushed outward: at 0.5 from 0.34 it was flattening
-        // the gutters, which is exactly where the perspective grid shows.
         var vig = g.createRadialGradient(
-          w / 2, h / 2, Math.min(w, h) * 0.45,
-          w / 2, h / 2, Math.max(w, h) * 0.85)
+          w / 2, h / 2, Math.min(w, h) * 0.42,
+          w / 2, h / 2, Math.max(w, h) * 0.86)
         vig.addColorStop(0, Qt.rgba(c.bg.r, c.bg.g, c.bg.b, 0))
-        vig.addColorStop(1, Qt.rgba(c.bg.r, c.bg.g, c.bg.b, 0.38))
+        vig.addColorStop(1, Qt.rgba(c.bg.r, c.bg.g, c.bg.b, 0.40))
         g.fillStyle = vig
         g.fillRect(0, 0, w, h)
       }

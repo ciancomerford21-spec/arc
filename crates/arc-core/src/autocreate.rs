@@ -67,7 +67,10 @@ const DESTRUCTIVE: &[&str] = &[
     "reinstall",
     "reboot",
     "shutdown",
+    "shut down",
+    "shutting down",
     "poweroff",
+    "power off",
     "halt",
     "kill",
     "killall",
@@ -201,7 +204,7 @@ impl AutoCreate {
         let draft = parse_draft(&r.content)?;
         // Keep the model honest about the name: it is the name the model
         // reached for and, after creation, the one it will call.
-        let mut d = draft.into_def(gap)?;
+        let d = draft.into_def(gap)?;
         if known.iter().any(|s| s.name == d.name) {
             return Err(format!("`{}` is already a tool, so nothing was missing", d.name));
         }
@@ -251,7 +254,7 @@ pub fn normalise_name(raw: &str) -> Result<String, String> {
         out.pop();
     }
     if out.is_empty() || !out.starts_with(|c: char| c.is_ascii_lowercase()) {
-        return Err(format!("`{raw}` is not usable as a tool name"));
+        return Err(format!("`{}` is not usable as a tool name", raw.trim()));
     }
     if out.len() > 40 {
         out.truncate(40);
@@ -260,7 +263,7 @@ pub fn normalise_name(raw: &str) -> Result<String, String> {
         }
     }
     if out.len() < 3 {
-        return Err(format!("`{raw}` is not usable as a tool name"));
+        return Err(format!("`{}` is not usable as a tool name", raw.trim()));
     }
     Ok(out)
 }
@@ -463,7 +466,7 @@ fn infer_language(script: &str) -> Language {
 /// Pull the JSON object out of the reply. Reasoning models often wrap it in a
 /// fence or write a sentence first, so the object is located rather than
 /// assumed.
-pub fn parse_draft(content: &str) -> Result<Draft, String> {
+fn parse_draft(content: &str) -> Result<Draft, String> {
     let text = content.trim();
     let start = text.find('{').ok_or("the design was not JSON")?;
     let end = text.rfind('}').ok_or("the design was not JSON")?;

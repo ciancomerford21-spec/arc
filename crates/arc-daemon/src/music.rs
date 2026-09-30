@@ -616,8 +616,34 @@ impl Resolver for YtMusicApi {
         if query.is_empty() {
             return Err("nothing to search for".into());
         }
-        let mut child = Command::new(&self.python)
-            .args(["-m", &self.module, "search", query, "--count", &count.clamp(1, 20).to_string()])
+        // The module is installed as data at ~/.local/share/arc/python, not
+        // into the venv's site-packages, so the interpreter has to be told where
+        // to find it.
+        //
+        // Without this the child exits with "No module named arc_music", and
+        // because the resolver is chained in front of yt-dlp, that error is
+        // swallowed and every search silently falls back to yt-dlp -- which is
+        // why titles came back as "Portishead - Roads (Live From...)" instead
+        // of "Roads". The fallback is doing its job; the primary was simply
+        // never reachable. The path is relative to the venv rather than to any
+        // working directory, because the daemon's cwd is not the data dir.
+        let mut cmd = Command::new(&self.python);
+        cmd.args(["-m", &self.module, "search", query, "--count", &count.clamp(1, 20).to_string()]);
+        // Prepended to any inherited PYTHONPATH rather than replacing it, so an
+        // interpreter set up for other packages keeps working.
+        // data_dir(), not runtime_dir(): the module is installed under the
+        // data dir (~/.local/share/arc/python) while runtime_dir() is the
+        // socket dir under /run/user. Pointing PYTHONPATH at the latter finds
+        // nothing and the error is swallowed by the fallback.
+        let module_dir = arc_config::paths::data_dir().join("python");
+        let pythonpath = match std::env::var("PYTHONPATH") {
+            Ok(existing) if !existing.is_empty() => {
+                format!("{}:{existing}", module_dir.display())
+            }
+            _ => module_dir.display().to_string(),
+        };
+        cmd.env("PYTHONPATH", pythonpath);
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -939,6 +965,23 @@ mod tests {
 
     fn t(name: &str) -> Track {
         Track::new(name, "Someone", "test", &format!("https://example.invalid/{name}")).unwrap()
+    }
+
+    /// The interpreter must be told where arc_music lives.
+    ///
+    /// Without this the child exits "No module named arc_music", and because
+    /// the API resolver is chained in front of yt-dlp the error is swallowed:
+    /// every search silently falls back, with no log line saying so, and the
+    /// only symptom is degraded titles and no artwork. The fallback working
+    /// correctly is exactly what made this hard to see.
+    ///
+    /// Asserted against the real data dir rather than a fixture, because the
+    /// bug was the two disagreeing -- the installer writes to data_dir() and
+    /// the resolver has to look there.
+    #[test]
+    fn python_path_points_at_the_installed_module() {
+        let dir = arc_config::paths::data_dir().join("python");
+        assert_eq!(dir.join("arc_music").exists(), true, "arc_music is not installed at {dir:?}");
     }
 
     #[test]

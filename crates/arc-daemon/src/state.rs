@@ -40,6 +40,12 @@ pub struct Daemon {
     pub bar_file: Option<PathBuf>,
     m: Mutex<Mutable>,
     utterance: AtomicU64,
+    /// True from the moment the `code` tool starts until the turn ends. The
+    /// slow-turn headsup checks it: a `code` task gets its own spoken
+    /// progress ("Handing that to Hermes...") within a few seconds, and
+    /// speaking the generic headsup as well produced two speeches three
+    /// seconds apart, measured live.
+    code_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A turn at least this long gets a spoken completion line.
@@ -166,7 +172,16 @@ fn task_summary(text: &str) -> String {
         .trim_start_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
         .split(&['.', ',', ';', '!', '?', '\n'][..])
         .map(str::trim)
-        .find(|c| !c.is_empty())
+        // A leading prepositional clause is scene-setting, not the job:
+        // "In the pipeline-test project, add a subtract function" was
+        // announced as "working on In the pipeline-test project", which
+        // told the user nothing.
+        .find(|c| {
+            !c.is_empty()
+                && !["in ", "on ", "at ", "for ", "from ", "inside ", "within ", "under ", "to "]
+                    .iter()
+                    .any(|p| c.to_lowercase().starts_with(p))
+        })
         .unwrap_or("that");
     // Politeness first, then an imperative, so the line reads as a noun
     // phrase: "can you please write a test" -> "a test". Matched
@@ -174,7 +189,7 @@ fn task_summary(text: &str) -> String {
     // capitals. The bare verbs are in the list because after the politeness
     // is stripped what often remains is still a command, which reads aloud as
     // an order rather than a subject.
-    const LEAD: [&str; 14] = [
+    const LEAD: [&str; 16] = [
         "please ",
         "can you ",
         "could you ",
@@ -189,6 +204,8 @@ fn task_summary(text: &str) -> String {
         "give me ",
         "write ",
         "build ",
+        "add ",
+        "make ",
     ];
     let mut stripped = cleaned.to_string();
     // Repeatedly, not once: "can you please write a test" carries two of
@@ -302,6 +319,7 @@ impl Daemon {
             bar_file,
             m: Mutex::new(Mutable::default()),
             utterance: AtomicU64::new(0),
+            code_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -390,8 +408,14 @@ impl Daemon {
         // SLOW_TURN_SPEAKS_AT, then keeps quiet -- a line every thirty seconds
         // would be worse than the silence it fixes.
         let speak = self.speak_handle();
+        let code_active = self.code_active.clone();
         let watchdog = tokio::spawn(async move {
             tokio::time::sleep(SLOW_TURN_SPEAKS_AT).await;
+            // A `code` task speaks for itself within a few seconds, so the
+            // generic headsup would be a second speech seconds apart.
+            if code_active.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             speak(SLOW_TURN_HEADSUP.to_string());
         });
         // Relay Hermes' progress while the turn runs. Each subscriber gets
@@ -400,6 +424,7 @@ impl Daemon {
         // rather than talk over each other.
         let mut talk = ProgressTalk { said: 0, last_at: None };
         let task = task_summary(text);
+        let code_flag = self.code_active.clone();
         let relay = tokio::spawn({
             let mut rx = self.events.subscribe();
             let speak = self.speak_handle();
@@ -407,6 +432,12 @@ impl Daemon {
                 loop {
                     let (tool, detail, step) = match rx.recv().await {
                         Ok(Event::CodeProgress { tool, detail, step, .. }) => (tool, detail, step),
+                        // The headsup stands down once a code task is under
+                        // way, so mark it as soon as the tool starts.
+                        Ok(Event::ToolStarted { tool, .. }) if tool == "code" => {
+                            code_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
                         Ok(_) => continue,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
@@ -424,6 +455,7 @@ impl Daemon {
         let reply = self.assistant.handle(&NluInput::text(text, to_core(source))).await;
         watchdog.abort();
         relay.abort();
+        self.code_active.store(false, std::sync::atomic::Ordering::Relaxed);
         self.finish(reply, start)
     }
 
@@ -725,12 +757,39 @@ mod tests {
     fn a_spoken_task_summary_is_short_and_speakable() {
         assert_eq!(task_summary("Build me a screenshot script"), "a screenshot script");
         assert_eq!(task_summary("can you please write a test for the gate"), "a test for the gate");
+        // Scene-setting clauses are skipped: announced live as "working on In
+        // the pipeline-test project", which says nothing.
+        assert_eq!(
+            task_summary("In the pipeline-test project, add a subtract function and a test for it"),
+            "a subtract function and a test for"
+        );
         assert_eq!(task_summary("  "), "that");
         assert_eq!(task_summary("..."), "that");
         let long =
             "please make me a really quite extraordinarily complicated thing that does many things indeed ok";
         assert!(task_summary(long).split_whitespace().count() <= 7, "{}", task_summary(long));
         assert!(!task_summary("run ls /home/user/Projects/secret-dir").contains('/'));
+    }
+
+    /// A `code` task speaks for itself within seconds, so the generic
+    /// "still working" headsup must stand down. Measured live before this:
+    /// the headsup and the first progress line landed three seconds apart.
+    #[test]
+    fn a_code_task_suppresses_the_generic_headsup() {
+        let h = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let said = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let fire = |flag: &std::sync::atomic::AtomicBool, said: &std::sync::Mutex<Vec<String>>| {
+            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                said.lock().unwrap().push(SLOW_TURN_HEADSUP.to_string());
+            }
+        };
+        // A slow non-code turn still gets the headsup.
+        fire(&h, &said);
+        assert_eq!(said.lock().unwrap().len(), 1);
+        // Once code starts, it does not.
+        h.store(true, std::sync::atomic::Ordering::Relaxed);
+        fire(&h, &said);
+        assert_eq!(said.lock().unwrap().len(), 1, "headsup stood down for a code task");
     }
 
     fn a_slow_turn_says_something_before_it_finishes() {

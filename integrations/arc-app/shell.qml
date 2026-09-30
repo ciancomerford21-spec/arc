@@ -354,6 +354,7 @@ ShellRoot {
                     tool: modelData.name
                     current: modelData.risk
                     builtin: modelData.default_risk || modelData.risk
+                    lowerable: modelData.lowerable !== false
                     reclassified: modelData.reclassified === true
                     enabled: shell.classBusy === ""
                     onPicked: function(level) { shell.setClass(modelData.name, level) }
@@ -633,7 +634,8 @@ ShellRoot {
     // Dangerous-by-nature tools (reboot, shutdown, code) can be raised but
     // never lowered -- the daemon refuses it -- so offering the lower cells
     // would be offering a button that cannot work.
-    readonly property bool locked: builtin === "dangerous"
+    property bool lowerable: true
+    readonly property bool locked: builtin === "dangerous" && !lowerable
 
     Repeater {
       model: picker.locked ? [] : shell.levels

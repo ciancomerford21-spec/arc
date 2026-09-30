@@ -412,6 +412,10 @@ pub struct PendingConfirmation {
     pub expires_in_s: u64,
 }
 
+fn yes() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolInfo {
     pub name: String,
@@ -432,6 +436,10 @@ pub struct ToolInfo {
     /// built-ins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub made_by_arc: Option<String>,
+    /// False for tools that are dangerous by nature and can only be raised
+    /// (reboot, shutdown, code). The picker shows those as locked.
+    #[serde(default = "yes")]
+    pub lowerable: bool,
     /// Why the tool is disabled/unavailable, when it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,

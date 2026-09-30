@@ -16,7 +16,10 @@
 >   *baseline*. Any call the tool itself judges dangerous stays dangerous, so
 >   marking `shell_exec` safe quiets `ls` but `rm -rf ~/x` or
 >   `systemctl poweroff` still ask. Tools that are dangerous by nature
->   (`reboot`, `shutdown`, `code`) cannot be lowered at all. A classification is
+>   (`reboot`, `shutdown`, `code`) cannot be lowered at all. Arc's self-made
+>   scripts are the exception: they start dangerous only because nobody has
+>   read them, so once you have, safe means safe — until the script changes.
+>   A classification is
 >   not a permission: blocked calls stay refused, and a `deny` rule or a
 >   disabled tool still wins.
 > * **Reset.** Clicking the already-active cell, or the `↺` button that appears
@@ -176,7 +179,7 @@ Ask Arc to learn something ("make yourself a tool that…") and it calls
 | Kind | What it is | Safety |
 |---|---|---|
 | **composite** | A named chain of existing tools, with `{param}` placeholders | Every step is gated as if called on its own, so wrapping `shell_exec "poweroff"` in a composite changes nothing about whether it asks. A held step stops the chain and the reply names the steps that did not run. |
-| **script** | A bash or python script Arc wrote | Dangerous by nature: **every run asks**, and the picker cannot lower it. Bash lines are screened by the `shell_exec` policy at creation and again at every load. Arguments arrive as `$ARC_ARG_<NAME>` and as JSON on stdin, never spliced into the script. |
+| **script** | A bash or python script Arc wrote | **Every run asks** until you have read it and lowered it in the picker (or `arc tool <name> safe`). The approval is for that text: editing the script on disk, or deleting and recreating it, resets it to asking. Bash lines are screened by the `shell_exec` policy at creation and again at every load. Arguments arrive as `$ARC_ARG_<NAME>` and as JSON on stdin, never spliced into the script. |
 
 * Stored in `~/.local/share/arc/tools/<name>/` (`tool.json` plus `run.sh` /
   `run.py`; override `$ARC_TOOLS_DIR`) and loaded at start. A tool edited on

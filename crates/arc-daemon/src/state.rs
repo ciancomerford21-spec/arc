@@ -147,6 +147,11 @@ impl Daemon {
             tracing::warn!("self-made tool not loaded: {p}");
         }
         tracing::info!(count = custom.names().len(), path = %tools_dir.display(), "self-made tools loaded");
+        // A script lowered to safe was lowered by someone who read *that*
+        // text. If it has been edited since, the approval does not carry over.
+        for t in assistant.gate().forget_classifications(&custom.changed_since_created()) {
+            tracing::warn!(tool = %t, "self-made script changed since it was created; its classification was reset");
+        }
         let path = std::env::var_os("ARC_AUTOMATIONS")
             .map(PathBuf::from)
             .unwrap_or_else(arc_config::paths::automations_file);
@@ -296,6 +301,8 @@ impl Daemon {
                         None => s.name.split('_').next().unwrap_or("").into(),
                     },
                     made_by_arc: made,
+                    lowerable: default_risk != arc_proto::RiskLevel::Dangerous
+                        || g.tools().by_name(&s.name).is_some_and(|t| t.user_may_lower()),
                     unavailable_reason: (!enabled).then(|| "disabled in configuration".into()),
                     reclassified: g.classification(&s.name).is_some(),
                     name: s.name,

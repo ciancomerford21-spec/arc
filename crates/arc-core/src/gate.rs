@@ -167,7 +167,7 @@ impl Gate {
         // dangerous at dangerous, so the picker would show "safe" on a tool
         // that still prompts. Refuse, and say why.
         if let Some(l) = level {
-            if t.base_risk() == RiskLevel::Dangerous && l < RiskLevel::Dangerous {
+            if t.base_risk() == RiskLevel::Dangerous && l < RiskLevel::Dangerous && !t.user_may_lower() {
                 return Err(format!(
                     "`{tool}` is dangerous by nature and cannot be lowered; it can only be reset to default"
                 ));
@@ -202,10 +202,18 @@ impl Gate {
     ///
     /// Blocked calls and `deny` rules are handled before and after this and
     /// are never affected by it.
-    fn classify(&self, tool: &str, a: &Assessment) -> (RiskLevel, bool) {
+    ///
+    /// The exception is a tool whose danger is only "nobody has reviewed
+    /// this yet" (`Tool::user_may_lower`: Arc's self-made scripts). It has no
+    /// per-call judgement to preserve -- every call is the same script -- so
+    /// once the user has read it and lowered it, the lowered level is the
+    /// level. Its content was screened against the blocklist at creation and
+    /// is again at every load, and a changed script loses the classification.
+    fn classify(&self, t: &dyn arc_tools::Tool, tool: &str, a: &Assessment) -> (RiskLevel, bool) {
         match self.classification(tool) {
             None => (a.risk, a.force_confirm),
             Some(RiskLevel::Dangerous) => (RiskLevel::Dangerous, true),
+            Some(l) if t.user_may_lower() => (l, false),
             Some(_) if a.risk == RiskLevel::Dangerous => (RiskLevel::Dangerous, a.force_confirm),
             Some(l) => (l, a.force_confirm),
         }
@@ -258,7 +266,7 @@ impl Gate {
         // The user's classification replaces the tool's own level. Blocked is
         // already handled above, so a `safe` classification cannot unblock a
         // destructive call -- it only removes the prompt.
-        let (risk, force_confirm) = self.classify(tool, &a);
+        let (risk, force_confirm) = self.classify(t.as_ref(), tool, &a);
         let decision = match self.policy.decide(tool, risk) {
             Decision::Allow if force_confirm => Decision::Confirm { reason: "unlisted command".into() },
             d => d,
@@ -281,9 +289,39 @@ impl Gate {
             }
             Decision::Allow => {
                 let warning = self.caution_notice(tool);
-                Self::execute(&t, tool, &args, risk, warning).await
+                let out = Self::execute(&t, tool, &args, risk, warning).await;
+                self.after(&out);
+                out
             }
         }
+    }
+
+    /// A deleted self-made tool takes its classification with it. Otherwise
+    /// "delete screenshot, create screenshot" would hand a brand-new,
+    /// unreviewed script the `safe` the user gave the old one.
+    fn after(&self, out: &Outcome) {
+        if let Outcome::Done { tool, result: ToolResult::Ok(v), .. } = out {
+            if tool == "tool_delete" {
+                if let Some(name) = v.get("deleted").and_then(|n| n.as_str()) {
+                    if let Err(e) = self.classes.write().unwrap().set(name, None) {
+                        tracing::warn!(tool = name, error = %e, "could not clear a deleted tool's classification");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clear the classification of every named tool (self-made scripts whose
+    /// content changed on disk since they were created). Returns those that
+    /// had one.
+    pub fn forget_classifications(&self, tools: &[String]) -> Vec<String> {
+        let mut cleared = vec![];
+        for t in tools {
+            if self.classification(t).is_some() && self.classes.write().unwrap().set(t, None).is_ok() {
+                cleared.push(t.clone());
+            }
+        }
+        cleared
     }
 
     /// Execute a previously held call, verbatim. Single use.
@@ -315,7 +353,9 @@ impl Gate {
         // Re-apply the classification: the user may have downgraded the tool
         // between asking and clicking, and the stored call is what runs.
         let warning = self.caution_notice(&p.tool);
-        Ok(Self::execute(&t, &p.tool, &args, p.risk, warning).await)
+        let out = Self::execute(&t, &p.tool, &args, p.risk, warning).await;
+        self.after(&out);
+        Ok(out)
     }
 
     /// Run a tool Arc made from other tools.
@@ -467,7 +507,7 @@ impl Gate {
             let a = t.assess(args);
             // A blocked call is refused whatever the classification says, so
             // reporting its risk as anything but the tool's own would be a lie.
-            if a.blocked.is_some() { a.risk } else { self.classify(tool, &a).0 }
+            if a.blocked.is_some() { a.risk } else { self.classify(t.as_ref(), tool, &a).0 }
         })
     }
 
@@ -716,6 +756,7 @@ mod tests {
             description: "test composite".into(),
             params: params.iter().map(|p| (p.to_string(), "x".to_string())).collect(),
             created: String::new(),
+            fingerprint: String::new(),
             body: arc_tools::custom::Body::Composite { steps: serde_json::from_value(steps).unwrap() },
         }
     }
@@ -822,7 +863,6 @@ mod tests {
         // A script tool is dangerous by nature: every run asks, and the
         // picker cannot lower it.
         assert!(matches!(g.run("say_hi", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)));
-        assert!(g.set_classification("say_hi", Some(RiskLevel::Safe)).is_err());
 
         let del = |n: &str| -> JsonMap { [("name".to_string(), Json::String(n.into()))].into() };
         assert!(matches!(g.run("tool_delete", del("reboot"), Json::Null).await, Outcome::Denied { .. }));
@@ -845,6 +885,91 @@ mod tests {
             &[],
         ));
         assert!(e.unwrap_err().contains("cannot create"));
+    }
+
+    fn script_def(name: &str, text: &str) -> arc_tools::custom::Def {
+        arc_tools::custom::Def {
+            name: name.into(),
+            description: "test script".into(),
+            params: Default::default(),
+            created: String::new(),
+            fingerprint: String::new(),
+            body: arc_tools::custom::Body::Script {
+                language: arc_tools::custom::Language::Bash,
+                script: text.into(),
+            },
+        }
+    }
+
+    /// The user asked for this: a self-made script they have reviewed can be
+    /// set to safe, and then runs without a prompt.
+    #[tokio::test]
+    async fn a_reviewed_self_made_script_can_be_set_to_safe() {
+        let (g, _, _) = judging_gate();
+        g.tools().custom().create(script_def("say_hi", "echo hi")).unwrap();
+        assert!(matches!(g.run("say_hi", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)));
+        for level in [RiskLevel::Caution, RiskLevel::Safe] {
+            g.set_classification("say_hi", Some(level)).unwrap();
+            assert_eq!(g.risk_of("say_hi", &JsonMap::new()), Some(level));
+            let Outcome::Done { result: ToolResult::Ok(v), .. } =
+                g.run("say_hi", JsonMap::new(), Json::Null).await
+            else {
+                panic!("a script marked {level} must run without asking")
+            };
+            assert_eq!(v["output"], "hi");
+        }
+        // Built-ins that are dangerous by nature are still locked.
+        for t in ["reboot", "tool_delete"] {
+            assert!(g.set_classification(t, Some(RiskLevel::Safe)).is_err(), "{t}");
+        }
+    }
+
+    /// Deleting a script takes its classification with it, so a new script
+    /// reusing the name starts back at "asks every run".
+    #[tokio::test]
+    async fn a_recreated_script_does_not_inherit_the_old_ones_safe() {
+        let (g, _, _) = judging_gate();
+        g.tools().custom().create(script_def("shot", "echo old")).unwrap();
+        g.set_classification("shot", Some(RiskLevel::Safe)).unwrap();
+        let del: JsonMap = [("name".to_string(), Json::String("shot".into()))].into();
+        let Outcome::NeedsConfirmation(p) = g.run("tool_delete", del, Json::Null).await else { panic!() };
+        g.confirm(&p.confirmation_id).await.unwrap();
+        assert_eq!(g.classification("shot"), None);
+        g.tools().custom().create(script_def("shot", "echo new")).unwrap();
+        assert!(matches!(g.run("shot", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)));
+    }
+
+    /// A script edited on disk after it was lowered loses the classification
+    /// at the next load: the user approved the old text, not the new one.
+    #[tokio::test]
+    async fn an_edited_script_loses_its_classification_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = || {
+            let mut tools = Tools::new();
+            tools.register(Arc::new(Probe {
+                name: "probe.safe",
+                risk: RiskLevel::Safe,
+                runs: Arc::new(AtomicUsize::new(0)),
+            }));
+            let classes = ClassifiedTools::load_from(dir.path().join("classes.json"));
+            let g = Gate::with_classes(Arc::new(tools), &Config::default(), classes);
+            g.tools().custom().attach_dir(dir.path().join("tools"));
+            g.forget_classifications(&g.tools().custom().changed_since_created());
+            g
+        };
+        let g = mk();
+        g.tools().custom().create(script_def("shot", "echo one")).unwrap();
+        g.tools().custom().create(script_def("other", "echo two")).unwrap();
+        g.set_classification("shot", Some(RiskLevel::Safe)).unwrap();
+        g.set_classification("other", Some(RiskLevel::Safe)).unwrap();
+        drop(g);
+        // Unchanged: kept across a restart.
+        assert_eq!(mk().classification("shot"), Some(RiskLevel::Safe));
+        std::fs::write(dir.path().join("tools/shot/run.sh"), "echo one\necho sneaky\n").unwrap();
+        let g = mk();
+        assert_eq!(g.classification("shot"), None, "edited: back to asking");
+        assert_eq!(g.classification("other"), Some(RiskLevel::Safe), "untouched: kept");
+        assert!(matches!(g.run("shot", JsonMap::new(), Json::Null).await, Outcome::NeedsConfirmation(_)));
     }
 
     /// A tool whose risk depends on the call, like shell_exec.

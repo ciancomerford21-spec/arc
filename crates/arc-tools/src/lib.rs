@@ -107,6 +107,13 @@ pub trait Tool: Send + Sync + 'static {
     fn follow_up(&self, _result: &Json) -> Option<String> {
         None
     }
+    /// True when this tool's danger means "nobody has reviewed it yet"
+    /// rather than something it works out per call, so a user who has read
+    /// it may lower it in the picker. Only self-made scripts: `reboot` is
+    /// dangerous because of what it does, and no review changes that.
+    fn user_may_lower(&self) -> bool {
+        false
+    }
 }
 
 fn s(v: &Json, k: &str) -> Option<String> {
@@ -1870,7 +1877,7 @@ impl Tool for ToolCreate {
         "Create a new tool for yourself, so a task you will repeat becomes one call. \
          kind=composite chains your existing tools (steps: [{tool, args}], args may use {param} placeholders). \
          kind=script runs a bash or python script you write, for things no existing tool can do; \
-         arguments reach it as $ARC_ARG_<NAME> env vars and as JSON on stdin. Script tools ask the user before every run. \
+         arguments reach it as $ARC_ARG_<NAME> env vars and as JSON on stdin. Script tools ask the user before every run until the user marks them safe. \
          Prefer composite when existing tools suffice. The tool is available from the next request."
     }
     fn parameters(&self) -> Json {
@@ -1927,6 +1934,7 @@ impl Tool for ToolCreate {
             description: text("description"),
             params,
             created: String::new(),
+            fingerprint: String::new(),
             body,
         };
         match self.store.create(def) {

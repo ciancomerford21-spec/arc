@@ -97,8 +97,25 @@ pub struct Def {
     pub params: BTreeMap<String, String>,
     #[serde(default)]
     pub created: String,
+    /// Hash of the script text as Arc wrote it. A script whose text no
+    /// longer matches at load has been edited since, so any classification
+    /// the user gave it -- having reviewed the *old* text -- is cleared.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
     #[serde(flatten)]
     pub body: Body,
+}
+
+/// FNV-1a, 64-bit. Detects an edited script; it is not a security boundary
+/// (anyone who can write the file can write tool.json too, and the script
+/// is re-screened against the blocklist at every load regardless).
+pub fn fingerprint(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 impl Def {
@@ -193,6 +210,9 @@ pub fn fill(v: &Json, args: &JsonMap) -> Json {
 /// change it.
 pub struct CustomTools {
     dir: RwLock<Option<PathBuf>>,
+    /// Scripts whose text changed on disk since Arc created them, found at
+    /// the last load. The daemon clears their classifications.
+    changed: RwLock<Vec<String>>,
     defs: RwLock<BTreeMap<String, Def>>,
     builtins: RwLock<HashSet<String>>,
     analyzer: ShellAnalyzer,
@@ -206,6 +226,7 @@ impl CustomTools {
     pub fn new(analyzer: ShellAnalyzer, timeout_s: u64) -> Self {
         Self {
             dir: RwLock::new(None),
+            changed: RwLock::new(vec![]),
             defs: RwLock::new(BTreeMap::new()),
             builtins: RwLock::new(HashSet::new()),
             analyzer,
@@ -228,6 +249,7 @@ impl CustomTools {
     /// that became a built-in) is skipped, not loaded half-trusted.
     pub fn attach_dir(&self, dir: PathBuf) -> Vec<String> {
         let mut problems = vec![];
+        let mut changed = vec![];
         let mut loaded = BTreeMap::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             let mut paths: Vec<PathBuf> =
@@ -239,6 +261,27 @@ impl CustomTools {
                         if let Err(e) = self.validate(&d, &loaded) {
                             problems.push(format!("{}: {e}", p.display()));
                         } else {
+                            if let Body::Script { script, .. } = &d.body {
+                                if d.fingerprint.is_empty() {
+                                    // Made before fingerprints existed. Such a
+                                    // script could not have been lowered then
+                                    // (scripts were locked at dangerous), so
+                                    // there is no approval to protect: record
+                                    // the text as it is now. Without this it
+                                    // counted as edited on every start and
+                                    // lost a new classification each restart.
+                                    let mut d2 = d.clone();
+                                    d2.fingerprint = fingerprint(script);
+                                    if let Err(e) = self.write_def(&p, &d2) {
+                                        problems.push(format!(
+                                            "{}: could not record fingerprint: {e}",
+                                            p.display()
+                                        ));
+                                    }
+                                } else if fingerprint(script) != d.fingerprint {
+                                    changed.push(d.name.clone());
+                                }
+                            }
                             loaded.insert(d.name.clone(), d);
                         }
                     }
@@ -248,7 +291,13 @@ impl CustomTools {
         }
         *self.defs.write().unwrap() = loaded;
         *self.dir.write().unwrap() = Some(dir);
+        *self.changed.write().unwrap() = changed;
         problems
+    }
+
+    /// Scripts edited on disk since Arc created them (as of the last load).
+    pub fn changed_since_created(&self) -> Vec<String> {
+        self.changed.read().unwrap().clone()
     }
 
     fn read_one(&self, p: &Path) -> Result<Def, String> {
@@ -423,6 +472,9 @@ impl CustomTools {
         if d.created.is_empty() {
             d.created = chrono::Local::now().to_rfc3339();
         }
+        if let Body::Script { script, .. } = &d.body {
+            d.fingerprint = fingerprint(script);
+        }
         if let Some(dir) = self.dir() {
             let p = dir.join(&d.name);
             std::fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -430,11 +482,16 @@ impl CustomTools {
                 let f = p.join(language.file());
                 std::fs::write(&f, script).map_err(|e| format!("{}: {e}", f.display()))?;
             }
-            let json = serde_json::to_string_pretty(&d).map_err(|e| e.to_string())?;
-            std::fs::write(p.join("tool.json"), json + "\n").map_err(|e| e.to_string())?;
+            self.write_def(&p, &d)?;
         }
         self.defs.write().unwrap().insert(d.name.clone(), d.clone());
         Ok(d)
+    }
+
+    /// Write `tool.json` (the metadata; a script's text lives beside it).
+    fn write_def(&self, p: &Path, d: &Def) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(d).map_err(|e| e.to_string())?;
+        std::fs::write(p.join("tool.json"), json + "\n").map_err(|e| e.to_string())
     }
 
     pub fn delete(&self, name: &str) -> Result<Def, String> {
@@ -477,6 +534,12 @@ impl Tool for CompositeTool {
     fn base_risk(&self) -> RiskLevel {
         self.risk
     }
+    /// A composite's level is only whether to hold the whole chain before
+    /// it starts; every step is still gated on its own, so lowering one
+    /// that contains a dangerous step changes nothing about that step.
+    fn user_may_lower(&self) -> bool {
+        true
+    }
     async fn execute(&self, _args: &JsonMap) -> ToolResult {
         ToolResult::Error("a composite tool runs through the gate, step by step".into())
     }
@@ -501,6 +564,9 @@ impl Tool for ScriptTool {
     }
     fn base_risk(&self) -> RiskLevel {
         RiskLevel::Dangerous
+    }
+    fn user_may_lower(&self) -> bool {
+        true
     }
     fn assess(&self, _args: &JsonMap) -> crate::Assessment {
         let at = match (&self.path, &self.def.body) {
@@ -590,6 +656,7 @@ mod tests {
             description: "test tool".into(),
             params: params.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
             created: String::new(),
+            fingerprint: String::new(),
             body: Body::Composite { steps: serde_json::from_value(steps).unwrap() },
         }
     }
@@ -600,6 +667,7 @@ mod tests {
             description: "test script".into(),
             params: params.iter().map(|p| (p.to_string(), "a value".to_string())).collect(),
             created: String::new(),
+            fingerprint: String::new(),
             body: Body::Script { language, script: script.into() },
         }
     }
@@ -658,6 +726,31 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("line 3"), "{e}");
         assert!(s.get("wipe").is_none());
+    }
+
+    /// A script made before fingerprints existed is recorded as-is, not
+    /// treated as edited on every start.
+    #[test]
+    fn a_script_from_before_fingerprints_is_adopted_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = CustomTools::new(ShellAnalyzer::new(&Config::default().permissions.shell, &[]).unwrap(), 10);
+        s.attach_dir(dir.path().to_path_buf());
+        s.create(script("old", Language::Bash, "echo hi", &[])).unwrap();
+        let j = dir.path().join("old/tool.json");
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&j).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("fingerprint");
+        std::fs::write(&j, v.to_string()).unwrap();
+        for _ in 0..2 {
+            let s =
+                CustomTools::new(ShellAnalyzer::new(&Config::default().permissions.shell, &[]).unwrap(), 10);
+            s.attach_dir(dir.path().to_path_buf());
+            assert!(s.changed_since_created().is_empty());
+        }
+        assert!(std::fs::read_to_string(&j).unwrap().contains("fingerprint"));
+        std::fs::write(dir.path().join("old/run.sh"), "echo changed").unwrap();
+        let s = CustomTools::new(ShellAnalyzer::new(&Config::default().permissions.shell, &[]).unwrap(), 10);
+        s.attach_dir(dir.path().to_path_buf());
+        assert_eq!(s.changed_since_created(), vec!["old".to_string()]);
     }
 
     #[test]

@@ -221,6 +221,87 @@ fn second_daemon_refuses_live_socket() {
     assert_eq!(Client::connect(&d.socket).data(json!({"type": "ping"}))["pong"], true);
 }
 
+/// The whole point of the feature, end to end: the playback script's report
+/// comes back out of the real socket as an event the overlay subscribes to,
+/// and the row clears when the player process is gone.
+///
+/// The report is made over the socket rather than by running the script,
+/// because the script's `arc` call is the same call -- running mpv and yt-dlp
+/// in a test would need both, a network, and would actually play music.
+#[test]
+fn now_playing_reaches_subscribers_and_clears_when_the_player_dies() {
+    let d = start("", &["--no-voice"]);
+    let mut sub = Client::connect(&d.socket);
+    sub.data(json!({"type": "subscribe", "topics": ["assistant"]}));
+    let mut c = Client::connect(&d.socket);
+
+    // Nothing playing at first.
+    let empty = c.data(json!({"type": "now_playing", "op": "show"}));
+    assert_eq!(empty["state"], "stopped");
+    assert_eq!(empty["playing"], false);
+    assert_eq!(c.data(json!({"type": "bar_status"})).get("now_playing"), None);
+
+    // A report from a playback tool.
+    let set = c.data(json!({
+        "type": "now_playing", "op": "set",
+        "title": "Hall of Fame", "artist": "Boards of Canada",
+        "source": "youtube music", "pid": 0,
+    }));
+    assert_eq!(set["playing"], true);
+    assert_eq!(set["label"], "Hall of Fame — Boards of Canada");
+
+    let ev = sub.wait_event(|e| e["event"] == "now_playing", Duration::from_secs(5));
+    assert_eq!(ev["status"]["title"], "Hall of Fame");
+    assert_eq!(ev["status"]["artist"], "Boards of Canada");
+    assert_eq!(ev["status"]["label"], "Hall of Fame — Boards of Canada");
+    // The overlay's own read agrees with what it was told.
+    assert_eq!(c.data(json!({"type": "now_playing", "op": "show"}))["title"], "Hall of Fame");
+    let bar = c.data(json!({"type": "bar_status"}));
+    assert_eq!(bar["now_playing"]["title"], "Hall of Fame");
+
+    // Stopping clears it and says so.
+    let stopped = c.data(json!({"type": "now_playing", "op": "stop"}));
+    assert_eq!(stopped["playing"], false);
+    let ev = sub.wait_event(
+        |e| e["event"] == "now_playing" && e["status"]["playing"] == false,
+        Duration::from_secs(5),
+    );
+    assert_eq!(ev["status"]["title"], "", "a stop must not leave the old title attached: {ev}");
+    assert_eq!(c.data(json!({"type": "bar_status"})).get("now_playing"), None);
+}
+
+/// A blank title is a client bug and must be an error, not an empty row on the
+/// overlay that nobody can tell apart from a rendering fault.
+#[test]
+fn a_now_playing_report_without_a_title_is_refused() {
+    let d = start("", &["--no-voice"]);
+    let mut c = Client::connect(&d.socket);
+    let v = c.call(json!({"type": "now_playing", "op": "set", "artist": "Nobody"}));
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error"]["code"], "bad_request");
+    assert!(c.data(json!({"type": "bar_status"})).get("now_playing").is_none());
+}
+
+/// The reap is the only thing that clears the row when a track ends on its own:
+/// the tool that started it has already exited by then. Report a pid that cannot
+/// exist and the row must clear on its own, within a second or two, with no
+/// further requests.
+#[test]
+fn a_dead_player_clears_the_row_without_being_asked() {
+    let d = start("", &["--no-voice"]);
+    let mut sub = Client::connect(&d.socket);
+    sub.data(json!({"type": "subscribe", "topics": ["assistant"]}));
+    let mut c = Client::connect(&d.socket);
+    // u32::MAX is above pid_t's range, so it can never be a real process.
+    c.data(json!({"type": "now_playing", "op": "set", "title": "Already Gone", "pid": u32::MAX}));
+    let ev = sub.wait_event(
+        |e| e["event"] == "now_playing" && e["status"]["playing"] == false,
+        Duration::from_secs(10),
+    );
+    assert_eq!(ev["status"]["title"], "", "{ev}");
+    assert_eq!(c.data(json!({"type": "now_playing", "op": "show"}))["playing"], false);
+}
+
 fn voice_available() -> bool {
     let py = arc_config_python();
     py.exists() && Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/arc_voice").exists()

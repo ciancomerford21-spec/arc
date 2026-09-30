@@ -232,6 +232,10 @@ ShellRoot {
   property int selected: -1          // index into turns; -1 = follow latest
   property int rev: 0                // bump to refresh bindings on mutation
   property string toolFilter: ""
+  // The track the daemon says is playing, or null. Fed by `now_playing` events
+  // and read once on start, so a track that was already playing when the app
+  // opened shows up without waiting for the next request.
+  property var nowPlaying: null
 
   readonly property int shownIndex: selected >= 0 && selected < turns.length ? selected : turns.length - 1
   readonly property var shownTurn: { rev; return shownIndex >= 0 ? turns[shownIndex] : null }
@@ -265,6 +269,16 @@ ShellRoot {
     var e = v.event
     if (e === "state") { arcState = String(v.state || "idle"); return }
     if (e === "heard") { ensureTurn(String(v.text || ""), String(v.source || "")); touch(); return }
+    // Not a turn event: the music strip is independent of any request, so it
+    // is handled before the "which turn does this belong to" logic below --
+    // a track starting playback must not conjure an empty turn.
+    if (e === "now_playing") {
+      var n = v.status || {}
+      // `playing` comes from the daemon rather than being re-derived here, so
+      // a stopped report with a stale title still clears the strip.
+      nowPlaying = (n.playing === true) ? n : null
+      return
+    }
     var t = current()
     if (!t || t.done) {
       if (e === "reply" || e === "thought" || e === "tool_started") t = ensureTurn("(no request text)", "")
@@ -377,6 +391,31 @@ ShellRoot {
   }
 
   // ------------------------------------------------------------ processes
+  // Read what is playing once at start and on every reconnect. Without this
+  // the strip only appears when a track is requested after the app opened --
+  // which is exactly the case the user is not looking at.
+  Process {
+    id: musicLoader
+    command: [shell.arcCmd, "--json", "now-playing", "show"]
+    running: true
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var n = JSON.parse(text)
+          shell.nowPlaying = (n && n.playing === true) ? n : null
+        } catch (e) {}
+      }
+    }
+  }
+
+  function stopPlayback() {
+    // Optimistic, then the daemon's own event confirms it: an IPC round trip
+    // is fast but not instant, and a strip that lingers a beat after a stop
+    // click looks broken.
+    nowPlaying = null
+    Quickshell.execDetached([arcCmd, "now-playing", "stop"])
+  }
+
   Process {
     id: watcher
     command: [shell.arcCmd, "--json", "watch", "--topics", "assistant,errors"]
@@ -389,7 +428,7 @@ ShellRoot {
     }
     onExited: { shell.arcState = "offline"; reconnect.start() }
   }
-  Timer { id: reconnect; interval: 3000; onTriggered: { watcher.running = true; toolLoader.running = true; statusLoader.running = true } }
+  Timer { id: reconnect; interval: 3000; onTriggered: { watcher.running = true; toolLoader.running = true; statusLoader.running = true; musicLoader.running = true } }
 
   Process {
     id: toolLoader
@@ -530,6 +569,65 @@ ShellRoot {
         // somewhere other than in the row the user was looking at.
         Tag { visible: shell.classNote !== ""; label: shell.classNote; tint: c.amber }
         Tag { label: shell.turns.length + " TURNS"; tint: c.chromeDim }
+
+        // What's playing. In the header rather than a pane of its own: it is
+        // a one-line fact about the machine right now, not part of any turn,
+        // and it is the one thing on screen that stays true between requests.
+        // Capped in width so a long title cannot squeeze the tags out.
+        Rectangle {
+          id: music
+          visible: shell.nowPlaying !== null
+          Layout.preferredWidth: Math.min(musicRow.implicitWidth + 34, Math.max(200, win.width * 0.34))
+          Layout.minimumWidth: 120
+          height: 24
+          radius: 3
+          color: Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, 0.14)
+          border.color: c.magenta
+          RowLayout {
+            id: musicRow
+            anchors.left: parent.left
+            anchors.leftMargin: 10
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.right: parent.right
+            anchors.rightMargin: 10
+            spacing: 6
+            Text { text: "♪"; color: c.magenta; font.pixelSize: 12 }
+            // Title and artist as separate items rather than the daemon's
+            // combined label, so a long title elides and the artist survives.
+            Text {
+              text: String(shell.nowPlaying ? shell.nowPlaying.title : "")
+              color: c.text
+              font.family: c.mono; font.pixelSize: 11; font.bold: true
+              elide: Text.ElideRight
+              Layout.maximumWidth: 260
+            }
+            Text {
+              text: String(shell.nowPlaying ? (shell.nowPlaying.artist || "") : "")
+              visible: text.length > 0
+              color: c.muted
+              font.family: c.mono; font.pixelSize: 11
+              elide: Text.ElideRight
+              Layout.maximumWidth: 200
+            }
+            MouseArea {
+              id: stopMa
+              Layout.preferredWidth: 16
+              Layout.preferredHeight: 16
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              Text {
+                anchors.centerIn: parent
+                text: "✕"
+                color: stopMa.containsMouse ? c.red : c.muted
+                font.pixelSize: 10
+              }
+              // Clears the overlay's row. It does not kill the player -- that
+              // is the music tool's business, and killing another process from
+              // a UI click is not something to do by accident.
+              onClicked: shell.stopPlayback()
+            }
+          }
+        }
       }
       Rectangle { Layout.fillWidth: true; height: 1; color: c.chrome; opacity: 0.35 }
 

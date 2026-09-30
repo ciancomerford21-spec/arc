@@ -80,7 +80,30 @@ enum Cmd {
         #[arg(long)]
         follow: bool,
     },
-    /// Stream daemon events (replies, state changes, confirmations).
+    /// Report or clear what is playing: `arc now-playing show|set|stop`.
+  ///
+  /// This is the IPC the playback scripts use. `set` is called once the player
+  /// is actually running, so the overlay never shows a track that failed to
+  /// start; `stop` clears it. `show` (the default) is a plain read -- the app
+  /// uses it on start so a track already playing appears without waiting for
+  /// the next change.
+  NowPlaying {
+    #[arg(value_name = "ACTION", default_value = "show")]
+    action: String,
+    /// Track title (with `set`).
+    #[arg(long)]
+    title: Option<String>,
+    /// Track artist (with `set`).
+    #[arg(long)]
+    artist: Option<String>,
+    /// Where it came from, e.g. "youtube music" (with `set`).
+    #[arg(long)]
+    source: Option<String>,
+    /// Player process, so the daemon can tell when playback ended.
+    #[arg(long)]
+    pid: Option<u32>,
+  },
+/// Stream daemon events (replies, state changes, confirmations).
     Watch {
         /// Topics: assistant, desktop, voice_activity, errors.
         #[arg(long, value_delimiter = ',', default_value = "assistant,errors")]
@@ -380,6 +403,48 @@ fn main() -> Result<()> {
                 let _ = res;
                 println!("{}", offline_bar(wb));
                 std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+        Cmd::NowPlaying { action, title, artist, source, pid } => {
+            // `set` needs a title. Saying so here rather than letting the
+            // daemon's "needs a title" error come back keeps the message next
+            // to the flag that is missing.
+            let req = match action.as_str() {
+                "show" | "get" => json!({"type": "now_playing", "op": "show"}),
+                "set" => {
+                    let Some(title) = title else {
+                        bail!("`arc now-playing set` needs --title \"Track name\"");
+                    };
+                    json!({
+                        "type": "now_playing", "op": "set", "title": title,
+                        "artist": artist.unwrap_or_default(),
+                        "source": source.unwrap_or_default(),
+                        "pid": pid.unwrap_or(0),
+                    })
+                }
+                "stop" | "clear" => json!({"type": "now_playing", "op": "stop"}),
+                other => bail!("unknown now-playing action `{other}` (show, set, stop)"),
+            };
+            // Reading must work without the daemon: a playback script that
+            // finds no socket should still be able to clear a stale track, and
+            // a widget asking "what is playing?" should get "nothing" rather
+            // than an error dialog. Stopping is local state, so treat an
+            // unreachable daemon as already stopped.
+            let out = match Conn::open(&sock, Some(Duration::from_secs(5))).and_then(|mut c| c.call(req)) {
+                Ok(v) => v,
+                Err(_) if action == "stop" || action == "clear" => json!({
+                    "state": "stopped", "title": "", "artist": "", "label": "", "playing": false,
+                }),
+                Err(e) => return Err(e),
+            };
+            if cli.json {
+                println!("{out}");
+                return Ok(());
+            }
+            if out["playing"] == true {
+                println!("{}", out["label"].as_str().unwrap_or(""));
+            } else {
+                println!("nothing playing");
             }
         }
         Cmd::Watch { topics } => {

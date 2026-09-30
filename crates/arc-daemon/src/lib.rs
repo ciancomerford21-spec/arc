@@ -23,6 +23,7 @@ pub async fn run(config: arc_config::Config, opts: Options) -> anyhow::Result<()
     if let Some(v) = opts.voice {
         tokio::spawn(voice::supervise(daemon.clone(), v));
     }
+    tokio::spawn(reap_now_playing(daemon.clone()));
     shutdown_signal().await;
     tracing::info!("shutting down");
     srv.abort();
@@ -31,6 +32,26 @@ pub async fn run(config: arc_config::Config, opts: Options) -> anyhow::Result<()
         let _ = std::fs::remove_file(b);
     }
     Ok(())
+}
+
+/// How often the player process is checked for liveness.
+///
+/// Fast enough that a finished track clears within a second of ending, slow
+/// enough to be one `kill -0` per second on an idle system. The check is a
+/// single syscall and nothing else, so this is not worth optimising.
+const NOW_PLAYING_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Clear the now-playing row when the player process goes away.
+///
+/// The playback tool starts mpv in the background and exits, so the daemon
+/// never gets an "it finished" message -- the process disappearing is the only
+/// signal there is. Without this the overlay would keep showing a track that
+/// ended minutes ago.
+async fn reap_now_playing(daemon: Arc<state::Daemon>) {
+    loop {
+        tokio::time::sleep(NOW_PLAYING_POLL).await;
+        daemon.reap_now_playing();
+    }
 }
 
 async fn shutdown_signal() {

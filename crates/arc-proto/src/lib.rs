@@ -125,6 +125,8 @@ pub enum Request {
         #[serde(default)]
         args: Value,
     },
+    /// Now-playing status. Returns [`NowPlaying`].
+    NowPlaying(NowPlayingRequest),
     /// Full status report. Returns [`StatusReport`].
     Status,
     /// Compact status for status bars. Returns [`BarStatus`].
@@ -210,6 +212,126 @@ pub enum MemoryRequest {
 pub enum AutomationRequest {
     List,
     Run { name: String },
+}
+
+// ---------------------------------------------------------------------------
+// Now playing
+// ---------------------------------------------------------------------------
+
+/// What the overlay shows in the music strip. Either a track that is playing,
+/// or nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NowPlayingState {
+    #[default]
+    Stopped,
+    Playing,
+}
+
+/// One currently-playing track.
+///
+/// Written by whatever started playback (today: the `play_youtube_music`
+/// script tool, via `arc --json now-playing set`), read by every client that
+/// wants to show it. `pid` is the player process, so the daemon can notice
+/// that playback ended without being told -- a track that finished must not
+/// stay on screen forever.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NowPlaying {
+    pub state: NowPlayingState,
+    pub title: String,
+    pub artist: String,
+    /// Where it came from, e.g. "youtube music".
+    pub source: String,
+    /// The player process, when one is known. Zero means unknown.
+    pub pid: u32,
+}
+
+impl NowPlaying {
+    /// True when there is something to display.
+    pub fn is_playing(&self) -> bool {
+        self.state == NowPlayingState::Playing && !self.title.trim().is_empty()
+    }
+
+    /// `Title — Artist`, or just whichever of the two exists.
+    pub fn label(&self) -> String {
+        match (self.title.trim(), self.artist.trim()) {
+            (t, a) if !t.is_empty() && !a.is_empty() => format!("{t} — {a}"),
+            (t, _) if !t.is_empty() => t.to_string(),
+            (_, a) if !a.is_empty() => a.to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Serialized as the five stored fields plus the two derived ones, so a
+/// client never has to reimplement [`NowPlaying::label`] in JavaScript to put
+/// "Title — Artist" on screen. `label` and `playing` are ignored when
+/// reading, which keeps this a superset of what a writer must send: an older
+/// writer that sends only `title` still decodes.
+impl Serialize for NowPlaying {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(7))?;
+        m.serialize_entry("state", &self.state)?;
+        m.serialize_entry("title", &self.title)?;
+        m.serialize_entry("artist", &self.artist)?;
+        m.serialize_entry("source", &self.source)?;
+        m.serialize_entry("pid", &self.pid)?;
+        m.serialize_entry("label", &self.label())?;
+        m.serialize_entry("playing", &self.is_playing())?;
+        m.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for NowPlaying {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Wire {
+            state: NowPlayingState,
+            title: String,
+            artist: String,
+            source: String,
+            pid: u32,
+        }
+        impl Default for Wire {
+            fn default() -> Self {
+                Self {
+                    state: NowPlayingState::Stopped,
+                    title: String::new(),
+                    artist: String::new(),
+                    source: String::new(),
+                    pid: 0,
+                }
+            }
+        }
+        let w = Wire::deserialize(d)?;
+        Ok(Self { state: w.state, title: w.title, artist: w.artist, source: w.source, pid: w.pid })
+    }
+}
+
+/// `Request::NowPlaying` operations.
+///
+/// `set` is what a playback script calls once the player is actually running;
+/// `stop` is what it calls when playback ends, and what the daemon calls for
+/// itself when the player process disappears.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum NowPlayingRequest {
+    Set {
+        title: String,
+        #[serde(default)]
+        artist: String,
+        #[serde(default)]
+        source: String,
+        #[serde(default)]
+        pid: u32,
+    },
+    /// Read the current status. Returns [`NowPlaying`] either way -- an empty
+    /// stopped one when nothing plays, rather than an error, so a widget can
+    /// call this on start and on reconnect without special cases.
+    Show,
+    Stop,
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +621,9 @@ pub struct StatusReport {
     pub last_reply: Option<String>,
     pub last_action: Option<String>,
     pub recent_errors: Vec<String>,
+    /// Present only while something is playing, like `BarStatus`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_playing: Option<NowPlaying>,
     pub rss_kb: Option<u64>,
 }
 
@@ -510,6 +635,11 @@ pub struct BarStatus {
     pub tooltip: String,
     pub class: String,
     pub mic_muted: Option<bool>,
+    /// Present only while something is playing. Absent otherwise rather than
+    /// an empty object, so an old bar widget reading this ignores it and a new
+    /// one can test `now_playing` for truthiness in one go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_playing: Option<NowPlaying>,
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +685,12 @@ pub enum Event {
         step: u32,
         elapsed_s: u64,
     },
+    /// The track that is playing right now, pushed whenever it changes.
+    /// A stopped state is pushed too -- that is how the overlay clears its
+    /// strip instead of showing a track that ended ten minutes ago.
+    NowPlaying {
+        status: NowPlaying,
+    },
     ToolStarted {
         tool: String,
         args: Value,
@@ -594,6 +730,7 @@ impl Event {
             | Event::Heard { .. }
             | Event::Thought { .. }
             | Event::CodeProgress { .. }
+            | Event::NowPlaying { .. }
             | Event::ToolStarted { .. }
             | Event::ToolFinished { .. }
             | Event::ConfirmationRequired { .. }
@@ -738,5 +875,121 @@ mod tests {
     fn event_topics() {
         assert_eq!(Event::VoiceLevel { rms: 0.1 }.topic(), Topic::VoiceActivity);
         assert_eq!(Event::VoiceControl { command: VoiceCommand::StopSpeaking }.topic(), Topic::VoiceControl);
+    }
+
+    // ------------------------------------------------------------ now playing
+
+    fn playing() -> NowPlaying {
+        NowPlaying {
+            state: NowPlayingState::Playing,
+            title: "Hall of Fame".into(),
+            artist: "Boards of Canada".into(),
+            source: "youtube music".into(),
+            pid: 4242,
+        }
+    }
+
+    /// The overlay must never have to build "Title — Artist" itself, and must
+    /// never show a row for a stopped player.
+    #[test]
+    fn now_playing_serializes_label_and_playing_flag() {
+        let v = serde_json::to_value(playing()).unwrap();
+        assert_eq!(v["state"], "playing");
+        assert_eq!(v["label"], "Hall of Fame — Boards of Canada");
+        assert_eq!(v["playing"], true);
+
+        // Stopped: `playing` false even if a stale title is still attached.
+        let stopped = NowPlaying { state: NowPlayingState::Stopped, ..playing() };
+        let v = serde_json::to_value(stopped).unwrap();
+        assert_eq!(v["state"], "stopped");
+        assert_eq!(v["playing"], false);
+
+        // An artist-less track falls back to the title alone.
+        let solo = NowPlaying { artist: String::new(), ..playing() };
+        assert_eq!(solo.label(), "Hall of Fame");
+        let titled = NowPlaying { title: String::new(), artist: "Autechre".into(), ..playing() };
+        assert_eq!(titled.label(), "Autechre");
+        assert!(!NowPlaying::default().is_playing());
+        assert_eq!(NowPlaying::default().label(), "");
+    }
+
+    #[test]
+    fn now_playing_roundtrips_through_json() {
+        let v = serde_json::to_value(playing()).unwrap();
+        assert_eq!(serde_json::from_value::<NowPlaying>(v).unwrap(), playing());
+        // A writer that knows only `title` still decodes -- the derived
+        // fields are an output convenience, never an input requirement.
+        let minimal: NowPlaying =
+            serde_json::from_value(json!({"state": "playing", "title": "Teardrop"})).unwrap();
+        assert_eq!(minimal.title, "Teardrop");
+        assert!(minimal.is_playing());
+        // Unknown fields do not break an older reader.
+        assert_eq!(
+            serde_json::from_value::<NowPlaying>(json!({"title": "x", "future": 1})).unwrap().title,
+            "x"
+        );
+    }
+
+    /// Both events and the bar status carry the same object, so a widget can
+    /// render one line of QML for both.
+    #[test]
+    fn now_playing_reaches_subscribers_and_the_bar() {
+        let ev = serde_json::to_value(ServerMessage::Event {
+            event: Event::NowPlaying { status: playing() },
+        })
+        .unwrap();
+        assert_eq!(ev["event"], "now_playing");
+        assert_eq!(ev["status"]["title"], "Hall of Fame");
+        assert_eq!(Event::NowPlaying { status: playing() }.topic(), Topic::Assistant);
+
+        let bar = serde_json::to_value(BarStatus {
+            state: AssistantState::Idle,
+            text: "".into(),
+            tooltip: String::new(),
+            class: "idle".into(),
+            mic_muted: None,
+            now_playing: Some(playing()),
+        })
+        .unwrap();
+        assert_eq!(bar["now_playing"]["label"], "Hall of Fame — Boards of Canada");
+        // Absent, not empty, when nothing plays: an old widget ignores the
+        // field entirely and `if (bar.now_playing)` is false.
+        let idle = serde_json::to_value(BarStatus {
+            state: AssistantState::Idle,
+            text: "".into(),
+            tooltip: String::new(),
+            class: "idle".into(),
+            mic_muted: None,
+            now_playing: None,
+        })
+        .unwrap();
+        assert!(idle.get("now_playing").is_none());
+        assert!(serde_json::from_value::<BarStatus>(idle).is_ok());
+    }
+
+    #[test]
+    fn now_playing_requests_parse() {
+        let m: ClientMessage = serde_json::from_value(
+            json!({"id":1,"type":"now_playing","op":"set","title":"Windowlicker","artist":"Aphex Twin","pid":99}),
+        )
+        .unwrap();
+        assert!(matches!(
+            m.request,
+            Request::NowPlaying(NowPlayingRequest::Set { ref title, ref artist, pid: 99, .. })
+                if title == "Windowlicker" && artist == "Aphex Twin"
+        ));
+        // artist/source/pid are optional: a script that only knows the query
+        // still reports something.
+        let m: ClientMessage =
+            serde_json::from_value(json!({"id":2,"type":"now_playing","op":"set","title":"x"})).unwrap();
+        assert!(matches!(m.request, Request::NowPlaying(NowPlayingRequest::Set { .. })));
+        let m: ClientMessage =
+            serde_json::from_value(json!({"id":3,"type":"now_playing","op":"stop"})).unwrap();
+        assert!(matches!(m.request, Request::NowPlaying(NowPlayingRequest::Stop)));
+        // `set` without a title is a caller bug, not a blank track.
+        assert!(serde_json::from_value::<ClientMessage>(
+            json!({"id":4,"type":"now_playing","op":"set","artist":"nobody"})
+        )
+        .is_err());
     }
 }

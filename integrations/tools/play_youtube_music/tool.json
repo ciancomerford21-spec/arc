@@ -1,0 +1,9 @@
+{
+  "name": "play_youtube_music",
+  "description": "Play a song request on YouTube Music. Prefers real playback via yt-dlp + mpv, falls back to opening the YouTube Music search results in the browser. Use when the user asks to play or hear a track. Reports the track to the Arc overlay so it can show what is playing.",
+  "params": {
+    "query": "song or artist to play, e.g. \"Hall of Fame\""
+  },
+  "kind": "script",
+  "language": "bash"
+}

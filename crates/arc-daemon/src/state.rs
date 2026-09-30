@@ -6,8 +6,8 @@ use arc_config::paths;
 use arc_core::{Assistant, InputSource as CoreSource, LastCall, NluInput, Reply, Route};
 use arc_memory::MemoryStore;
 use arc_proto::{
-    AskResult, AssistantState, BarStatus, ComponentStatus, Event, HealthStatus, InputSource, StatusReport,
-    VoiceCommand, VoiceMode,
+    AskResult, AssistantState, BarStatus, ComponentStatus, Event, HealthStatus, InputSource,
+    NowPlaying, NowPlayingRequest, NowPlayingState, StatusReport, VoiceCommand, VoiceMode,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +23,8 @@ pub struct Mutable {
     pub last_action: Option<String>,
     pub recent_errors: Vec<String>,
     pub voice: Option<VoiceStatus>,
+    /// The track the overlay shows. `None` when nothing is playing.
+    pub now_playing: Option<NowPlaying>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -656,6 +658,82 @@ impl Daemon {
         self.publish_bar();
     }
 
+    /// Handle a now-playing report from a playback tool.
+    ///
+    /// `set` is called by the tool once the player is actually running, so the
+    /// overlay never shows a track that failed to start. `stop` clears it.
+    /// Both are idempotent: a duplicate report publishes nothing, which is
+    /// what stops the overlay's row from flickering on every poll.
+    pub fn now_playing(&self, req: NowPlayingRequest) -> Result<NowPlaying, String> {
+        let next = match req {
+            // A read is not a state change: nothing is emitted, nothing is
+            // stored, the answer is whatever is already there.
+            NowPlayingRequest::Show => return Ok(self.now_playing_status()),
+            NowPlayingRequest::Set { title, artist, source, pid } => {
+                let title = title.trim();
+                if title.is_empty() {
+                    return Err("a now-playing report needs a title".into());
+                }
+                NowPlaying {
+                    state: NowPlayingState::Playing,
+                    title: title.chars().take(200).collect(),
+                    artist: artist.trim().chars().take(200).collect(),
+                    source: source.trim().chars().take(60).collect(),
+                    pid,
+                }
+            }
+            NowPlayingRequest::Stop => NowPlaying::default(),
+        };
+        let changed = {
+            let mut m = self.m.lock().unwrap();
+            let current = m.now_playing.clone().unwrap_or_default();
+            // An empty stop on an already-empty state is not a change: this
+            // is the common case (every script that finds no player), and it
+            // must not push an event each time.
+            if !next.is_playing() && !current.is_playing() {
+                return Ok(NowPlaying::default());
+            }
+            if next == current {
+                return Ok(next);
+            }
+            m.now_playing = if next.is_playing() { Some(next.clone()) } else { None };
+            true
+        };
+        if changed {
+            let published = next.clone();
+            self.emit(Event::NowPlaying { status: published });
+            self.publish_bar();
+        }
+        Ok(next)
+    }
+
+    /// What the overlay should currently show.
+    pub fn now_playing_status(&self) -> NowPlaying {
+        self.m.lock().unwrap().now_playing.clone().unwrap_or_default()
+    }
+
+    /// Clear the now-playing row when the player process is gone.
+    ///
+    /// A tool that starts a player in the background cannot tell anyone when
+    /// the track ends -- it has already exited by then. Watching the pid is
+    /// the only signal that exists, so this runs on a timer rather than being
+    /// left to the script. `pid == 0` means the reporter did not say, and
+    /// nothing is reaped: mpv is a long-lived process in other setups and
+    /// killing the row because pid 0 looked dead would be wrong.
+    pub fn reap_now_playing(&self) {
+        let dead = {
+            let m = self.m.lock().unwrap();
+            match &m.now_playing {
+                Some(n) if n.is_playing() && n.pid != 0 => !process_alive(n.pid),
+                _ => false,
+            }
+        };
+        if dead {
+            tracing::debug!("player process gone; clearing now-playing");
+            let _ = self.now_playing(NowPlayingRequest::Stop);
+        }
+    }
+
     /// Push the bar status to subscribers and the bar file.
     pub fn publish_bar(&self) {
         let status = self.bar_status();
@@ -977,6 +1055,7 @@ impl Daemon {
             last_reply: m.last_reply,
             last_action: m.last_action,
             recent_errors: m.recent_errors,
+            now_playing: m.now_playing.filter(|n| n.is_playing()),
             rss_kb: rss_kb(),
         }
     }
@@ -1005,7 +1084,20 @@ impl Daemon {
         if let Some(c) = &m.last_command {
             tooltip.push_str(&format!("\nLast: {c}"));
         }
-        BarStatus { state: m.state, text: text.into(), tooltip, class: class.into(), mic_muted: None }
+        // Only while something is actually playing, so an idle bar looks
+        // exactly as it did before this existed.
+        let now_playing = m.now_playing.clone().filter(|n| n.is_playing());
+        if let Some(n) = &now_playing {
+            tooltip.push_str(&format!("\n♪ {}", n.label()));
+        }
+        BarStatus {
+            state: m.state,
+            text: text.into(),
+            tooltip,
+            class: class.into(),
+            mic_muted: None,
+            now_playing,
+        }
     }
 
     /// Write the bar status atomically (rename), so watchers never read a
@@ -1030,6 +1122,26 @@ impl Daemon {
 fn rss_kb() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
     s.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Is this pid still running? `kill -0` is the check, but only after
+/// confirming it is not our own group leader, which would signal us.
+/// Signals are checked through the `kill` return value; EPERM means the
+/// process exists but belongs to someone else, which for a player we started
+/// cannot happen and so counts as gone.
+fn process_alive(pid: u32) -> bool {
+    // A pid wider than pid_t cannot be converted without wrapping, and the
+    // wrapped value is a *negative* pid -- where kill(-1, 0) means "every
+    // process I may signal" and cheerfully reports success for a pid that has
+    // never existed. Cast a pid_t through u32, not i32, and refuse the ones
+    // that would wrap.
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs the existence/permission check only; it
+    // delivers nothing and cannot kill the caller.
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 #[cfg(test)]
@@ -1462,10 +1574,185 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_ok_task_still_announces_completion() {
-        let mut a = act("code", ActionOutcome::Success, 40_000);
-        a.data = serde_json::json!({"status": "done", "steps": 5, "took_s": 40});
-        let line = completion_line(&[a]).unwrap();
-        assert!(line.contains('5') && line.contains("40"), "the task's own numbers should be used: {line}");
+        fn a_reported_ok_task_still_announces_completion() {
+            let mut a = act("code", ActionOutcome::Success, 40_000);
+            a.data = serde_json::json!({"status": "done", "steps": 5, "took_s": 40});
+            let line = completion_line(&[a]).unwrap();
+            assert!(line.contains('5') && line.contains("40"), "the task's own numbers should be used: {line}");
+        }
+
+        // ------------------------------------------------------------ now playing
+
+        /// A daemon with no model and a scratch memory file, so these tests touch
+            /// neither the user's memory nor a real provider.
+            fn daemon() -> std::sync::Arc<Daemon> {
+                let dir = tempfile::tempdir().unwrap();
+                // Keep the TempDir alive for the life of the daemon.
+                std::mem::forget(dir);
+                let mut cfg = Config::default();
+                cfg.ai.provider = arc_config::ProviderKind::None;
+                let daemon =
+                    Daemon::new(cfg, None).map_err(|e| panic!("could not build a test daemon: {e}")).unwrap();
+                std::sync::Arc::new(daemon)
+            }
+
+        fn set(title: &str, artist: &str, pid: u32) -> NowPlayingRequest {
+            NowPlayingRequest::Set {
+                title: title.into(),
+                artist: artist.into(),
+                source: "youtube music".into(),
+                pid,
+            }
+        }
+
+        /// Collect events published while `f` runs. The bus is a broadcast channel,
+        /// so this is the only way to see what the overlay would have received.
+        fn events_while(d: &Daemon, f: impl FnOnce()) -> Vec<arc_proto::ServerMessage> {
+            let mut rx = d.events.subscribe();
+            f();
+            let mut out = vec![];
+            while let Ok(e) = rx.try_recv() {
+                out.push(arc_proto::ServerMessage::Event { event: e });
+            }
+            out
+        }
+
+        fn now_playing_events(msgs: &[arc_proto::ServerMessage]) -> Vec<arc_proto::NowPlaying> {
+            msgs.iter()
+                .filter_map(|m| match m {
+                    arc_proto::ServerMessage::Event { event: arc_proto::Event::NowPlaying { status } } => {
+                        Some(status.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+            fn a_reported_track_is_shown_and_a_stop_clears_it() {
+                let d = daemon();
+                let msgs = events_while(&d, || {
+                    d.now_playing(set("Hall of Fame", "Boards of Canada", 0)).unwrap();
+                    assert!(d.now_playing_status().is_playing());
+                    assert_eq!(d.now_playing_status().label(), "Hall of Fame — Boards of Canada");
+                    d.now_playing(NowPlayingRequest::Stop).unwrap();
+                });
+                // The overlay learns about it from events, not by polling: one report,
+                // one clear. Both must arrive or the row either never appears or never
+                // goes away.
+                let ev = now_playing_events(&msgs);
+                assert_eq!(ev.len(), 2, "expected a set then a stop: {msgs:?}");
+                assert!(ev[0].is_playing(), "the track should be announced");
+                assert!(!ev[1].is_playing(), "the overlay must be told to clear, not left stale");
+                assert!(!d.now_playing_status().is_playing());
+            }
+
+        /// A track reported twice, or a stop with nothing playing, must not push
+        /// events: the overlay row would flicker on every poll otherwise.
+        #[test]
+        fn repeated_reports_are_idempotent() {
+            let d = daemon();
+            let set_again = set("Hall of Fame", "Boards of Canada", 0);
+            d.now_playing(set_again.clone()).unwrap();
+            let msgs = events_while(&d, || {
+                d.now_playing(set_again.clone()).unwrap();
+                d.now_playing(NowPlayingRequest::Stop).unwrap();
+                d.now_playing(NowPlayingRequest::Stop).unwrap();
+            });
+            assert_eq!(now_playing_events(&msgs).len(), 1, "one stop, not two: {msgs:?}");
+            assert!(!d.now_playing_status().is_playing());
+        }
+
+        /// A show is a read: it must not emit, and must not disturb what is there.
+        #[test]
+        fn show_reads_without_changing_or_announcing() {
+            let d = daemon();
+            d.now_playing(set("Teardrop", "Massive Attack", 0)).unwrap();
+            let msgs = events_while(&d, || {
+                let shown = d.now_playing(NowPlayingRequest::Show).unwrap();
+                assert_eq!(shown.title, "Teardrop");
+            });
+            assert!(now_playing_events(&msgs).is_empty(), "a read pushed an event: {msgs:?}");
+            assert!(d.now_playing_status().is_playing());
+        }
+
+        /// A blank title is a broken report, not a track. Storing it would put an
+        /// empty row on the overlay with no way to tell it from a rendering bug.
+        #[test]
+        fn a_report_without_a_title_is_refused() {
+            let d = daemon();
+            let e = d.now_playing(set("   ", "Nobody", 0)).unwrap_err();
+            assert!(e.contains("title"), "{e}");
+            assert!(!d.now_playing_status().is_playing());
+        }
+
+        /// The end of a track is not reported to anyone -- the tool that started it
+        /// has already exited -- so the pid is the only signal. Without the reap the
+        /// overlay keeps showing a track that ended minutes ago.
+        #[test]
+        fn a_dead_player_clears_the_row_and_a_live_one_does_not() {
+            let d = daemon();
+            // This process is definitely alive, so its pid must not reap.
+            d.now_playing(set("Still Playing", "Someone", std::process::id())).unwrap();
+            d.reap_now_playing();
+            assert!(d.now_playing_status().is_playing(), "a running player was reaped");
+
+            // pid 0 means "I did not say", which is not "dead": reaping on it would
+            // clear the row for any report that omits the pid.
+            d.now_playing(set("Unknown Player", "Someone", 0)).unwrap();
+            d.reap_now_playing();
+            assert!(d.now_playing_status().is_playing(), "pid 0 was treated as a dead process");
+
+            // A pid that cannot exist is reaped.
+            d.now_playing(set("Gone", "Someone", u32::MAX)).unwrap();
+            let msgs = events_while(&d, || d.reap_now_playing());
+            assert!(!d.now_playing_status().is_playing(), "a dead player was left on screen");
+            let cleared = now_playing_events(&msgs);
+            assert_eq!(cleared.len(), 1);
+            assert!(!cleared[0].is_playing());
+            // Idempotent: a second poll finds nothing to do.
+            let again = events_while(&d, || d.reap_now_playing());
+            assert!(now_playing_events(&again).is_empty());
+        }
+
+        /// The bar and status reports carry the track, and only while it plays.
+        #[test]
+        fn the_bar_carries_the_track_only_while_playing() {
+            let d = daemon();
+            assert!(d.bar_status().now_playing.is_none(), "an idle bar gained a field");
+            assert!(d.status().now_playing.is_none());
+            assert!(!d.bar_status().tooltip.contains('♪'));
+
+            d.now_playing(set("Windowlicker", "Aphex Twin", 0)).unwrap();
+            let bar = d.bar_status();
+            assert_eq!(bar.now_playing.as_ref().unwrap().label(), "Windowlicker — Aphex Twin");
+            assert!(bar.tooltip.contains("Windowlicker"), "the bar tooltip should mention it: {}", bar.tooltip);
+            assert_eq!(d.status().now_playing.unwrap().title, "Windowlicker");
+
+            d.now_playing(NowPlayingRequest::Stop).unwrap();
+            assert!(d.bar_status().now_playing.is_none());
+            assert!(d.status().now_playing.is_none());
+        }
+
+        /// Over-long metadata comes from a scraped web page, not from Arc. It goes
+        /// on one line of a header chip; it must not be able to fill the screen.
+        #[test]
+        fn absurdly_long_metadata_is_truncated() {
+            let d = daemon();
+            let long = "x".repeat(5000);
+            let n = d
+                .now_playing(set(&long, &long, 0))
+                .map_err(|e| panic!("a long title should still be reported: {e}"))
+                .unwrap();
+            assert_eq!(n.title.chars().count(), 200);
+            assert_eq!(n.artist.chars().count(), 200);
+        }
+
+        #[test]
+        fn process_alive_is_true_for_this_process_and_false_for_nonsense() {
+            assert!(process_alive(std::process::id()));
+            assert!(!process_alive(0));
+            // 0x7FFFFFFF is above the default pid_max and cannot exist.
+            assert!(!process_alive(0x7fff_ffff));
+        }
     }
-}

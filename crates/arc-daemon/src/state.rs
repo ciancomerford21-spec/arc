@@ -46,6 +46,9 @@ pub struct Daemon {
     /// speaking the generic headsup as well produced two speeches three
     /// seconds apart, measured live.
     code_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Name of the tool currently running, kept by `emit` so a turn that runs
+    /// long can say what it is waiting on instead of shrugging.
+    running_tool: Arc<Mutex<Option<String>>>,
 }
 
 /// A turn at least this long gets a spoken completion line.
@@ -54,44 +57,160 @@ pub struct Daemon {
 /// notice never fire together as two speeches for one turn.
 const COMPLETION_SPEAKS_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What actually happened, said plainly.
+/// What actually happened, said plainly -- and said *variously*.
 ///
-/// Reads the tool outcomes rather than the reply, because the reply is prose
-/// and can be truncated mid-sentence. Worst outcome wins: a turn that built a
-/// project and then failed a test must not be announced as finished.
+/// This used to be one fixed sentence, "That's finished. Everything ran and
+/// it's all on disk. Have a look at it.", for every long turn ever. It said
+/// nothing the reply that immediately follows it did not already say, and
+/// hearing it twice in one session is how a voice assistant starts to feel
+/// like a machine. So the line is now built from the real outcome -- which
+/// tool, how long, how many steps, what happened -- and the phrasing is
+/// rotated, so no two turns in a row sound the same.
+///
+/// It is deliberately short. The model's own reply is spoken next; this is a
+/// fact, not a second summary.
 fn completion_line(actions: &[arc_proto::ActionRecord]) -> Option<String> {
     // Nothing to report unless something was actually done.
     let work: Vec<_> = actions.iter().filter(|a| a.duration_ms > 0).collect();
     if work.is_empty() {
         return None;
     }
-    if work.iter().any(|a| a.outcome == arc_proto::ActionOutcome::Failed) {
-        return Some("That finished, but part of it failed. I have the details.".into());
-    }
-    // Success of the CHILD PROCESS is not the same as success of the WORK. The
-    // agent exits 0 even when the task it was given could not be done -- a
-    // dependency that does not exist, a build that would not pass -- and it
-    // says so in prose. The tool's own `status` field is the sharper signal, so
-    // it wins over the exit code, which is what this got wrong first: a run
-    // whose install failed was announced as "everything ran".
-    if work.iter().any(|a| a.data.get("status").and_then(|s| s.as_str()) == Some("failed")) {
-        return Some("That didn't fully work out. I have the details.".into());
+    if work.iter().any(|a| a.outcome == arc_proto::ActionOutcome::AwaitingConfirmation) {
+        // Both name the OK explicitly: this line gates a real action, and
+        // "I need your yes first" is vaguer about what is being approved.
+        return Some(vary(&["I need your OK before I finish that.", "Hold on -- say OK and I'll carry on."]));
     }
     if work.iter().any(|a| a.outcome == arc_proto::ActionOutcome::Cancelled) {
-        return Some("That stopped before it finished.".into());
+        return Some(vary(&["That stopped before the end.", "I pulled it before it finished."]));
     }
-    if work.iter().any(|a| a.outcome == arc_proto::ActionOutcome::AwaitingConfirmation) {
-        return Some("I need your OK before I finish that.".into());
+    // Success of the CHILD PROCESS is not success of the WORK. The agent exits
+    // 0 even when the task could not be done, so the tool's own `status` is
+    // the sharper signal and it wins over the exit code.
+    let hard_failed = work.iter().any(|a| {
+        a.outcome == arc_proto::ActionOutcome::Failed
+            || a.data.get("status").and_then(|s| s.as_str()) == Some("failed")
+    });
+    let total_ms: u64 = work.iter().map(|a| a.duration_ms).sum();
+    // Capitalised for speech: these lines start sentences.
+    let Subject = {
+        let s = work.last().map(|a| tool_phrase(&a.tool)).unwrap_or_else(|| "that".into());
+        let mut c = s.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => String::from("That"),
+        }
+    };
+
+    if hard_failed {
+        return match failure_detail(&work) {
+            Some(why) => Some(vary(&[
+                &format!("{Subject} hit a wall: {why}."),
+                &format!("That one didn't work -- {why}."),
+                &format!("{Subject} fell over: {why}."),
+            ])),
+            None => Some(vary(&[
+                &format!("{Subject} didn't finish cleanly. I've got the details."),
+                "That didn't come out clean. Details coming up.",
+            ])),
+        };
     }
-    let done = work.iter().filter(|a| a.outcome == arc_proto::ActionOutcome::Success).count();
-    if done == 0 {
+    if !work.iter().any(|a| a.outcome == arc_proto::ActionOutcome::Success) {
         return None;
     }
-    // No tool names or counts here: speech would read "underscore code" aloud,
-    // and "you asked for 1" tells the user nothing they can act on. They want
-    // to know the wait is over and the work is on disk.
-    let _ = done;
-    Some("That's finished. Everything ran and it's all on disk. Have a look at it.".into())
+    // A `code` task reports its own real numbers, so use them: "9 steps, 37
+    // seconds" is information, "everything ran" is not.
+    if let Some(code) = work.iter().rev().find(|a| a.tool == "code") {
+        let steps = code.data.get("steps").and_then(|v| v.as_u64());
+        let took = code.data.get("took_s").and_then(|v| v.as_u64()).unwrap_or(total_ms / 1000);
+        // No verdict here. The `code` tool cannot know whether the task
+        // succeeded: hermes exits 0 even when the build failed and says so in
+        // prose. Measured -- a task that failed dependency resolution reported
+        // `status: done`, because that flag is the process exit code, and the
+        // line announced success over a broken build. The model's own reply,
+        // spoken next, carries the verdict. So this line closes the wait with
+        // numbers and stops: asserting "done" would be a claim Arc cannot
+        // support, and repeating the verdict is the double summary this line
+        // exists to avoid.
+        return Some(match (steps, took) {
+            (Some(n), t) => vary(&[
+                &format!("Hermes: {n} steps, {t} seconds."),
+                &format!("That took Hermes {n} steps, {t} seconds."),
+                &format!("Hermes worked through {n} steps in {t} seconds."),
+            ]),
+            (None, t) => vary(&[&format!("Hermes took {t} seconds."), &format!("That ran for {t} seconds.")]),
+        });
+    }
+    let n = work.len();
+    if n == 1 {
+        let secs = plural_secs(total_ms);
+        return Some(vary(&[
+            &format!("{Subject} took {secs}. Done."),
+            &format!("{Subject} finished in {secs}."),
+        ]));
+    }
+    let secs = plural_secs(total_ms);
+    Some(vary(&[&format!("{n} things done in {secs}."), &format!("That was {n} steps, {secs}.")]))
+}
+
+/// The plainest name for a tool, for saying out loud. Tool names are not
+/// speakable -- "underscore code" -- and a line that makes the user decode an
+/// identifier has failed at its only job.
+fn tool_phrase(tool: &str) -> String {
+    match tool {
+        "code" => "Hermes".into(),
+        "shell_exec" => "the shell".into(),
+        "web_search" | "web_extract" => "the search".into(),
+        "tool_create" => "the new tool".into(),
+        "tool_delete" => "the delete".into(),
+        "tool_list_own" => "the list".into(),
+        t if t.starts_with("workspace_") => "the workspace".into(),
+        t if t.starts_with("window_") || t.starts_with("screen") => "the window".into(),
+        t if t.starts_with("media_") || t.starts_with("audio_") => "the sound".into(),
+        t if t.starts_with("file_") => "the file".into(),
+        // A self-made tool: Arc named it, so the name is probably speakable,
+        // but a long or underscored one is not. Use a pronoun instead.
+        _ => "that".into(),
+    }
+}
+
+/// The most specific failure reason available, for a line that says *why*.
+///
+/// A generic "it failed" is the same non-information this replaced; the
+/// tool's own summary usually names the cause, so the first line of it is
+/// used, cut to something sayable.
+fn failure_detail(work: &[&arc_proto::ActionRecord]) -> Option<String> {
+    let a = work.iter().find(|a| {
+        a.outcome == arc_proto::ActionOutcome::Failed
+            || a.data.get("status").and_then(|s| s.as_str()) == Some("failed")
+    })?;
+    let raw = a
+        .data
+        .get("error")
+        .and_then(|v| v.as_str())
+        .or_else(|| a.data.get("summary").and_then(|v| v.as_str()))
+        .or_else(|| a.summary.as_str().into())?;
+    let first = raw.lines().find(|l| !l.trim().is_empty())?.trim();
+    let flat = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let words: Vec<&str> = flat.split(' ').take(9).collect();
+    let s = words.join(" ");
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn plural_secs(ms: u64) -> String {
+    let s = ms / 1000;
+    if s == 1 { "a second".to_string() } else { format!("{s} seconds") }
+}
+
+/// Pick one phrasing, rotating so consecutive turns differ.
+///
+/// Deterministic on purpose: a test can assert on a set of possibilities, and
+/// a fixed line is exactly what this is fixing. The counter is per-process, so
+/// the first long turn after a restart says the same thing it always did --
+/// which is a fair trade for a predictable test.
+fn vary(options: &[&str]) -> String {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let i = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    options[i % options.len()].to_string()
 }
 
 /// How long a turn may run before Arc says something.
@@ -103,26 +222,77 @@ fn completion_line(actions: &[arc_proto::ActionRecord]) -> Option<String> {
 /// only fires for genuinely long turns.
 const SLOW_TURN_SPEAKS_AT: std::time::Duration = std::time::Duration::from_secs(6);
 
-/// The one line said when a turn runs long. Deliberately vague: at this point
-/// the tool has been chosen but nothing has happened yet, and naming a step it
-/// may not reach would be a claim Arc cannot support.
-const SLOW_TURN_HEADSUP: &str = "On it. This one takes a minute.";
+/// The line said when a turn runs long.
+///
+/// It used to be the fixed "On it. This one takes a minute." for every slow
+/// turn ever, which told the user nothing except that time was passing. It
+/// is now built from what is actually known at that moment -- the tool that
+/// is running and how long it has been running -- and rotated, so it does not
+/// become a sound the user learns to wait for.
+///
+/// What it must not do is name a step the turn may never reach: at 6s the tool
+/// has been chosen, so the tool is a fact, but "it's writing the tests" when
+/// it is still reading files would be a lie.
+fn slow_turn_headsup(tool: Option<&str>, elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs().max(1);
+    // Grammatically usable on its own, because it is dropped into the middle
+    // of a sentence: "the shell's", "Hermes has been". "it" reads as a typo
+    // when it starts one.
+    let (doing, subject) = match tool.map(tool_phrase) {
+        Some(t) => (format!("{t}'s"), t),
+        None => (String::from("it"), String::from("it")),
+    };
+    // Long enough to be worth mentioning, and the wait is real information
+    // only when it is long.
+    // Every variant names the tool. One of them used to be a bare "Still
+    // working.", which is the exact non-information this function replaced --
+    // a test caught it losing the name the caller went to the trouble of
+    // supplying.
+    let named = tool.is_some();
+    if secs >= 60 {
+        if named {
+            vary(&[
+                &format!("Still going -- {subject} has been at it {secs} seconds."),
+                &format!("{subject} is still running, {secs} seconds in."),
+                &format!("No news yet. {subject} has been at it {secs} seconds."),
+            ])
+        } else {
+            // No tool known yet, so no subject to attach a verb to: "it has
+            // been at it" is grammatical but reads like a typo when it opens
+            // the line.
+            vary(&[
+                &format!("Still going -- {secs} seconds in."),
+                &format!("No news yet, {secs} seconds in."),
+                &format!("Still working. {secs} seconds so far."),
+            ])
+        }
+    } else if named {
+        vary(&[
+            &format!("Working on it -- {doing} running."),
+            &format!("{doing} going. Give it a moment."),
+            &format!("Still in there -- {doing} running."),
+        ])
+    } else {
+        vary(&["Still working on it.", "Give it a moment.", "Still going, one moment."])
+    }
+}
 
 /// What Arc says while Hermes works, and when.
 ///
 /// The pipeline delivers a line per Hermes tool call -- measured on a real
-/// task, 63 calls for one small feature -- so speaking them all would be
-/// unusable. Three rules keep it useful:
+/// task, 9 calls for a small feature and 63 for a larger one -- so speaking
+/// them all would be unusable. The rules:
 ///
-/// 1. At most [`PROGRESS_SPOKEN_MAX`] lines per task.
-/// 2. At least [`PROGRESS_SPOKEN_GAP`] apart, so it never turns into a
-///    stream of chatter.
-/// 3. Only for tools that mean something happened: reading and searching
-///    are invisible, so hearing "reading a file" tells the user nothing.
-///    Writing, editing and running commands do.
+/// 1. At most [`PROGRESS_SPOKEN_MAX`] lines per task, so a long build still
+///    ends with the model's own reply rather than a running commentary.
+/// 2. At least [`PROGRESS_SPOKEN_GAP`] apart.
+/// 3. Only for tools that mean something happened. Reading and searching are
+///    invisible: "it's reading a file" is not information.
 ///
-/// The first spoken line names what Hermes is building, not which tool it
-/// picked, so it is still true if the plan changes.
+/// Within that budget the lines are specific -- the work, then the phase --
+/// and phrased in Arc's own voice, because a handoff line is still something
+/// the user has to listen to. A fixed "On it" for every handoff is what this
+/// replaced.
 struct ProgressTalk {
     said: u32,
     last_at: Option<std::time::Instant>,
@@ -137,7 +307,13 @@ fn progress_is_notable(tool: &str) -> bool {
 }
 
 /// The spoken form of one progress line. `None` means show it, don't say it.
-fn progress_line(task: &str, tool: &str, step: u32, talk: &mut ProgressTalk) -> Option<String> {
+fn progress_line(
+    task: &str,
+    tool: &str,
+    step: u32,
+    elapsed_s: u64,
+    talk: &mut ProgressTalk,
+) -> Option<String> {
     if talk.said >= PROGRESS_SPOKEN_MAX || !progress_is_notable(tool) {
         return None;
     }
@@ -148,15 +324,34 @@ fn progress_line(task: &str, tool: &str, step: u32, talk: &mut ProgressTalk) -> 
     }
     talk.said += 1;
     talk.last_at = Some(std::time::Instant::now());
-    // The first line is the useful one: it says what is being built. After
-    // that the user mostly wants to know it is still moving.
     Some(match talk.said {
-        1 => format!("Handing that to Hermes. It's working on {task}."),
-        _ => match tool {
-            "write_file" | "patch" => "It's writing the files now.".to_string(),
-            "terminal" | "process" | "execute_code" => "It's running the build and tests now.".to_string(),
-            _ => format!("Hermes is on step {step}."),
+        // The handoff. Names the work, and is honest that this is going to
+        // take a while, which is the one thing worth saying at the start.
+        1 => vary(&[
+            &format!("Handing that to Hermes -- {task}. This will take a bit."),
+            &format!("Hermes is on it: {task}. Give me a few minutes."),
+            &format!("Okay, Hermes is building that -- {task}. I'll report back."),
+        ]),
+        2 => match tool {
+            "write_file" | "patch" => vary(&[
+                "It's writing the files now.",
+                "Files are being written.",
+                "It's putting the code down now.",
+            ]),
+            _ => vary(&[
+                "It's building and testing now -- the slow part.",
+                "Building, running the tests. This is where the time goes.",
+                "It's compiling and testing now.",
+            ]),
         },
+        // The last line carries the running totals, which is the only number
+        // that changes meaning as the task goes on. Its phrasing is distinct
+        // from the second line's on purpose: two lines about "still going" in
+        // a row is the monotony this whole change is about.
+        _ => vary(&[
+            &format!("Still going -- step {step}, {elapsed_s} seconds in."),
+            &format!("Hermes is {elapsed_s} seconds in. Step {step}."),
+        ]),
     })
 }
 
@@ -320,6 +515,7 @@ impl Daemon {
             m: Mutex::new(Mutable::default()),
             utterance: AtomicU64::new(0),
             code_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            running_tool: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -341,6 +537,13 @@ impl Daemon {
     }
 
     pub fn emit(&self, e: Event) {
+        // Track what is running, so a slow turn can name it in the headsup
+        // rather than shrugging. Cheap: one string move per tool event.
+        match &e {
+            Event::ToolStarted { tool, .. } => *self.running_tool.lock().unwrap() = Some(tool.clone()),
+            Event::ToolFinished { .. } => *self.running_tool.lock().unwrap() = None,
+            _ => {}
+        }
         // No subscribers is fine.
         let _ = self.events.send(e);
     }
@@ -409,6 +612,7 @@ impl Daemon {
         // would be worse than the silence it fixes.
         let speak = self.speak_handle();
         let code_active = self.code_active.clone();
+        let running = self.running_tool.clone();
         let watchdog = tokio::spawn(async move {
             tokio::time::sleep(SLOW_TURN_SPEAKS_AT).await;
             // A `code` task speaks for itself within a few seconds, so the
@@ -416,7 +620,16 @@ impl Daemon {
             if code_active.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
-            speak(SLOW_TURN_HEADSUP.to_string());
+            // Name the tool that is actually running, not a guess at the step.
+            // Nothing running yet means the model is still choosing, and there
+            // is no fact to report: measured live, this fired as "Still going,
+            // one moment." six seconds into a turn whose first tool call came
+            // at 18s, which is the same empty reassurance this line replaced.
+            let tool = running.lock().unwrap().clone();
+            if tool.is_none() {
+                return;
+            }
+            speak(slow_turn_headsup(tool.as_deref(), SLOW_TURN_SPEAKS_AT));
         });
         // Relay Hermes' progress while the turn runs. Each subscriber gets
         // its own channel clone, so this sees only what arrives from here;
@@ -430,8 +643,10 @@ impl Daemon {
             let speak = self.speak_handle();
             async move {
                 loop {
-                    let (tool, detail, step) = match rx.recv().await {
-                        Ok(Event::CodeProgress { tool, detail, step, .. }) => (tool, detail, step),
+                    let (tool, detail, step, elapsed) = match rx.recv().await {
+                        Ok(Event::CodeProgress { tool, detail, step, elapsed_s }) => {
+                            (tool, detail, step, elapsed_s)
+                        }
                         // The headsup stands down once a code task is under
                         // way, so mark it as soon as the tool starts.
                         Ok(Event::ToolStarted { tool, .. }) if tool == "code" => {
@@ -442,7 +657,7 @@ impl Daemon {
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     };
-                    match progress_line(&task, &tool, step, &mut talk) {
+                    match progress_line(&task, &tool, step, elapsed, &mut talk) {
                         Some(t) => {
                             tracing::info!(tool = %tool, detail = %detail, step, spoken = %t, "hermes progress");
                             speak(t);
@@ -723,32 +938,140 @@ mod tests {
     use super::*;
     use arc_proto::ActionOutcome;
 
-    #[test]
-    /// Speaking every Hermes tool call would be unusable (63 calls for one
-    /// small feature), so the policy is: only tools where something was
+    /// Speaking every Hermes tool call would be unusable (9 calls for a small
+    /// feature, 63 for a larger one), so: only tools where something was
     /// written or run, at most three lines, never two close together.
     #[test]
     fn progress_is_spoken_sparingly_and_only_when_something_happens() {
         let mut t = ProgressTalk { said: 0, last_at: None };
+        let ago =
+            || Some(std::time::Instant::now() - PROGRESS_SPOKEN_GAP - std::time::Duration::from_secs(1));
         // Reading is invisible: "it's reading a file" tells the user nothing
         // they can act on.
-        assert_eq!(progress_line("a test", "read_file", 1, &mut t), None);
-        assert_eq!(progress_line("a test", "search_files", 2, &mut t), None);
+        assert_eq!(progress_line("a test", "read_file", 1, 6, &mut t), None);
+        assert_eq!(progress_line("a test", "search_files", 2, 9, &mut t), None);
         let first =
-            progress_line("a test", "write_file", 3, &mut t).expect("the first notable step is spoken");
+            progress_line("a test", "write_file", 3, 12, &mut t).expect("the first notable step is spoken");
         assert!(first.contains("a test"), "{first}");
-        assert_eq!(progress_line("a test", "terminal", 4, &mut t), None, "too soon after the last line");
-        t.last_at = Some(std::time::Instant::now() - PROGRESS_SPOKEN_GAP - std::time::Duration::from_secs(1));
-        let second = progress_line("a test", "terminal", 5, &mut t).expect("spoken once the gap has passed");
-        assert!(second.contains("build"), "{second}");
-        t.last_at = Some(std::time::Instant::now() - PROGRESS_SPOKEN_GAP - std::time::Duration::from_secs(1));
-        assert_eq!(
-            progress_line("a test", "write_file", 6, &mut t),
-            Some("It's writing the files now.".into())
+        assert!(first.contains("Hermes"), "the handoff should name who has it: {first}");
+        assert_eq!(progress_line("a test", "terminal", 4, 20, &mut t), None, "too soon after the last line");
+        t.last_at = ago();
+        let second =
+            progress_line("a test", "terminal", 5, 31, &mut t).expect("spoken once the gap has passed");
+        assert!(second.contains("build") || second.contains("test") || second.contains("compil"), "{second}");
+        t.last_at = ago();
+        let third = progress_line("a test", "terminal", 9, 60, &mut t).expect("a third line is allowed");
+        assert!(
+            third.contains('9') && third.contains("60"),
+            "the last line should carry the real numbers: {third}"
         );
-        t.last_at = Some(std::time::Instant::now() - PROGRESS_SPOKEN_GAP - std::time::Duration::from_secs(1));
-        assert_eq!(progress_line("a test", "write_file", 7, &mut t), None, "capped at three lines");
+        t.last_at = ago();
+        assert_eq!(progress_line("a test", "write_file", 10, 70, &mut t), None, "capped at three lines");
         assert_eq!(t.said, PROGRESS_SPOKEN_MAX);
+    }
+
+    /// The handoff and the completion line were fixed sentences, so every
+    /// long turn sounded identical. They must vary.
+    #[test]
+    fn the_spoken_lines_are_not_the_same_every_time() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let mut t = ProgressTalk { said: 0, last_at: None };
+            seen.insert(progress_line("a test", "write_file", 1, 5, &mut t).unwrap());
+        }
+        assert!(seen.len() >= 2, "every handoff sounded the same: {seen:?}");
+
+        let ok = |n: u64| -> arc_proto::ActionRecord {
+            arc_proto::ActionRecord {
+                tool: "network_status".into(),
+                args: serde_json::json!({}),
+                risk: arc_proto::RiskLevel::Safe,
+                outcome: ActionOutcome::Success,
+                summary: String::new(),
+                warning: None,
+                data: serde_json::json!({ "n": n }),
+                duration_ms: 4000,
+            }
+        };
+        let mut outs = std::collections::HashSet::new();
+        for n in 0..4 {
+            outs.insert(completion_line(&[ok(n)]).unwrap());
+        }
+        assert!(outs.len() >= 2, "every completion sounded the same: {outs:?}");
+    }
+
+    /// The completion line exists to add information the reply does not have.
+    /// A `code` task knows its own step count and duration, so it says those
+    /// rather than "everything ran".
+    #[test]
+    fn the_completion_line_reports_the_real_numbers() {
+        let rec = |tool: &str, status: &str, ms: u64| arc_proto::ActionRecord {
+            tool: tool.into(),
+            args: serde_json::json!({}),
+            risk: arc_proto::RiskLevel::Safe,
+            outcome: if status == "failed" { ActionOutcome::Failed } else { ActionOutcome::Success },
+            summary: String::new(),
+            warning: None,
+            data: serde_json::json!({ "status": status, "steps": 9, "took_s": 37, "workspace": "/w" }),
+            duration_ms: ms,
+        };
+        let line = completion_line(&[rec("code", "done", 37_000)]).unwrap();
+        assert!(line.contains('9') && line.contains("37"), "no real numbers in: {line}");
+        assert!(
+            !line.contains("all on disk") || line.contains("On disk now"),
+            "still the old vague line: {line}"
+        );
+
+        // A failure says why, when the tool said why.
+        let mut bad = rec("code", "failed", 12_000);
+        bad.data = serde_json::json!({ "status": "failed", "error": "the crate does not exist" });
+        let f = completion_line(&[bad]).unwrap();
+        assert!(f.contains("crate does not exist"), "failure line hides the cause: {f}");
+
+        // A tool that failed while the process exited 0 is still a failure.
+        let mut quiet = rec("shell_exec", "failed", 900);
+        quiet.outcome = ActionOutcome::Success;
+        let q = completion_line(&[quiet]).unwrap().to_lowercase();
+        assert!(
+            q.contains("wall") || q.contains("didn't") || q.contains("clean") || q.contains("fell"),
+            "{q}"
+        );
+
+        // Nothing done, nothing said.
+        assert!(completion_line(&[]).is_none());
+    }
+
+    /// Tool names are not speakable -- "underscore code" -- so a line must
+    /// never contain one.
+    #[test]
+    fn a_spoken_line_never_contains_a_tool_name() {
+        for tool in ["code", "shell_exec", "web_search", "network_status", "workspace_switch"] {
+            let p = tool_phrase(tool);
+            assert_ne!(p, tool, "{tool} is not speakable");
+            assert!(!p.contains('_'), "{tool} -> {p}");
+        }
+        // A self-made tool's name is Arc's own; it may be speakable, but it
+        // may not be an identifier, so a pronoun is used.
+        assert_eq!(tool_phrase("my_weird_tool"), "that");
+    }
+
+    /// The headsup names the tool that is actually running, varies, and never
+    /// promises a step that has not happened.
+    #[test]
+    fn the_headsup_names_the_running_tool_and_varies() {
+        let a = slow_turn_headsup(Some("shell_exec"), std::time::Duration::from_secs(6));
+        assert!(a.contains("shell") || a.contains("Working") || a.contains("going"), "{a}");
+        assert!(!a.contains('_'), "{a}");
+        let long = slow_turn_headsup(Some("code"), std::time::Duration::from_secs(90));
+        assert!(long.contains("90") || long.contains("Still") || long.contains("seconds"), "{long}");
+        let mut set = std::collections::HashSet::new();
+        for _ in 0..5 {
+            set.insert(slow_turn_headsup(Some("shell_exec"), std::time::Duration::from_secs(6)));
+        }
+        assert!(set.len() >= 2, "the headsup never varies: {set:?}");
+        // With nothing known, it must not invent a step.
+        let unknown = slow_turn_headsup(None, std::time::Duration::from_secs(6));
+        assert!(!unknown.contains("test") && !unknown.contains("writ"), "{unknown}");
     }
 
     /// The first progress line is spoken, so what it says has to be
@@ -772,26 +1095,36 @@ mod tests {
     }
 
     /// A `code` task speaks for itself within seconds, so the generic
-    /// "still working" headsup must stand down. Measured live before this:
-    /// the headsup and the first progress line landed three seconds apart.
+    /// headsup must stand down. Measured live before this: the headsup and
+    /// the first progress line landed three seconds apart.
     #[test]
     fn a_code_task_suppresses_the_generic_headsup() {
         let h = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let said = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
         let fire = |flag: &std::sync::atomic::AtomicBool, said: &std::sync::Mutex<Vec<String>>| {
             if !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                said.lock().unwrap().push(SLOW_TURN_HEADSUP.to_string());
+                said.lock().unwrap().push(slow_turn_headsup(None, SLOW_TURN_SPEAKS_AT));
             }
         };
-        // A slow non-code turn still gets the headsup.
         fire(&h, &said);
-        assert_eq!(said.lock().unwrap().len(), 1);
-        // Once code starts, it does not.
+        assert_eq!(said.lock().unwrap().len(), 1, "a slow non-code turn still gets a headsup");
         h.store(true, std::sync::atomic::Ordering::Relaxed);
         fire(&h, &said);
         assert_eq!(said.lock().unwrap().len(), 1, "headsup stood down for a code task");
     }
 
+    /// With no tool running there is nothing true to say, so nothing is said.
+    /// The line exists to report a wait, not to fill it.
+    #[test]
+    fn a_headsup_with_nothing_running_is_not_spoken() {
+        let running: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(running.lock().unwrap().is_none());
+        // The watchdog's own guard: no tool, no line.
+        let tool = running.lock().unwrap().clone();
+        assert!(tool.is_none(), "nothing to name, so nothing worth saying");
+    }
+
+    #[test]
     fn a_slow_turn_says_something_before_it_finishes() {
         // The bug this fixes: a `code` task runs for minutes and used to be
         // completely silent, so a build that was working looked dead. Assert
@@ -806,7 +1139,8 @@ mod tests {
         );
         // It must not promise a step: at six seconds the tool is chosen but
         // nothing has happened yet.
-        assert!(!SLOW_TURN_HEADSUP.contains("test") && !SLOW_TURN_HEADSUP.contains("build"));
+        let h = slow_turn_headsup(None, SLOW_TURN_SPEAKS_AT);
+        assert!(!h.contains("test") && !h.contains("writ") && !h.contains("build"), "{h}");
     }
 
     #[test]
@@ -840,14 +1174,18 @@ mod tests {
             act("code", ActionOutcome::Failed, 5_000),
         ])
         .unwrap();
-        assert!(line.contains("failed"), "{line}");
-        assert!(!line.contains("done"), "worst outcome must win: {line}");
+        let low = line.to_lowercase();
+        assert!(
+            low.contains("wall") || low.contains("fell") || low.contains("didn't") || low.contains("details"),
+            "the failure is not stated: {line}"
+        );
+        assert!(!low.contains("done") && !low.contains("on disk now"), "worst outcome must win: {line}");
     }
 
     #[test]
     fn a_pending_confirmation_says_so_instead_of_claiming_done() {
         let line = completion_line(&[act("code", ActionOutcome::AwaitingConfirmation, 40_000)]).unwrap();
-        assert!(line.contains("OK"), "{line}");
+        assert!(line.to_lowercase().contains("ok"), "the user must know a confirmation is wanted: {line}");
     }
 
     #[test]
@@ -859,7 +1197,9 @@ mod tests {
     #[test]
     fn a_successful_long_run_announces_completion() {
         let line = completion_line(&[act("code", ActionOutcome::Success, 85_000)]).unwrap();
-        assert!(line.contains("finished"), "must say the wait is over: {line}");
+        // Says the wait is over, and says it with a number rather than a
+        // platitude: this line exists to add what the reply does not know.
+        assert!(line.contains("85") || line.contains("seconds"), "no real information in: {line}");
         // Tool names must never reach speech.
         assert!(!line.contains("code"), "would be read aloud as a word: {line}");
     }
@@ -889,14 +1229,19 @@ mod tests {
         let mut a = act("code", ActionOutcome::Success, 40_000);
         a.data = serde_json::json!({"status": "failed"});
         let line = completion_line(&[a]).unwrap();
-        assert!(!line.contains("everything ran"), "{line}");
-        assert!(line.contains("didn't fully work"), "{line}");
+        let low = line.to_lowercase();
+        assert!(!low.contains("on disk now") && !low.contains("everything ran"), "{line}");
+        assert!(
+            low.contains("wall") || low.contains("fell") || low.contains("didn't") || low.contains("clean"),
+            "a failed task was not reported as a failure: {line}"
+        );
     }
 
     #[test]
     fn a_reported_ok_task_still_announces_completion() {
         let mut a = act("code", ActionOutcome::Success, 40_000);
-        a.data = serde_json::json!({"status": "done"});
-        assert!(completion_line(&[a]).unwrap().contains("finished"));
+        a.data = serde_json::json!({"status": "done", "steps": 5, "took_s": 40});
+        let line = completion_line(&[a]).unwrap();
+        assert!(line.contains('5') && line.contains("40"), "the task's own numbers should be used: {line}");
     }
 }

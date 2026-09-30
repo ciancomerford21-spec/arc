@@ -542,6 +542,14 @@ pub enum Event {
         reasoning: String,
         text: String,
     },
+    /// What Hermes is doing right now, while a `code` task runs. Display
+    /// only -- never spoken automatically and never fed back to the model.
+    CodeProgress {
+        tool: String,
+        detail: String,
+        step: u32,
+        elapsed_s: u64,
+    },
     ToolStarted {
         tool: String,
         args: Value,
@@ -580,6 +588,7 @@ impl Event {
             | Event::Bar { .. }
             | Event::Heard { .. }
             | Event::Thought { .. }
+            | Event::CodeProgress { .. }
             | Event::ToolStarted { .. }
             | Event::ToolFinished { .. }
             | Event::ConfirmationRequired { .. }

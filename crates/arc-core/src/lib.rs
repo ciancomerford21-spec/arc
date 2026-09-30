@@ -682,6 +682,12 @@ impl Assistant {
     }
 
     /// Report each agent step (reasoning, tool start) as it happens.
+    /// Report what Hermes is doing while a `code` task runs. The daemon
+    /// speaks a few of these and shows them all.
+    pub fn set_code_progress(&self, f: arc_tools::ProgressSink) {
+        self.gate.tools().set_code_progress(f);
+    }
+
     pub fn set_trace(&mut self, trace: agent::Trace) {
         if let Some(a) = &mut self.agent {
             a.set_trace(trace);

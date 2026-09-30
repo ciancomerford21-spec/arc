@@ -145,6 +145,9 @@ pub struct Tools {
     /// Tools Arc made for itself. Looked up after the built-ins, which they
     /// can never shadow (creation refuses a built-in's name).
     custom: Arc<CustomTools>,
+    /// Where the `code` tool sends progress. Held here because the tool
+    /// itself is registered as `Arc<dyn Tool>`.
+    progress: ProgressSlot,
 }
 
 impl Default for Tools {
@@ -189,9 +192,10 @@ impl Tools {
         let analyzer = ShellAnalyzer::new(&cfg.permissions.shell, &sensitive)
             .map_err(|e| format!("invalid permissions.shell regex: {e}"))?;
         let custom = Arc::new(CustomTools::new(analyzer.clone(), cfg.permissions.shell.timeout_s));
-        let mut t = Tools { by_name: HashMap::new(), custom: custom.clone() };
+        let progress = no_progress();
+        let mut t = Tools { by_name: HashMap::new(), custom: custom.clone(), progress: progress.clone() };
         t.register_builtins(
-            HermesCode { cfg: cfg.code.clone() },
+            HermesCode { cfg: cfg.code.clone(), progress: progress.clone() },
             ShellExec { analyzer, policy: cfg.permissions.shell.clone() },
             store,
             search_url,
@@ -200,6 +204,11 @@ impl Tools {
         t.register(Arc::new(ToolDelete { store: custom.clone() }));
         t.register(Arc::new(ToolListOwn { store: custom }));
         Ok(t)
+    }
+
+    /// Report what Hermes is doing while a `code` task runs.
+    pub fn set_code_progress(&self, f: ProgressSink) {
+        *self.progress.write().unwrap() = Some(f);
     }
 
     /// Schemas for every registered tool, sorted by name.
@@ -1380,6 +1389,35 @@ impl Tool for MonitorOverview {
 /// confirmation.
 pub struct HermesCode {
     cfg: arc_config::Code,
+    progress: ProgressSlot,
+}
+
+/// One thing Hermes is doing, as reported by `hermes chat --format
+/// stream-json`. The tool pushes these while the task runs, so Arc can show
+/// and speak progress instead of going quiet for the whole task.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeProgress {
+    /// Hermes' own tool name (`terminal`, `read_file`, ...).
+    pub tool: String,
+    /// A short hint of what it was asked to do: a command, a path.
+    pub detail: String,
+    /// How many tools Hermes has used so far in this task.
+    pub step: u32,
+    /// Seconds since the task started.
+    pub elapsed_s: u64,
+}
+
+/// Callback for [`CodeProgress`]. The assistant sets one; the daemon turns
+/// each update into a protocol event and decides whether to speak it.
+pub type ProgressSink = Arc<dyn Fn(CodeProgress) + Send + Sync>;
+
+/// Shared, so the daemon can set the sink through `Tools` (the tool itself
+/// is registered as `Arc<dyn Tool>` and cannot be downcast).
+pub type ProgressSlot = Arc<std::sync::RwLock<Option<ProgressSink>>>;
+
+/// A sink that drops updates, for tests and for `code` disabled.
+pub fn no_progress() -> ProgressSlot {
+    Arc::new(std::sync::RwLock::new(None))
 }
 
 impl HermesCode {
@@ -1436,6 +1474,38 @@ impl HermesCode {
             .join(" ")
             .trim()
             .to_string()
+    }
+
+    /// Set the callback that receives progress while a task runs.
+    pub fn set_progress(&self, sink: ProgressSink) {
+        *self.progress.write().unwrap() = Some(sink);
+    }
+
+    /// A one-line description of what Hermes is doing, from its tool call.
+    ///
+    /// Shown and spoken, so it must be short and must not leak the task text
+    /// or anything from a file: just the tool and the head of its main
+    /// argument, newlines flattened.
+    fn progress_detail(name: &str, input: &Json) -> String {
+        let pick = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let first = |a: String, b: String| if a.is_empty() { b } else { a };
+        let raw = match name {
+            "terminal" | "process" => pick("command"),
+            "read_file" | "write_file" | "patch" => first(pick("path"), pick("file_path")),
+            "search_files" | "search_repositories" => pick("pattern"),
+            "execute_code" => pick("description"),
+            "web_search" => pick("query"),
+            "delegate_task" => pick("goal"),
+            _ => first(pick("description"), first(pick("command"), pick("path"))),
+        };
+        let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.is_empty() {
+            return String::new();
+        }
+        // Long commands and file contents are noise spoken aloud.
+        let mut chars = flat.chars();
+        let short: String = chars.by_ref().take(60).collect();
+        if chars.next().is_some() { format!("{short}…") } else { short }
     }
 
     /// Reject a task that names a path outside the workspace, or an obviously
@@ -1675,83 +1745,150 @@ impl Tool for HermesCode {
         if let Err(e) = std::fs::write(&qfile, &prompt) {
             return ToolResult::Error(format!("could not write the task file: {e}"));
         }
+        // --format stream-json: newline-delimited events as they happen
+        // (init, tool_use, tool_result, streaming text, and a final result
+        // carrying the reply, the session id and the token counts). This is
+        // the pipeline: it is what lets Arc report what Hermes is doing
+        // while it works, instead of going quiet for the whole task. stderr
+        // is left inherited so a crash is still visible in the journal.
+        let started = std::time::Instant::now();
+        let sink = self.progress.read().unwrap().clone();
         let run = async {
-            tokio::process::Command::new(&self.cfg.binary)
+            let mut child = tokio::process::Command::new(&self.cfg.binary)
                 .arg("chat")
                 .arg("--query-file")
                 .arg(&qfile)
                 .arg("--format")
-                .arg("text")
+                .arg("stream-json")
                 .arg("--reasoning")
                 .arg(&self.cfg.reasoning)
                 .arg("--run-budget")
                 .arg(self.cfg.run_budget_s.to_string())
                 .current_dir(&dir)
                 .kill_on_drop(true)
-                .output()
-                .await
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let mut lines = tokio::io::BufReader::new(stdout);
+            let mut line = String::new();
+            let mut steps = 0u32;
+            let mut said = String::new();
+            let mut session = String::new();
+            let mut exit_code = 0;
+            // The final `result` event is the authoritative answer; the
+            // streaming `text` deltas are only a fallback for a run that ends
+            // without one (an abort, say).
+            loop {
+                line.clear();
+                match tokio::io::AsyncBufReadExt::read_line(&mut lines, &mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let Ok(v) = serde_json::from_str::<Json>(line.trim_end()) else { continue };
+                match v["type"].as_str().unwrap_or("") {
+                    "system" => session = v["session_id"].as_str().unwrap_or("").to_string(),
+                    "tool_use" => {
+                        steps += 1;
+                        let tool = v["name"].as_str().unwrap_or("").to_string();
+                        if let Some(f) = &sink {
+                            f(CodeProgress {
+                                detail: Self::progress_detail(&tool, &v["input"]),
+                                tool,
+                                step: steps,
+                                elapsed_s: started.elapsed().as_secs(),
+                            });
+                        }
+                    }
+                    "text" => said.push_str(v["text"].as_str().unwrap_or("")),
+                    "result" => {
+                        exit_code = v["exit_code"].as_i64().unwrap_or(0) as i32;
+                        said = v["text"].as_str().unwrap_or("").to_string();
+                    }
+                    _ => {}
+                }
+            }
+            let status = child.wait().await;
+            Ok::<_, std::io::Error>((status, said, session, steps, exit_code))
         };
         let result = tokio::time::timeout(limit, run).await;
         let _ = std::fs::remove_file(&qfile);
 
-        let output = match result {
-            Ok(o) => o,
+        let (status, said, session, steps, exit_code) = match result {
+            Ok(Ok(v)) => v,
+            // Timed out: the child was killed on drop, so report that plainly
+            // rather than as a failure.
             Err(_) => {
                 return ToolResult::Error(format!(
                     "Hermes did not finish within {} minutes; stopped.",
                     limit.as_secs() / 60
                 ));
             }
+            Ok(Err(e)) => return ToolResult::Error(format!("could not run {}: {e}", self.cfg.binary)),
         };
-
-        let clip = |b: &[u8]| {
-            let t = String::from_utf8_lossy(&b[..b.len().min(self.cfg.max_output_bytes)]).trim().to_string();
-            if b.len() > self.cfg.max_output_bytes { format!("{t}\n[truncated]") } else { t }
-        };
-
-        match output {
-            Ok(out) => {
-                let stdout = clip(&out.stdout);
-                let stderr = clip(&out.stderr);
-                let ok = out.status.success();
-                if ok {
-                    // `raw` used to go back to the model verbatim, and Hermes prints the
-                    // full write plus a diff. For one Python file that was a
-                    // 376-line diff inside a single tool result, which crowded
-                    // out the conversation and pushed the model into a second
-                    // tool call just to check its own work -- and that call
-                    // needed confirmation, which is how a working build ended
-                    // up silent. The summary is the answer; the transcript is
-                    // not needed and is available in the daemon log.
-                    ToolResult::Ok(serde_json::json!({
-                        // The exit status is the answer, not Hermes' closing box. That box
-                        // is its internal narration -- observed live, it ended with
-                        // "Also verify CLI with venv python", which reads like unfinished
-                        // work, so the model reached for shell_exec to check, which is
-                        // Caution, so it stopped and asked, and the user sat in silence
-                        // next to a project that had in fact been built and tested. Lead
-                        // with a definite status; keep the narration as detail only.
-                        "status": if ok { "done" } else { "failed" },
-                        "summary": format!(
-                            "{}\n\nAgent output (may be its own running notes): {}",
-                            if ok {
-                                "The agent finished. Files were written and any build and tests were \
-                                 run as part of the task. This is complete -- report it to the user \
-                                 and do not verify it with another tool."
-                            } else {
-                                "The agent FAILED. Tell the user it failed and quote the error below. \
-                                 Do not claim success."
-                            },
-                            Self::extract_reply(&stdout)
-                        ),
-                        "stderr": stderr,
-                        "workspace": dir.display().to_string(),
-                    }))
-                } else {
-                    ToolResult::Error(format!("Hermes exited with {}: {stderr}", out.status))
-                }
+        let reply = {
+            let t = said.trim();
+            if t.chars().count() > self.cfg.max_output_bytes {
+                let cut: String = t.chars().take(self.cfg.max_output_bytes).collect();
+                format!("{cut}\n[truncated]")
+            } else {
+                t.to_string()
             }
-            Err(e) => ToolResult::Error(format!("could not run {}: {e}", self.cfg.binary)),
+        };
+        // A non-zero exit from `hermes` itself (a crash, a bad flag) is a
+        // failure of the run; its own `result.exit_code` is the task's.
+        let ok = status.map(|s| s.success()).unwrap_or(false);
+        let took = started.elapsed().as_secs();
+        if !session.is_empty() {
+            tracing::info!(session = %session, steps, took_s = took, "hermes task finished");
+        }
+
+        {
+            if ok {
+                // `raw` used to go back to the model verbatim, and Hermes prints the
+                // full write plus a diff. For one Python file that was a
+                // 376-line diff inside a single tool result, which crowded
+                // out the conversation and pushed the model into a second
+                // tool call just to check its own work -- and that call
+                // needed confirmation, which is how a working build ended
+                // up silent. The summary is the answer; the transcript is
+                // not needed and is available in the daemon log.
+                ToolResult::Ok(serde_json::json!({
+                    // The exit status is the answer, not Hermes' closing box. That box
+                    // is its internal narration -- observed live, it ended with
+                    // "Also verify CLI with venv python", which reads like unfinished
+                    // work, so the model reached for shell_exec to check, which is
+                    // Caution, so it stopped and asked, and the user sat in silence
+                    // next to a project that had in fact been built and tested. Lead
+                    // with a definite status; keep the narration as detail only.
+                    "status": if ok { "done" } else { "failed" },
+                    "summary": format!(
+                        "{}\n\nAgent output (may be its own running notes): {}",
+                        if ok {
+                            "The agent finished. Files were written and any build and tests were \
+                             run as part of the task. This is complete -- report it to the user \
+                             and do not verify it with another tool."
+                        } else {
+                            "The agent FAILED. Tell the user it failed and quote the error below. \
+                             Do not claim success."
+                        },
+                        Self::extract_reply(&reply)
+                    ),
+                    "session": session,
+                    "steps": steps,
+                    "took_s": took,
+                    "workspace": dir.display().to_string(),
+                }))
+            } else {
+                ToolResult::Error(format!(
+                    "Hermes itself failed (exit {}). Its own last words: {}",
+                    exit_code,
+                    if reply.is_empty() {
+                        String::from("nothing")
+                    } else {
+                        reply.chars().take(400).collect::<String>()
+                    }
+                ))
+            }
         }
     }
 }
@@ -2303,6 +2440,109 @@ mod tests {
         let a: Vec<String> = t.select_specs("i am tired").into_iter().map(|s| s.name).collect();
         let b: Vec<String> = t.select_specs("i am tired").into_iter().map(|s| s.name).collect();
         assert_eq!(a, b);
+    }
+
+    /// A fake `hermes` that emits a stream-json transcript, so the pipeline is
+    /// tested against the real event shapes without a real model.
+    fn fake_hermes(events: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hermes"), format!("#!/bin/sh\ncat <<'EOF'\n{events}\nEOF\n"))
+            .unwrap();
+        std::fs::set_permissions(
+            dir.path().join("hermes"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let bin = dir.path().join("hermes").display().to_string();
+        (dir, bin)
+    }
+
+    fn code_tools(bin: &str, ws: &str) -> Tools {
+        let mut cfg = Config::default();
+        cfg.code.enabled = true;
+        cfg.code.binary = bin.into();
+        cfg.code.workspace = ws.into();
+        cfg.code.timeout_s = 30;
+        Tools::from_config(&cfg).unwrap()
+    }
+
+    fn task(msg: &str) -> JsonMap {
+        [("task".to_string(), Json::String(msg.into()))].into()
+    }
+
+    /// The pipeline: every `tool_use` becomes a progress update while the task
+    /// is still running, and the final `result` is the answer.
+    #[tokio::test]
+    async fn stream_json_events_become_progress_and_a_reply() {
+        let events = [
+            r#"{"type":"system","subtype":"init","model":"m","session_id":"20260101_000000_abc123"}"#,
+            r#"{"type":"tool_use","name":"read_file","input":{"path":"/home/u/Projects/a.rs"}}"#,
+            r#"{"type":"tool_use","name":"terminal","input":{"command":"cargo test 2>&1 | tail -3"}}"#,
+            r#"{"type":"text","text":"partial "}"#,
+            r#"{"type":"text","text":"answer"}"#,
+            r#"{"type":"result","session_id":"20260101_000000_abc123","exit_code":0,"text":"Built it.","tokens":{"input":1,"output":2,"total":3}}"#,
+        ].join("\n");
+        let (dir, bin) = fake_hermes(&events);
+        let tools = code_tools(&bin, &dir.path().display().to_string());
+        let seen: Arc<std::sync::Mutex<Vec<CodeProgress>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let sink_seen = seen.clone();
+        tools.set_code_progress(Arc::new(move |p| sink_seen.lock().unwrap().push(p)));
+        let ToolResult::Ok(v) = tools.by_name("code").unwrap().execute(&task("build a thing")).await else {
+            panic!("expected ok")
+        };
+        assert_eq!(v["status"], "done");
+        assert_eq!(v["session"], "20260101_000000_abc123");
+        assert_eq!(v["steps"], 2);
+        // The result event is the answer; the streamed deltas are the model's
+        // own running prose, not its final reply.
+        assert!(v["summary"].as_str().unwrap().contains("Built it."));
+        let p = seen.lock().unwrap();
+        assert_eq!(p.len(), 2, "one update per tool_use, while running");
+        assert_eq!(p[0].tool, "read_file");
+        assert_eq!(p[0].detail, "/home/u/Projects/a.rs");
+        assert_eq!(p[0].step, 1);
+        assert_eq!(p[1].tool, "terminal");
+        assert_eq!(p[1].step, 2);
+    }
+
+    /// A run that ends without a `result` event still answers with what it
+    /// streamed, rather than reporting nothing.
+    #[tokio::test]
+    async fn a_run_without_a_result_event_still_replies() {
+        let (dir, bin) = fake_hermes(r#"{"type":"text","text":"half an answer"}"#);
+        let tools = code_tools(&bin, &dir.path().display().to_string());
+        let ToolResult::Ok(v) = tools.by_name("code").unwrap().execute(&task("x")).await else { panic!() };
+        assert!(v["summary"].as_str().unwrap().contains("half an answer"));
+    }
+
+    /// A crash of the hermes process itself is an error, never a quiet success.
+    #[tokio::test]
+    async fn a_crash_is_reported_not_pretended_to_have_worked() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("hermes");
+        std::fs::write(&bin, "#!/bin/sh\necho boom >&2\nexit 2\n").unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let tools = code_tools(&bin.display().to_string().as_str(), &dir.path().display().to_string());
+        let ToolResult::Error(e) = tools.by_name("code").unwrap().execute(&task("x")).await else {
+            panic!("a crash must not read as done")
+        };
+        assert!(e.contains("itself failed"), "{e}");
+    }
+
+    /// The detail line gets spoken, so it must be short, flat, and must not
+    /// carry a whole command line.
+    #[test]
+    fn a_progress_detail_is_short_and_flattened() {
+        let long = format!("cargo build {}", "x".repeat(200));
+        let d = HermesCode::progress_detail("terminal", &serde_json::json!({ "command": long }));
+        assert!(d.chars().count() <= 61, "{}", d.chars().count());
+        assert!(d.ends_with('\u{2026}'), "{d}");
+        assert_eq!(
+            HermesCode::progress_detail("write_file", &serde_json::json!({ "path": "/a/b.rs" })),
+            "/a/b.rs"
+        );
+        assert_eq!(HermesCode::progress_detail("read_file", &serde_json::json!({ "file_path": "/c" })), "/c");
+        assert_eq!(HermesCode::progress_detail("todo", &serde_json::json!({})), "");
     }
 
     #[test]

@@ -108,6 +108,25 @@ ShellRoot {
     }
     if (e === "thought") {
       t.steps.push({ kind: "thought", round: v.round, reasoning: String(v.reasoning || ""), text: String(v.text || ""), at: now() })
+    } else if (e === "code_progress") {
+      // What Hermes is doing inside a `code` task. Collected into one step
+      // that grows, rather than a step per call: a real task made 63 of
+      // them, and 63 rows would bury the turn.
+      var live = null
+      for (var i = t.steps.length - 1; i >= 0; i--)
+        if (t.steps[i].kind === "hermes") { live = t.steps[i]; break }
+      if (!live) {
+        live = { kind: "hermes", items: [], steps: 0, elapsed_s: 0, done: false, at: now() }
+        t.steps.push(live)
+      }
+      live.steps = v.step || (live.steps + 1)
+      live.elapsed_s = v.elapsed_s || live.elapsed_s
+      // Keep the tail only: this is a live tail, not a log.
+      live.items.push(String(v.tool || "") + (v.detail ? "  " + String(v.detail) : ""))
+      while (live.items.length > 40) live.items.shift()
+    } else if (e === "tool_finished" && v.record && v.record.tool === "code") {
+      for (var j = t.steps.length - 1; j >= 0; j--)
+        if (t.steps[j].kind === "hermes") { t.steps[j].done = true; break }
     } else if (e === "tool_started") {
       t.steps.push({ kind: "tool", tool: v.tool, args: v.args, risk: v.risk, status: "running", summary: "", ms: 0, at: now(), t0: Date.now() })
     } else if (e === "tool_finished") {
@@ -496,6 +515,7 @@ ShellRoot {
                 : step.kind === "thought" ? c.magenta
                 : step.kind === "confirm" ? c.amber
                 : step.kind === "error" ? c.red
+                : step.kind === "hermes" ? c.cyan
                 : step.status === "running" ? c.cyan
                 : step.status === "success" ? c.green
                 : step.status === "awaiting_confirmation" ? c.amber : c.red
@@ -513,6 +533,7 @@ ShellRoot {
                   text: isHead ? "REQUEST"
                     : isTail ? (turn.done ? "REPLY" : "WAITING")
                     : step.kind === "thought" ? "REASONING  ·  round " + step.round
+                    : step.kind === "hermes" ? "HERMES  ·  step " + step.steps + (step.done ? "  ·  done" : "  ·  " + step.elapsed_s + "s")
                     : step.kind === "confirm" ? "NEEDS CONFIRMATION"
                     : step.kind === "error" ? "ERROR"
                     : "TOOL  ·  " + step.tool + "  ·  " + (step.status === "running" ? "running…"
@@ -530,6 +551,19 @@ ShellRoot {
                     : step.kind === "confirm" ? step.text
                     : step.kind === "error" ? step.text
                     : ""
+                }
+                Column {  // Hermes' live tool tail
+                  visible: step !== null && step.kind === "hermes"
+                  width: parent.width; spacing: 1
+                  Repeater {
+                    model: step && step.kind === "hermes" ? step.items.slice(-6) : []
+                    delegate: Text {
+                      required property string modelData
+                      width: parent.width; elide: Text.ElideRight; wrapMode: Text.Wrap
+                      text: "  " + modelData
+                      color: c.muted; font.family: c.mono; font.pixelSize: 11
+                    }
+                  }
                 }
                 Text {  // model's working note alongside a tool call
                   width: parent.width; wrapMode: Text.Wrap; color: c.muted; font.pixelSize: 12; font.italic: true

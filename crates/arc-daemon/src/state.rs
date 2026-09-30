@@ -102,6 +102,115 @@ const SLOW_TURN_SPEAKS_AT: std::time::Duration = std::time::Duration::from_secs(
 /// may not reach would be a claim Arc cannot support.
 const SLOW_TURN_HEADSUP: &str = "On it. This one takes a minute.";
 
+/// What Arc says while Hermes works, and when.
+///
+/// The pipeline delivers a line per Hermes tool call -- measured on a real
+/// task, 63 calls for one small feature -- so speaking them all would be
+/// unusable. Three rules keep it useful:
+///
+/// 1. At most [`PROGRESS_SPOKEN_MAX`] lines per task.
+/// 2. At least [`PROGRESS_SPOKEN_GAP`] apart, so it never turns into a
+///    stream of chatter.
+/// 3. Only for tools that mean something happened: reading and searching
+///    are invisible, so hearing "reading a file" tells the user nothing.
+///    Writing, editing and running commands do.
+///
+/// The first spoken line names what Hermes is building, not which tool it
+/// picked, so it is still true if the plan changes.
+struct ProgressTalk {
+    said: u32,
+    last_at: Option<std::time::Instant>,
+}
+
+const PROGRESS_SPOKEN_MAX: u32 = 3;
+const PROGRESS_SPOKEN_GAP: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Tools worth a spoken mention: something was made or run.
+fn progress_is_notable(tool: &str) -> bool {
+    matches!(tool, "write_file" | "patch" | "terminal" | "process" | "execute_code" | "delegate_task")
+}
+
+/// The spoken form of one progress line. `None` means show it, don't say it.
+fn progress_line(task: &str, tool: &str, step: u32, talk: &mut ProgressTalk) -> Option<String> {
+    if talk.said >= PROGRESS_SPOKEN_MAX || !progress_is_notable(tool) {
+        return None;
+    }
+    if let Some(last) = talk.last_at {
+        if last.elapsed() < PROGRESS_SPOKEN_GAP {
+            return None;
+        }
+    }
+    talk.said += 1;
+    talk.last_at = Some(std::time::Instant::now());
+    // The first line is the useful one: it says what is being built. After
+    // that the user mostly wants to know it is still moving.
+    Some(match talk.said {
+        1 => format!("Handing that to Hermes. It's working on {task}."),
+        _ => match tool {
+            "write_file" | "patch" => "It's writing the files now.".to_string(),
+            "terminal" | "process" | "execute_code" => "It's running the build and tests now.".to_string(),
+            _ => format!("Hermes is on step {step}."),
+        },
+    })
+}
+
+/// The user's request, shortened to something speakable.
+///
+/// This is spoken in the first progress line, so it must be short, must not
+/// be the whole sentence (which may be 40 words of dictation), and must be
+/// safe to say out loud: no paths, no commands, no names that need spelling
+/// out. Falls back to something generic when nothing usable is left.
+fn task_summary(text: &str) -> String {
+    let cleaned = text
+        .trim()
+        .trim_start_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+        .split(&['.', ',', ';', '!', '?', '\n'][..])
+        .map(str::trim)
+        .find(|c| !c.is_empty())
+        .unwrap_or("that");
+    // Politeness first, then an imperative, so the line reads as a noun
+    // phrase: "can you please write a test" -> "a test". Matched
+    // case-insensitively, since dictation and typed text disagree about
+    // capitals. The bare verbs are in the list because after the politeness
+    // is stripped what often remains is still a command, which reads aloud as
+    // an order rather than a subject.
+    const LEAD: [&str; 14] = [
+        "please ",
+        "can you ",
+        "could you ",
+        "would you ",
+        "i want ",
+        "i need ",
+        "i'd like ",
+        "make me ",
+        "build me ",
+        "write me ",
+        "create ",
+        "give me ",
+        "write ",
+        "build ",
+    ];
+    let mut stripped = cleaned.to_string();
+    // Repeatedly, not once: "can you please write a test" carries two of
+    // these, and one pass left "please write a test for the gate" to be said
+    // aloud.
+    loop {
+        let lower = stripped.to_lowercase();
+        match LEAD.iter().find(|p| lower.starts_with(**p)) {
+            Some(p) => stripped = stripped[p.len()..].trim_start().to_string(),
+            None => break,
+        }
+    }
+    // Never speak a path or a command: TTS reads "/" as "slash" and
+    // "/home/user/Projects" as a spelled-out string, which is both useless
+    // and a disclosure of the directory layout. Drop those tokens whole and
+    // keep the words around them.
+    let words: Vec<&str> =
+        stripped.split_whitespace().filter(|w| !w.contains('/') && !w.contains('\\')).take(7).collect();
+    let s = words.join(" ");
+    if s.is_empty() { "that".to_string() } else { s }
+}
+
 fn next_progress_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
     N.fetch_add(1, Ordering::Relaxed)
@@ -172,6 +281,18 @@ impl Daemon {
         let tx = events.clone();
         assistant.set_trace(std::sync::Arc::new(move |e| {
             let _ = tx.send(e);
+        }));
+        // The code pipeline: Hermes reports each tool call as it happens, so
+        // Arc can show the work as it goes instead of going quiet for the
+        // whole task. Shown always; the daemon speaks a few of them.
+        let px = events.clone();
+        assistant.set_code_progress(std::sync::Arc::new(move |p| {
+            let _ = px.send(Event::CodeProgress {
+                tool: p.tool,
+                detail: p.detail,
+                step: p.step,
+                elapsed_s: p.elapsed_s,
+            });
         }));
         Ok(Self {
             assistant,
@@ -273,8 +394,36 @@ impl Daemon {
             tokio::time::sleep(SLOW_TURN_SPEAKS_AT).await;
             speak(SLOW_TURN_HEADSUP.to_string());
         });
+        // Relay Hermes' progress while the turn runs. Each subscriber gets
+        // its own channel clone, so this sees only what arrives from here;
+        // `speak` is the same voice queue the headsup uses, so the two queue
+        // rather than talk over each other.
+        let mut talk = ProgressTalk { said: 0, last_at: None };
+        let task = task_summary(text);
+        let relay = tokio::spawn({
+            let mut rx = self.events.subscribe();
+            let speak = self.speak_handle();
+            async move {
+                loop {
+                    let (tool, detail, step) = match rx.recv().await {
+                        Ok(Event::CodeProgress { tool, detail, step, .. }) => (tool, detail, step),
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    };
+                    match progress_line(&task, &tool, step, &mut talk) {
+                        Some(t) => {
+                            tracing::info!(tool = %tool, detail = %detail, step, spoken = %t, "hermes progress");
+                            speak(t);
+                        }
+                        None => tracing::info!(tool = %tool, detail = %detail, step, "hermes progress"),
+                    }
+                }
+            }
+        });
         let reply = self.assistant.handle(&NluInput::text(text, to_core(source))).await;
         watchdog.abort();
+        relay.abort();
         self.finish(reply, start)
     }
 
@@ -543,6 +692,47 @@ mod tests {
     use arc_proto::ActionOutcome;
 
     #[test]
+    /// Speaking every Hermes tool call would be unusable (63 calls for one
+    /// small feature), so the policy is: only tools where something was
+    /// written or run, at most three lines, never two close together.
+    #[test]
+    fn progress_is_spoken_sparingly_and_only_when_something_happens() {
+        let mut t = ProgressTalk { said: 0, last_at: None };
+        // Reading is invisible: "it's reading a file" tells the user nothing
+        // they can act on.
+        assert_eq!(progress_line("a test", "read_file", 1, &mut t), None);
+        assert_eq!(progress_line("a test", "search_files", 2, &mut t), None);
+        let first =
+            progress_line("a test", "write_file", 3, &mut t).expect("the first notable step is spoken");
+        assert!(first.contains("a test"), "{first}");
+        assert_eq!(progress_line("a test", "terminal", 4, &mut t), None, "too soon after the last line");
+        t.last_at = Some(std::time::Instant::now() - PROGRESS_SPOKEN_GAP - std::time::Duration::from_secs(1));
+        let second = progress_line("a test", "terminal", 5, &mut t).expect("spoken once the gap has passed");
+        assert!(second.contains("build"), "{second}");
+        t.last_at = Some(std::time::Instant::now() - PROGRESS_SPOKEN_GAP - std::time::Duration::from_secs(1));
+        assert_eq!(
+            progress_line("a test", "write_file", 6, &mut t),
+            Some("It's writing the files now.".into())
+        );
+        t.last_at = Some(std::time::Instant::now() - PROGRESS_SPOKEN_GAP - std::time::Duration::from_secs(1));
+        assert_eq!(progress_line("a test", "write_file", 7, &mut t), None, "capped at three lines");
+        assert_eq!(t.said, PROGRESS_SPOKEN_MAX);
+    }
+
+    /// The first progress line is spoken, so what it says has to be
+    /// speakable: short, and never a path read out character by character.
+    #[test]
+    fn a_spoken_task_summary_is_short_and_speakable() {
+        assert_eq!(task_summary("Build me a screenshot script"), "a screenshot script");
+        assert_eq!(task_summary("can you please write a test for the gate"), "a test for the gate");
+        assert_eq!(task_summary("  "), "that");
+        assert_eq!(task_summary("..."), "that");
+        let long =
+            "please make me a really quite extraordinarily complicated thing that does many things indeed ok";
+        assert!(task_summary(long).split_whitespace().count() <= 7, "{}", task_summary(long));
+        assert!(!task_summary("run ls /home/user/Projects/secret-dir").contains('/'));
+    }
+
     fn a_slow_turn_says_something_before_it_finishes() {
         // The bug this fixes: a `code` task runs for minutes and used to be
         // completely silent, so a build that was working looked dead. Assert

@@ -430,17 +430,85 @@ ShellRoot {
     visible: true
     onClosed: Qt.quit()
 
-    // faint grid backdrop
+    // Backdrop. Was a flat 32px graph-paper grid, which reads as a spreadsheet
+    // rather than an instrument. This is a lit space instead: a bloom of the
+    // theme's own accent for a light source, a floor grid lying down and
+    // receding to a horizon, and a vignette so the corners fall away. Every
+    // colour comes from the palette, so it re-tints with the theme.
     Canvas {
+      id: backdrop
       anchors.fill: parent
-      opacity: 0.35
-      onPaint: {
-        var g = getContext("2d"); g.clearRect(0, 0, width, height)
-        g.strokeStyle = c.line; g.lineWidth = 1
-        for (var x = 0; x < width; x += 32) { g.beginPath(); g.moveTo(x + .5, 0); g.lineTo(x + .5, height); g.stroke() }
-        for (var y = 0; y < height; y += 32) { g.beginPath(); g.moveTo(0, y + .5); g.lineTo(width, y + .5); g.stroke() }
+      // Repaint on a palette change, not only on resize. The grid version only
+      // repainted for width/height, so after `omarchy theme set` it kept
+      // drawing the previous theme's colour. Watched through Connections
+      // because these are properties of the palette object, not of the Canvas.
+      Connections {
+        target: c
+        function onLineChanged() { backdrop.requestPaint() }
+        function onChromeChanged() { backdrop.requestPaint() }
+        function onBgChanged() { backdrop.requestPaint() }
       }
-      onWidthChanged: requestPaint(); onHeightChanged: requestPaint()
+
+      onPaint: {
+        var g = getContext("2d")
+        var w = width, h = height
+        g.clearRect(0, 0, w, h)
+
+        // 1. Light source: a wide, low bloom of the accent from above, so the
+        //    window has a direction to it rather than being evenly filled.
+        var bloom = g.createRadialGradient(w * 0.5, -h * 0.2, 0, w * 0.5, -h * 0.2, h * 0.95)
+        bloom.addColorStop(0, Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.13))
+        bloom.addColorStop(0.45, Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.045))
+        bloom.addColorStop(1, Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0))
+        g.fillStyle = bloom
+        g.fillRect(0, 0, w, h)
+
+        // 2. Horizon, a little above centre, with the floor grid below it.
+        var horizon = Math.round(h * 0.44) + 0.5
+        g.save()
+        g.beginPath(); g.rect(0, horizon, w, h - horizon); g.clip()
+        g.lineWidth = 1
+        // A third of the way from the border colour to the accent, so the
+        // floor carries a hint of the theme rather than being grey.
+        g.strokeStyle = c.blend(c.line, c.chrome, 0.35)
+
+        // Receding lines: spaced widely at the bottom, bunching toward the
+        // horizon. Squaring the parameter is what sells the perspective.
+        for (var j = 0; j < 16; j++) {
+          var t = j / 15
+          var y = horizon + Math.pow(t, 2.2) * (h - horizon)
+          g.globalAlpha = 0.10 + t * 0.55
+          g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke()
+        }
+        // Converging verticals, fading out toward the edges of the window.
+        for (var i = -16; i <= 16; i++) {
+          var spread = Math.abs(i) / 16
+          g.globalAlpha = 0.62 * (1 - spread * 0.8)
+          g.beginPath()
+          g.moveTo(w * 0.5 + i * (w / 14), h)
+          g.lineTo(w * 0.5 + i * 3, horizon)
+          g.stroke()
+        }
+        g.restore()
+
+        // 3. The horizon itself, brighter than the grid it sits on.
+        g.globalAlpha = 0.7
+        g.strokeStyle = c.chrome
+        g.beginPath(); g.moveTo(0, horizon); g.lineTo(w, horizon); g.stroke()
+
+        // 4. Vignette in the background's own colour rather than black, so it
+        //    darkens a dark theme and does nothing ugly to a light one.
+        g.globalAlpha = 1
+        // Kept light and pushed outward: at 0.5 from 0.34 it was flattening
+        // the gutters, which is exactly where the perspective grid shows.
+        var vig = g.createRadialGradient(
+          w / 2, h / 2, Math.min(w, h) * 0.45,
+          w / 2, h / 2, Math.max(w, h) * 0.85)
+        vig.addColorStop(0, Qt.rgba(c.bg.r, c.bg.g, c.bg.b, 0))
+        vig.addColorStop(1, Qt.rgba(c.bg.r, c.bg.g, c.bg.b, 0.38))
+        g.fillStyle = vig
+        g.fillRect(0, 0, w, h)
+      }
     }
 
     ColumnLayout {

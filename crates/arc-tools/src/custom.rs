@@ -34,7 +34,8 @@ use std::sync::{Arc, RwLock};
 
 /// Tool-management tools. A composite may not call these: a tool that can
 /// create or delete tools would let one unconfirmed call manufacture others.
-pub const MANAGEMENT: &[&str] = &["tool_create", "tool_delete", "tool_list_own"];
+pub const MANAGEMENT: &[&str] =
+    &["tool_create", "tool_delete", "tool_list_own", crate::TOOL_MISSING];
 
 const MAX_STEPS: usize = 12;
 const MAX_PARAMS: usize = 8;

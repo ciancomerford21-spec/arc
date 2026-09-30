@@ -30,21 +30,114 @@ ShellRoot {
   readonly property string arcCmd: "arc"
 
   // ------------------------------------------------------------ palette
+  //
+  // Read from the live Omarchy theme rather than hardcoded, so the app is
+  // the same colour as the bar, the launcher and the terminal, and it follows
+  // `omarchy theme set` with no restart. Omarchy's own shell reads the same
+  // file through the same Quickshell FileView.
   QtObject {
     id: c
-    readonly property color bg: "#070b12"
-    readonly property color panel: "#0b1320"
-    readonly property color panelHi: "#101b2c"
-    readonly property color line: "#1b2c44"
-    readonly property color cyan: "#35e6ff"
-    readonly property color cyanDim: "#1d7f8f"
-    readonly property color magenta: "#ff3fa4"
-    readonly property color amber: "#ffb547"
-    readonly property color green: "#4dffa6"
-    readonly property color red: "#ff5468"
-    readonly property color text: "#d6e6f5"
-    readonly property color muted: "#6f86a3"
+    readonly property string home: Quickshell.env("HOME")
+    readonly property string themePath: home + "/.local/state/omarchy/current/theme/colors.toml"
+
+    // Raw "key" -> "#rrggbb" from the theme, or "" when the key is absent.
+    // Assigning the whole object is what makes the bindings below re-evaluate
+    // on a theme swap; mutating it in place would not.
+    property var theme: ({})
+
+    function val(key, fallback) {
+      var v = theme[key]
+      return (typeof v === "string" && v.length > 0) ? v : fallback
+    }
+    // Mix toward another colour: used for the surface ramp, since a theme
+    // gives one background and this UI needs three related ones.
+    function blend(a, b, t) {
+      return Qt.rgba(a.r * (1 - t) + b.r * t, a.g * (1 - t) + b.g * t, a.b * (1 - t) + b.b * t, 1)
+    }
+
+    // One flat "#rrggbb" -> "#rrggbb" walker. Themes vary in which keys they
+    // define, so every slot below has a chain of fallbacks ending at a
+    // neutral that still reads correctly.
+    function parseColors(raw) {
+      var out = {}
+      var re = /^\s*([A-Za-z0-9_-]+)\s*=\s*["']?(#[0-9A-Fa-f]{6})/
+      var lines = String(raw || "").split("\n")
+      for (var i = 0; i < lines.length; i++) {
+        var m = lines[i].match(re)
+        if (m) out[m[1]] = m[2]
+      }
+      return out
+    }
+
+    // --- surfaces, from darkest to lightest
+    readonly property color bg: val("darker_background", val("dark_background", val("background", "#141414")))
+    readonly property color panel: val("background", "#1c1c1c")
+    readonly property color panelHi: val("lighter_background", blend(panel, text, 0.06))
+    readonly property color line: blend(text, bg, 0.72)
+
+    // --- text
+    readonly property color text: val("foreground", "#e6e6e6")
+    // Lifted 22% toward the text colour. A theme's own `muted` is tuned for
+    // its own surfaces and lands under 4.5:1 on this app's panel -- measured
+    // across the four installed themes, Itachi 4.34 and Siren 4.09 raw. The
+    // lift puts the worst case at 5.55:1 while staying an order of magnitude
+    // below body text (13-14:1), so it still reads as secondary.
+    readonly property color muted: blend(val("muted", val("dark_foreground", text)), text, 0.22)
+
+    // --- roles. Accent is the theme's own accent; the rest are its named
+    // colours, so a green theme reads green and Itachi reads warm red.
+    readonly property color accent: val("accent", val("color4", "#c05050"))
+    // The chrome colour. Omarchy's own shell paints its highlights with
+    // `accent` 235 times and the numbered palette 9 times combined -- it
+    // never uses cyan as chrome, so Arc should not either. Under Itachi that
+    // is the crimson #dc5b56, which is what the bar and launcher use.
+    readonly property color chrome: accent
+    readonly property color chromeDim: blend(chrome, bg, 0.45)
+    readonly property color magenta: val("magenta", val("bright_magenta", val("color5", accent)))
+    readonly property color amber: val("yellow", val("bright_yellow", val("color3", "#d0a040")))
+    readonly property color green: val("green", val("bright_green", val("color2", "#70a060")))
+    readonly property color red: val("red", val("bright_red", val("color1", "#c05050")))
     readonly property string mono: "JetBrainsMono Nerd Font"
+
+    // True when two parsed themes are identical, so a poll that finds no
+    // change does not reassign `theme` and repaint the whole app.
+    function sameTheme(a, b) {
+      var ka = Object.keys(a), kb = Object.keys(b)
+      if (ka.length !== kb.length) return false
+      for (var i = 0; i < ka.length; i++) if (a[ka[i]] !== b[ka[i]]) return false
+      return true
+    }
+    function acceptColors(raw) {
+      var p = parseColors(raw)
+      if (Object.keys(p).length === 0) return   // a torn read; keep what we have
+      if (Object.keys(p).length === 0) return   // a torn read; keep what we have
+      if (!sameTheme(theme, p)) theme = p
+    }
+
+    property FileView colorsFile: FileView {
+      id: colorsFile
+      path: c.themePath
+      watchChanges: true
+      printErrors: false
+      // reload() rather than parsing the change signal: text() is stale there.
+      onLoaded: c.acceptColors(text())
+      onFileChanged: reload()
+      // Deliberately keeps the last good palette. `omarchy theme set` swaps
+      // the whole current/theme directory, so the watched file briefly stops
+      // existing; blanking the palette here left the app on its grey fallback
+      // for good, because the watcher dies with the old inode.
+      onLoadFailed: colorsPoll.restart()
+    }
+  }
+
+  // At the root, not inside the palette object: a QtObject has no default
+  // property, so a bare Timer there is a load error.
+  Timer {
+    id: colorsPoll
+    interval: 3000
+    repeat: true
+    running: true
+    onTriggered: colorsFile.reload()
   }
 
   function riskColor(r) {
@@ -272,7 +365,7 @@ ShellRoot {
       opacity: 0.35
       onPaint: {
         var g = getContext("2d"); g.clearRect(0, 0, width, height)
-        g.strokeStyle = "#0f2236"; g.lineWidth = 1
+        g.strokeStyle = c.line; g.lineWidth = 1
         for (var x = 0; x < width; x += 32) { g.beginPath(); g.moveTo(x + .5, 0); g.lineTo(x + .5, height); g.stroke() }
         for (var y = 0; y < height; y += 32) { g.beginPath(); g.moveTo(0, y + .5); g.lineTo(width, y + .5); g.stroke() }
       }
@@ -290,7 +383,7 @@ ShellRoot {
         spacing: 14
         Item {
           width: 34; height: 34
-          Rectangle { id: core; anchors.centerIn: parent; width: 14; height: 14; radius: 7; color: shell.arcState === "offline" ? c.red : c.cyan }
+          Rectangle { id: core; anchors.centerIn: parent; width: 14; height: 14; radius: 7; color: shell.arcState === "offline" ? c.red : c.chrome }
           Rectangle {
             anchors.centerIn: parent; width: 30; height: 30; radius: 15; color: "transparent"
             border.color: core.color; border.width: 1.5; opacity: 0.8
@@ -302,18 +395,18 @@ ShellRoot {
           }
         }
         Column {
-          Text { text: "A R C"; color: c.cyan; font.family: c.mono; font.pixelSize: 22; font.bold: true; font.letterSpacing: 4 }
+          Text { text: "A R C"; color: c.chrome; font.family: c.mono; font.pixelSize: 22; font.bold: true; font.letterSpacing: 4 }
           Text { text: shell.model || "connecting…"; color: c.muted; font.family: c.mono; font.pixelSize: 11 }
         }
         Item { Layout.fillWidth: true }
-        Tag { label: shell.arcState.toUpperCase(); tint: shell.arcState === "offline" ? c.red : shell.arcState === "idle" ? c.cyanDim : c.magenta }
-        Tag { label: shell.tools.length + " TOOLS"; tint: c.cyanDim }
+        Tag { label: shell.arcState.toUpperCase(); tint: shell.arcState === "offline" ? c.red : shell.arcState === "idle" ? c.chromeDim : c.chrome }
+        Tag { label: shell.tools.length + " TOOLS"; tint: c.chromeDim }
         // Echoes the last classification change, so a click is confirmed
         // somewhere other than in the row the user was looking at.
         Tag { visible: shell.classNote !== ""; label: shell.classNote; tint: c.amber }
-        Tag { label: shell.turns.length + " TURNS"; tint: c.cyanDim }
+        Tag { label: shell.turns.length + " TURNS"; tint: c.chromeDim }
       }
-      Rectangle { Layout.fillWidth: true; height: 1; color: c.cyan; opacity: 0.35 }
+      Rectangle { Layout.fillWidth: true; height: 1; color: c.chrome; opacity: 0.35 }
 
       // ---------------------------------------------------- panes
       RowLayout {
@@ -352,7 +445,7 @@ ShellRoot {
                 height: tcol.implicitHeight + 16
                 radius: 4
                 color: ma.containsMouse ? c.panelHi : "transparent"
-                border.color: open ? c.cyanDim : c.line
+                border.color: open ? c.chromeDim : c.line
                 opacity: modelData.enabled ? 1 : 0.45
                 Rectangle { width: 3; height: parent.height - 12; anchors.verticalCenter: parent.verticalCenter; x: 0; radius: 1; color: shell.riskColor(modelData.risk) }
                 // Declared before the content on purpose: a MouseArea takes
@@ -394,7 +487,7 @@ ShellRoot {
                       if (!ks.length) return "no arguments"
                       return ks.map(function(k) { return "• " + k + (req.indexOf(k) >= 0 ? "*" : "") + "  " + (p[k].description || p[k].type || "") }).join("\n")
                     }
-                    color: c.cyan; font.family: c.mono; font.pixelSize: 11; wrapMode: Text.Wrap
+                    color: c.chrome; font.family: c.mono; font.pixelSize: 11; wrapMode: Text.Wrap
                   }
                   Text {
                     visible: open
@@ -441,7 +534,7 @@ ShellRoot {
                   width: Math.min(youM.width + 26, parent.width * 0.8)
                   TextMetrics { id: youM; text: turn ? turn.query : ""; font.pixelSize: 14 }
                   height: youText.implicitHeight + 16
-                  radius: 6; color: "#12253b"; border.color: index === shell.shownIndex ? c.cyan : c.line
+                  radius: 6; color: c.panelHi; border.color: index === shell.shownIndex ? c.chrome : c.line
                   Text { id: youText; x: 12; y: 8; width: parent.width - 24; text: turn ? turn.query : ""; color: c.text; wrapMode: Text.Wrap; font.pixelSize: 14 }
                   MouseArea { anchors.fill: parent; onClicked: shell.selected = index }
                 }
@@ -455,7 +548,7 @@ ShellRoot {
                   width: Math.min(Math.max(arcM.width, 120) + 26, parent.width * 0.85)
                   TextMetrics { id: arcM; text: arcText.text; font.pixelSize: 14 }
                   height: arcText.implicitHeight + 16
-                  radius: 6; color: c.panelHi; border.color: turn && turn.done ? c.cyanDim : c.magenta
+                  radius: 6; color: c.panelHi; border.color: turn && turn.done ? c.chromeDim : c.chrome
                   Text {
                     id: arcText; x: 12; y: 8; width: parent.width - 24
                     text: !turn ? "" : turn.done ? turn.reply : ("working" + ".".repeat(1 + (dots.tick % 3)) + "  " + turn.steps.length + " step" + (turn.steps.length === 1 ? "" : "s"))
@@ -510,13 +603,13 @@ ShellRoot {
               readonly property bool isHead: index === 0
               readonly property bool isTail: turn && index === turn.steps.length + 1
               readonly property var step: { shell.rev; return turn && !isHead && !isTail ? turn.steps[index - 1] : null }
-              readonly property color dot: isHead ? c.cyan
+              readonly property color dot: isHead ? c.chrome
                 : isTail ? (turn.done ? c.green : c.magenta)
                 : step.kind === "thought" ? c.magenta
                 : step.kind === "confirm" ? c.amber
                 : step.kind === "error" ? c.red
-                : step.kind === "hermes" ? c.cyan
-                : step.status === "running" ? c.cyan
+                : step.kind === "hermes" ? c.chrome
+                : step.status === "running" ? c.chrome
                 : step.status === "success" ? c.green
                 : step.status === "awaiting_confirmation" ? c.amber : c.red
               width: trace.width - 10
@@ -574,11 +667,11 @@ ShellRoot {
                   visible: step !== null && step.kind === "tool"
                   width: parent.width
                   height: visible ? toolBody.implicitHeight + 12 : 0
-                  radius: 4; color: "#081018"; border.color: c.line
+                  radius: 4; color: c.panelHi; border.color: c.line
                   Column {
                     id: toolBody; x: 8; y: 6; width: parent.width - 16; spacing: 4
                     Text {
-                      width: parent.width; wrapMode: Text.WrapAnywhere; color: c.cyan; font.family: c.mono; font.pixelSize: 11
+                      width: parent.width; wrapMode: Text.WrapAnywhere; color: c.chrome; font.family: c.mono; font.pixelSize: 11
                       text: step && step.kind === "tool" ? "args  " + JSON.stringify(step.args || {}) : ""
                     }
                     Text {
@@ -623,7 +716,10 @@ ShellRoot {
     id: pane
     property string title: ""
     default property alias content: holder.data
-    color: Qt.rgba(0.043, 0.075, 0.125, 0.92)
+    // The window surface, translucent so the desktop shows through. This was
+    // a hardcoded rgba blue and was 56% of the window: the one place the old
+    // palette survived the swap, and the reason the app still looked blue.
+    color: Qt.rgba(c.panel.r, c.panel.g, c.panel.b, 0.94)
     border.color: c.line
     radius: 6
     // corner brackets
@@ -634,17 +730,17 @@ ShellRoot {
         width: 14; height: 14
         x: index % 2 ? pane.width - 14 : 0
         y: index < 2 ? 0 : pane.height - 14
-        Rectangle { width: 14; height: 2; color: c.cyan; y: index < 2 ? 0 : 12 }
-        Rectangle { width: 2; height: 14; color: c.cyan; x: index % 2 ? 12 : 0 }
+        Rectangle { width: 14; height: 2; color: c.chrome; y: index < 2 ? 0 : 12 }
+        Rectangle { width: 2; height: 14; color: c.chrome; x: index % 2 ? 12 : 0 }
       }
     }
-    Text { x: 16; y: 10; text: "▍" + pane.title; color: c.cyan; font.family: c.mono; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2 }
+    Text { x: 16; y: 10; text: "▍" + pane.title; color: c.chrome; font.family: c.mono; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2 }
     Item { id: holder; anchors.fill: parent; anchors.margins: 12; anchors.topMargin: 34 }
   }
 
   component Tag: Rectangle {
     property string label: ""
-    property color tint: c.cyanDim
+    property color tint: c.chromeDim
     height: 24; width: tl.implicitWidth + 20; radius: 3
     color: "transparent"; border.color: tint
     Text { id: tl; anchors.centerIn: parent; text: parent.label; color: parent.tint; font.family: c.mono; font.pixelSize: 11; font.bold: true; font.letterSpacing: 1 }
@@ -718,7 +814,7 @@ ShellRoot {
       radius: 3
       color: resetMa.containsMouse ? c.panelHi : "transparent"
       border.color: c.line
-      Text { anchors.centerIn: parent; text: "↺"; color: resetMa.containsMouse ? c.cyan : c.muted; font.family: c.mono; font.pixelSize: 12 }
+      Text { anchors.centerIn: parent; text: "↺"; color: resetMa.containsMouse ? c.chrome : c.muted; font.family: c.mono; font.pixelSize: 12 }
       MouseArea {
         id: resetMa
         anchors.fill: parent
@@ -733,7 +829,7 @@ ShellRoot {
   component Button_: Rectangle {
     id: btn
     property string label: ""
-    property color tint: c.cyan
+    property color tint: c.chrome
     signal clicked()
     height: 34; width: bl.implicitWidth + 28; radius: 4
     color: bma.containsMouse ? Qt.rgba(tint.r, tint.g, tint.b, 0.18) : "transparent"
@@ -750,13 +846,13 @@ ShellRoot {
     signal edited(string text)
     function clear() { ti.text = "" }
     implicitHeight: 34; implicitWidth: 200; radius: 4
-    color: "#081018"; border.color: ti.activeFocus ? c.cyan : c.line
+    color: c.panelHi; border.color: ti.activeFocus ? c.chrome : c.line
     TextInput {
       id: ti
       anchors.fill: parent; anchors.leftMargin: 12; anchors.rightMargin: 12
       verticalAlignment: TextInput.AlignVCenter
       color: c.text; font.family: c.mono; font.pixelSize: 13; clip: true
-      selectionColor: c.cyanDim
+      selectionColor: c.chromeDim
       onAccepted: fld.accepted(text)
       onTextEdited: fld.edited(text)
     }

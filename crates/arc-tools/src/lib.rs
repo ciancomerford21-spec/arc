@@ -21,6 +21,13 @@ pub use custom::CustomTools;
 /// Arguments passed to a tool at execution time. Always a JSON object.
 pub type JsonMap = HashMap<String, Json>;
 
+/// The tool the model calls when nothing it has can do what was asked.
+///
+/// The agent intercepts the call before the gate and runs the planner in
+/// `arc_core::autocreate`, so this implementation only exists to make the name
+/// real: an unknown tool is refused, which would lose the request.
+pub const TOOL_MISSING: &str = "tool_missing";
+
 /// Outcome of a tool execution.
 #[derive(Debug, Clone)]
 pub enum ToolResult {
@@ -202,7 +209,8 @@ impl Tools {
         );
         t.register(Arc::new(ToolCreate { store: custom.clone() }));
         t.register(Arc::new(ToolDelete { store: custom.clone() }));
-        t.register(Arc::new(ToolListOwn { store: custom }));
+        t.register(Arc::new(ToolListOwn { store: custom.clone() }));
+        t.register(Arc::new(ToolMissing));
         Ok(t)
     }
 
@@ -2192,6 +2200,46 @@ impl Tool for ToolListOwn {
             1 => format!("I've made one tool: {}.", names[0]),
             n => format!("I've made {n} tools: {}.", names.join(", ")),
         })
+    }
+}
+
+/// `tool_missing`: "nothing I have can do this". The agent intercepts this
+/// call before the gate and asks the model to design the missing tool
+/// (`arc_core::autocreate`), so reaching this implementation means the
+/// planner was refused and the model is being told so.
+struct ToolMissing;
+
+#[async_trait]
+impl Tool for ToolMissing {
+    fn name(&self) -> &str {
+        TOOL_MISSING
+    }
+    fn description(&self) -> &str {
+        "Call this when the user asks for something no tool you have can do. Say what is needed in \
+         `need` and suggest a snake_case `name` for it; a tool is then designed and registered for you, \
+         and you should call it. Do not call it for a destructive request, and do not call it for \
+         anything an existing tool does."
+    }
+    fn parameters(&self) -> Json {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "need": {"type": "string", "description": "what you need to be able to do, in one sentence"},
+                "name": {"type": "string", "description": "suggested snake_case name for the new tool"}
+            },
+            "required": ["need"]
+        })
+    }
+    fn hints(&self) -> &'static [&'static str] {
+        &["no tool", "cannot do that", "don't have a tool", "nothing to do that"]
+    }
+    fn base_risk(&self) -> RiskLevel {
+        RiskLevel::Safe
+    }
+    async fn execute(&self, _args: &JsonMap) -> ToolResult {
+        ToolResult::Error(
+            "the missing tool was not created; do not call this again this turn".into(),
+        )
     }
 }
 

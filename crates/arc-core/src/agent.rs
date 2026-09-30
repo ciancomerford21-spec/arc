@@ -3,6 +3,7 @@
 //! `ai.max_tool_rounds` is reached. Tool calls from the model get no special
 //! trust: they go through the same [`Gate`] as everything else.
 
+use crate::autocreate::{AutoCreate, Gap, TOOL_MISSING};
 use crate::gate::{Gate, Outcome};
 use arc_ai::{AiError, AiMessage, ProviderSet, ToolDef};
 
@@ -34,6 +35,10 @@ pub struct Agent {
     system_prompt: String,
     max_rounds: u32,
     trace: Option<Trace>,
+    /// Builds a tool when the model asks for one that does not exist. See
+    /// [`crate::autocreate`]; disabling it is one config line and the whole
+    /// feature turns off, `tool_create` included in the model's own hands.
+    auto: AutoCreate,
 }
 
 /// Tool results are truncated before going back to the model so a large
@@ -171,7 +176,20 @@ pub fn shorten_for_speech(text: &str, max_chars: usize) -> String {
 
 impl Agent {
     pub fn new(providers: ProviderSet, gate: Arc<Gate>, system_prompt: String, max_rounds: u32) -> Self {
-        Self { providers, gate, system_prompt, max_rounds: max_rounds.max(1), trace: None }
+        Self::new_with_auto(providers, gate, system_prompt, max_rounds, AutoCreate::disabled())
+    }
+
+    /// As [`Agent::new`], but with automatic tool creation configured. This is
+    /// what the daemon uses; [`Agent::new`] stays off so a library caller and
+    /// the agent's own tests never spend an extra model request by surprise.
+    pub fn new_with_auto(
+        providers: ProviderSet,
+        gate: Arc<Gate>,
+        system_prompt: String,
+        max_rounds: u32,
+        auto: AutoCreate,
+    ) -> Self {
+        Self { providers, gate, system_prompt, max_rounds: max_rounds.max(1), trace: None, auto }
     }
 
     pub fn set_trace(&mut self, trace: Trace) {
@@ -200,17 +218,88 @@ impl Agent {
             .collect()
     }
 
+    /// As [`Agent::tool_defs_for`], plus these tools whatever the scorer
+    /// thought. Used after something was auto-created: selection is keyword
+    /// based, and the new tool's description is the model's own words for
+    /// something the scorer has never seen, so it would otherwise be dropped
+    /// from the very request that needs it.
+    fn tool_defs_with(&self, utterance: &str, must: &[String]) -> Vec<ToolDef> {
+        let mut defs = self.tool_defs_for(utterance);
+        for name in must {
+            if defs.iter().any(|d| &d.name == name) {
+                continue;
+            }
+            let Some(t) = self.gate.tools().by_name(name) else { continue };
+            defs.push(ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.parameters(),
+            });
+        }
+        defs
+    }
+
+    /// The tool calls in one round that mean "this does not exist".
+    ///
+    /// Two shapes. An explicit `tool_missing` call, and a call to a name the
+    /// gate has never heard of -- which is what a model does when it needs a
+    /// capability and has decided what to call it. The second is the common
+    /// one and it costs nothing to notice: today those calls are simply
+    /// refused with "unknown tool" and the turn carries on without the task.
+    ///
+    /// Only one gap is taken per round. Two different missing tools in one
+    /// round means the model guessed wrong twice, and building for a guess is
+    /// how a directory of junk gets made.
+    fn detect_gap(&self, calls: &[arc_ai::ToolCall], request: &str) -> Option<Gap> {
+        for c in calls {
+            let declared = c.name == TOOL_MISSING;
+            if !declared && crate::autocreate::is_known(&self.gate, &c.name) {
+                continue;
+            }
+            if declared || !c.name.is_empty() {
+                let name = crate::autocreate::normalise_name(&c.name).unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                let want = c
+                    .args
+                    .get("need")
+                    .or_else(|| c.args.get("reason"))
+                    .or_else(|| c.args.get("description"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Some(Gap {
+                    name,
+                    want,
+                    request: request.to_string(),
+                    ids: vec![c.id.clone()],
+                    declared,
+                });
+            }
+        }
+        None
+    }
+
     /// Answer `user` given prior `history` (without system prompt).
     pub async fn ask(&self, history: &[AiMessage], user: &str) -> Result<AgentReply, AiError> {
-        let tools = self.tool_defs_for(user);
+        self.auto.begin_turn();
+        let mut tools = self.tool_defs_for(user);
+        let mut made: Vec<String> = vec![];
         let mut msgs = Vec::with_capacity(history.len() + 2);
         msgs.push(AiMessage::system(self.system_prompt.clone()));
         msgs.extend_from_slice(history);
         msgs.push(AiMessage::user(user));
         let mut actions = vec![];
         let mut failures = 0u32;
+        // A tool built mid-turn is worth a round of its own: the model has to
+        // be able to call the thing that was just created, or the whole point
+        // is lost. One extra round per tool, capped by the per-turn budget.
+        let mut budget = self.max_rounds;
+        let mut round = 0u32;
 
-        for round in 0..self.max_rounds {
+        while round < budget {
+            round += 1;
             let r = self.providers.complete(&msgs, &tools).await?;
             // Words the model wrote alongside tool calls are its working notes;
             // a final answer is already shown as the reply, so it is not
@@ -222,7 +311,7 @@ impl Agent {
                 // announcements for one turn.
                 let speakable = !r.tool_calls.iter().any(|c| c.name == "code");
                 self.emit(arc_proto::Event::Thought {
-                    round: round + 1,
+                    round,
                     reasoning: r.reasoning.clone(),
                     text: note,
                     speakable,
@@ -277,9 +366,81 @@ impl Agent {
                 return Ok(AgentReply::Answer { text: shorten_for_speech(&text, MAX_SPOKEN_CHARS), actions });
             }
             msgs.push(AiMessage::assistant(r.content.clone(), r.tool_calls.clone()));
+
+            // Automatic tool creation, before anything is run.
+            //
+            // This sits ahead of the gate because the whole point is to build
+            // the tool the call was reaching for: once the call has been
+            // refused as unknown, the round has already told the model the
+            // capability is missing and it moves on. The gap calls are answered
+            // here (so the conversation stays well formed) and every other
+            // call runs as normal.
+            let gap = self.detect_gap(&r.tool_calls, user);
+            let mut created: Option<String> = None;
+            let mut refusal: Option<String> = None;
+            if let Some(g) = &gap {
+                let known = self.gate.tools().specs();
+                match self.auto.plan(&self.providers, self.gate.tools().custom(), &known, g).await {
+                    Ok(d) => {
+                        tracing::info!(tool = %d.name, kind = d.kind(), "auto-created a tool mid-turn");
+                        self.emit(arc_proto::Event::Thought {
+                            round,
+                            reasoning: format!("no tool could do that, so I made {}", d.name),
+                            text: String::new(),
+                            speakable: false,
+                        });
+                        made.push(d.name.clone());
+                        created = Some(d.name);
+                        // One more round, so the new tool can actually be
+                        // called. The per-turn budget already caps how many
+                        // times this can happen.
+                        budget += 1;
+                    }
+                    Err(why) => {
+                        tracing::info!(tool = %g.name, "not creating a tool: {why}");
+                        refusal = Some(why);
+                    }
+                }
+            }
+            // The new tool has to be in scope for the retry, or the model is
+            // asked to do the same thing with the same list.
+            if created.is_some() {
+                tools = self.tool_defs_with(user, &made);
+            }
+
             let mut held: Option<PendingConfirmation> = None;
             for call in &r.tool_calls {
-                let outcome = if held.is_some() {
+                let is_gap = gap.as_ref().is_some_and(|g| g.ids.contains(&call.id));
+                let outcome = if is_gap {
+                    match (&created, &refusal) {
+                        (Some(name), _) => Outcome::Done {
+                            tool: call.name.clone(),
+                            result: ToolResult::Ok(json!({
+                                "created": name,
+                                "note": "that tool now exists and is in your list: call it now to finish \
+                                         what the user asked",
+                            })),
+                            args: call.args.clone(),
+                            risk: arc_proto::RiskLevel::Safe,
+                            duration_ms: 0,
+                            warning: None,
+                        },
+                        (_, Some(why)) => Outcome::Denied {
+                            tool: call.name.clone(),
+                            reason: why.clone(),
+                            args: call.args.clone(),
+                            risk: arc_proto::RiskLevel::Safe,
+                        },
+                        // A gap with no verdict cannot happen: `plan` answers
+                        // both ways.
+                        _ => Outcome::Denied {
+                            tool: call.name.clone(),
+                            reason: "the missing tool was not created".into(),
+                            args: call.args.clone(),
+                            risk: arc_proto::RiskLevel::Safe,
+                        },
+                    }
+                } else if held.is_some() {
                     // Don't run anything after a held action in the same turn.
                     Outcome::Denied {
                         tool: call.name.clone(),

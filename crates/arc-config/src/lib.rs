@@ -144,6 +144,14 @@ pub struct Ai {
     /// Rewrites the final reply before it is spoken. Off means replies are
     /// passed through untouched, which costs nothing.
     pub phrasing_enabled: bool,
+    /// Design and register a tool when the model asks for something nothing it
+    /// has can do. Off means a missing capability is reported instead of built.
+    pub auto_create_tools: bool,
+    /// Tools auto-created in one request. 1 keeps a wrong guess from turning
+    /// into a directory of half-tools.
+    pub auto_create_max_per_turn: u32,
+    /// Tools auto-created before auto-creation stops for the session.
+    pub auto_create_max_per_session: u32,
     pub openai: RemoteAi,
     pub anthropic: RemoteAi,
     /// Endpoint for the Hermes proxy fallback (`hermes proxy start`).
@@ -174,6 +182,14 @@ impl Default for Ai {
             // one and a second round trip for no measured gain.
             phrasing: ProviderKind::Hermes,
             phrasing_enabled: true,
+            // Arc writing its own tools is the whole point of tool_create, and
+            // creating one grants nothing: a composite adds no capability and
+            // a script asks before every run. So the implicit path is on by
+            // default, one tool per request and five per session, with the
+            // destructive screen in `arc_core::autocreate` in front of it.
+            auto_create_tools: true,
+            auto_create_max_per_turn: 1,
+            auto_create_max_per_session: 5,
             // The proxy ignores the bearer: `hermes proxy start` attaches the
             // user's own Portal credentials. Any non-empty value works.
             hermes: RemoteAi {
@@ -687,6 +703,12 @@ pub fn validate(c: &Config) -> Result<Vec<String>, ConfigError> {
     }
     if c.ai.max_tokens < 32 {
         errors.push("ai.max_tokens must be at least 32".into());
+    }
+    if c.ai.auto_create_max_per_turn > 3 {
+        errors.push("ai.auto_create_max_per_turn must be 0..=3".into());
+    }
+    if c.ai.auto_create_max_per_session > 20 {
+        errors.push("ai.auto_create_max_per_session must be 0..=20".into());
     }
     if c.general.name.trim().is_empty() {
         errors.push("general.name must not be empty".into());

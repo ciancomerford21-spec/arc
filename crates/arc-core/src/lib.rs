@@ -6,6 +6,7 @@
 //! * [`agent::Agent`]: language-model tool loop for everything else.
 //! * [`Assistant`]: one entry point that ties them together.
 
+pub mod autocreate;
 pub mod agent;
 pub mod automations;
 pub mod gate;
@@ -632,11 +633,16 @@ impl Assistant {
             Ok(p) => {
                 let name = p.primary_name().to_string();
                 (
-                    Some(Agent::new(
+                    Some(Agent::new_with_auto(
                         p,
                         gate.clone(),
                         system_prompt(cfg, store.as_ref()),
                         cfg.ai.max_tool_rounds,
+                        autocreate::AutoCreate::from_settings(
+                            cfg.ai.auto_create_tools,
+                            cfg.ai.auto_create_max_per_turn,
+                            cfg.ai.auto_create_max_per_session,
+                        ),
                     )),
                     name,
                 )

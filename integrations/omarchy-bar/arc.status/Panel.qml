@@ -186,11 +186,15 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  // Only properties Omarchy's Color singleton actually defines. It has no
+  // `warning`, `success` or `error`, and naming them produced
+  // "Unable to assign [undefined] to QColor" in the shell log every time Arc
+  // went busy, which is to say constantly.
   function stateColour() {
     if (root.state === "listening") return Color.accent
-    if (root.state === "thinking" || root.state === "executing") return Color.warning
-    if (root.state === "speaking") return Color.success
-    if (root.state === "error") return Color.error
+    if (root.state === "thinking" || root.state === "executing") return Color.foreground
+    if (root.state === "speaking") return Color.accent
+    if (root.state === "error") return Color.urgent
     return root.dim
   }
 

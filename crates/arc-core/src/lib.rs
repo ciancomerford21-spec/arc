@@ -6,8 +6,8 @@
 //! * [`agent::Agent`]: language-model tool loop for everything else.
 //! * [`Assistant`]: one entry point that ties them together.
 
-pub mod autocreate;
 pub mod agent;
+pub mod autocreate;
 pub mod automations;
 pub mod gate;
 

@@ -1430,6 +1430,16 @@ pub fn no_progress() -> ProgressSlot {
 
 impl HermesCode {
     /// The task prompt. Kept in one place so it is reviewable as a whole.
+    /// " for up to 15 minutes" when there is a ceiling, and nothing at all
+    /// when there is not, so the prompt never promises a deadline Arc will
+    /// not keep.
+    fn within(timeout_s: u64) -> String {
+        match timeout_s {
+            0 => String::new(),
+            s if s < 60 => format!(" for up to {s} seconds"),
+            s => format!(" for up to {} minutes", s / 60),
+        }
+    }
     fn build_prompt(task: &str, dir: &str) -> String {
         format!(
             "You are working in {dir}. Do the following task, working directly in \
@@ -1711,15 +1721,15 @@ impl Tool for HermesCode {
             force_confirm: self.cfg.confirm,
             explanation: if self.cfg.confirm {
                 format!(
-                    "let Hermes work in {} for up to {} minutes: {task}",
+                    "let Hermes work in {}{}: {task}",
                     arc_config::paths::expand(&self.cfg.workspace).display(),
-                    self.cfg.timeout_s / 60
+                    Self::within(self.cfg.timeout_s)
                 )
             } else {
                 format!(
-                    "working in {} for up to {} minutes without asking: {task}",
+                    "working in {}{} without asking: {task}",
                     arc_config::paths::expand(&self.cfg.workspace).display(),
-                    self.cfg.timeout_s / 60
+                    Self::within(self.cfg.timeout_s)
                 )
             },
         }
@@ -1744,7 +1754,13 @@ impl Tool for HermesCode {
         }
 
         let prompt = Self::build_prompt(&task, &dir.display().to_string());
-        let limit = std::time::Duration::from_secs(self.cfg.timeout_s.max(1));
+        // 0 = no limit. `tokio::time::timeout` needs a real duration, so the
+        // no-limit case skips the wrapper entirely rather than using
+        // `Duration::MAX`, which the timer cannot represent.
+        let limit = match self.cfg.timeout_s {
+            0 => None,
+            s => Some(std::time::Duration::from_secs(s)),
+        };
         // The prompt goes in a file, never on the command line. A task may
         // legitimately contain quotes, $(...), or backticks, and passing it as
         // an argument would let the shell reinterpret whatever the model
@@ -1759,6 +1775,12 @@ impl Tool for HermesCode {
         // the pipeline: it is what lets Arc report what Hermes is doing
         // while it works, instead of going quiet for the whole task. stderr
         // is left inherited so a crash is still visible in the journal.
+        // Hermes documents its own budget as "Unset = off", so the flag is
+        // omitted rather than passed as 0 when there is no budget.
+        let run_budget_args: Vec<String> = match self.cfg.run_budget_s {
+            0 => Vec::new(),
+            s => vec!["--run-budget".into(), s.to_string()],
+        };
         let started = std::time::Instant::now();
         let sink = self.progress.read().unwrap().clone();
         let run = async {
@@ -1770,8 +1792,7 @@ impl Tool for HermesCode {
                 .arg("stream-json")
                 .arg("--reasoning")
                 .arg(&self.cfg.reasoning)
-                .arg("--run-budget")
-                .arg(self.cfg.run_budget_s.to_string())
+                .args(run_budget_args)
                 .current_dir(&dir)
                 .kill_on_drop(true)
                 .stdout(std::process::Stdio::piped())
@@ -1818,7 +1839,10 @@ impl Tool for HermesCode {
             let status = child.wait().await;
             Ok::<_, std::io::Error>((status, said, session, steps, exit_code))
         };
-        let result = tokio::time::timeout(limit, run).await;
+        let result = match limit {
+            Some(d) => tokio::time::timeout(d, run).await,
+            None => Ok(run.await),
+        };
         let _ = std::fs::remove_file(&qfile);
 
         let (status, said, session, steps, exit_code) = match result {
@@ -1826,10 +1850,8 @@ impl Tool for HermesCode {
             // Timed out: the child was killed on drop, so report that plainly
             // rather than as a failure.
             Err(_) => {
-                return ToolResult::Error(format!(
-                    "Hermes did not finish within {} minutes; stopped.",
-                    limit.as_secs() / 60
-                ));
+                let mins = limit.map(|d| d.as_secs() / 60).unwrap_or(0);
+                return ToolResult::Error(format!("Hermes did not finish within {mins} minutes; stopped."));
             }
             Ok(Err(e)) => return ToolResult::Error(format!("could not run {}: {e}", self.cfg.binary)),
         };
@@ -2237,14 +2259,38 @@ impl Tool for ToolMissing {
         RiskLevel::Safe
     }
     async fn execute(&self, _args: &JsonMap) -> ToolResult {
-        ToolResult::Error(
-            "the missing tool was not created; do not call this again this turn".into(),
-        )
+        ToolResult::Error("the missing tool was not created; do not call this again this turn".into())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A build that needs longer than a quarter of an hour was being killed
+    /// with nothing on disk to show for it. 0 now means no ceiling at all,
+    /// and the wording must not imply one.
+    #[test]
+    fn no_timeout_means_no_ceiling_is_promised() {
+        assert_eq!(HermesCode::within(0), "", "no limit, so say nothing about time");
+        assert_eq!(HermesCode::within(900), " for up to 15 minutes");
+        assert_eq!(HermesCode::within(120), " for up to 2 minutes");
+        // Below a minute, /60 rounds to zero, which would read as "up to 0
+        // minutes" -- nonsense, so name the seconds instead.
+        assert_eq!(HermesCode::within(30), " for up to 30 seconds");
+    }
+
+    /// `hermes chat --run-budget` documents its own budget as "Unset = off",
+    /// so a zero budget has to omit the flag rather than pass 0.
+    #[test]
+    fn a_zero_run_budget_omits_the_flag() {
+        let args = |s: u64| -> Vec<String> {
+            match s {
+                0 => Vec::new(),
+                s => vec!["--run-budget".into(), s.to_string()],
+            }
+        };
+        assert!(args(0).is_empty());
+        assert_eq!(args(840), vec!["--run-budget".to_string(), "840".to_string()]);
+    }
     use super::*;
 
     fn args(kv: &[(&str, &str)]) -> JsonMap {

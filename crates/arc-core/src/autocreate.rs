@@ -93,7 +93,8 @@ const DESTRUCTIVE: &[&str] = &[
 /// by hand and checked them. (`shell_exec` is deliberately absent: it is
 /// screened per call and per line, which is the same guarantee the explicit
 /// path has.)
-const DANGEROUS_STEPS: &[&str] = &["reboot", "shutdown", "tool_delete", "tool_create", "tool_list_own", TOOL_MISSING];
+const DANGEROUS_STEPS: &[&str] =
+    &["reboot", "shutdown", "tool_delete", "tool_create", "tool_list_own", TOOL_MISSING];
 
 /// Python never reaches the bash analyzer, so it gets its own screen for the
 /// primitives that destroy: file and tree removal, disks, partitions, and
@@ -162,7 +163,10 @@ impl AutoCreate {
         }
         let made = self.session.load(Ordering::SeqCst);
         if made >= self.max_per_session {
-            return Err(format!("already auto-created {made} tools this session (limit {})", self.max_per_session));
+            return Err(format!(
+                "already auto-created {made} tools this session (limit {})",
+                self.max_per_session
+            ));
         }
         let words = request.split_whitespace().count();
         if words < 3 {
@@ -195,7 +199,9 @@ impl AutoCreate {
         let msgs = plan_messages(gap, known);
         tracing::info!(wanted = %gap.name, request, "designing a missing tool");
         let r = providers.complete(&msgs, &[]).await.map_err(|e| match e {
-            AiError::Network(_) | AiError::Timeout | AiError::Provider(_) => format!("the model could not design it ({e})"),
+            AiError::Network(_) | AiError::Timeout | AiError::Provider(_) => {
+                format!("the model could not design it ({e})")
+            }
             AiError::Unconfigured => "no language model is configured".to_string(),
         })?;
         if r.tool_calls.iter().any(|c| c.name == TOOL_MISSING || c.name == "tool_create") {
@@ -389,10 +395,7 @@ fn plan_messages(gap: &Gap, known: &[ToolSpec]) -> Vec<AiMessage> {
         )),
     ];
     if gap.declared {
-        msgs.push(AiMessage::assistant(
-            String::from("I have no tool that can do that."),
-            vec![],
-        ));
+        msgs.push(AiMessage::assistant(String::from("I have no tool that can do that."), vec![]));
     }
     msgs
 }
@@ -438,7 +441,9 @@ impl Draft {
                 };
                 Body::Script { language, script: self.script }
             }
-            _ => return Err("the design needs kind=composite with steps, or kind=script with a script".into()),
+            _ => {
+                return Err("the design needs kind=composite with steps, or kind=script with a script".into());
+            }
         };
         Ok(Def {
             name,
@@ -478,12 +483,10 @@ fn parse_draft(content: &str) -> Result<Draft, String> {
         Ok(d) => Ok(d),
         Err(e) => {
             // Some models emit JSON with trailing commas or single quotes.
-            let cleaned: String = body
-                .replace('\n', " ")
-                .replace(",}", "}")
-                .replace(",]", "]")
-                .replace('\'', "\"");
-            serde_json::from_str::<Draft>(&cleaned).map_err(|_| format!("the design was not usable JSON: {e}"))
+            let cleaned: String =
+                body.replace('\n', " ").replace(",}", "}").replace(",]", "]").replace('\'', "\"");
+            serde_json::from_str::<Draft>(&cleaned)
+                .map_err(|_| format!("the design was not usable JSON: {e}"))
         }
     }
 }
@@ -561,11 +564,13 @@ mod tests {
 
         // Python never reaches the bash analyzer, so this screen is the only
         // thing standing there.
-        assert!(screen_definition(&def(Body::Script {
-            language: Language::Python,
-            script: "import os\nos.remove('/tmp/x')\n".into(),
-        }))
-        .is_err());
+        assert!(
+            screen_definition(&def(Body::Script {
+                language: Language::Python,
+                script: "import os\nos.remove('/tmp/x')\n".into(),
+            }))
+            .is_err()
+        );
 
         let e = screen_definition(&def(Body::Composite {
             steps: vec![Step { tool: "media_pause".into(), args: serde_json::json!({}) }],
@@ -593,10 +598,7 @@ mod tests {
         );
         assert!(
             screen_definition(&def(Body::Composite {
-                steps: vec![Step {
-                    tool: "media_pause".into(),
-                    args: serde_json::json!({"x": "{ws}"}),
-                }]
+                steps: vec![Step { tool: "media_pause".into(), args: serde_json::json!({"x": "{ws}"}) }]
             }))
             .is_ok()
         );

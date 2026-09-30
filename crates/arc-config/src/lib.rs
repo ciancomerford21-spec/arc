@@ -406,6 +406,11 @@ pub struct Code {
     pub workspace: String,
     /// Hard wall-clock limit for one task, in seconds. Hermes is given a
     /// matching instruction and Arc kills the process at the limit.
+    ///
+    /// `0` means no limit: Arc does not wrap the task in a timeout at all, and
+    /// says so in the prompt rather than promising a deadline it will not
+    /// enforce. A build that legitimately needs twenty minutes was being
+    /// killed at fifteen with nothing on disk to show for it.
     pub timeout_s: u64,
     /// Cap on captured output, so a runaway build cannot flood the prompt.
     pub max_output_bytes: usize,
@@ -423,6 +428,10 @@ pub struct Code {
     /// Wall-clock budget handed to Hermes as --run-budget. Same ceiling as
     /// `timeout_s`, but stated to the agent as well as enforced by Arc, so it
     /// can wrap up rather than be killed mid-write.
+    ///
+    /// `0` omits the flag entirely. Hermes documents its own budget as
+    /// "Unset = off"; passing `0` is not the same thing and is not treated as
+    /// such here.
     pub run_budget_s: u64,
 }
 
@@ -432,11 +441,15 @@ impl Default for Code {
             enabled: false,
             binary: "hermes".into(),
             workspace: "~/Projects".into(),
-            timeout_s: 900,
+            // No limit by default. Arc is hands-free: a fifteen-minute
+            // ceiling on a build was arbitrary, and being killed mid-write
+            // leaves the user with nothing. Set these to a number to restore
+            // a ceiling.
+            timeout_s: 0,
             max_output_bytes: 16384,
             confirm: true,
             reasoning: "medium".into(),
-            run_budget_s: 840,
+            run_budget_s: 0,
         }
     }
 }

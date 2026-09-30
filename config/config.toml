@@ -168,8 +168,10 @@ enabled = false
 binary = "hermes"
 # The only tree a task may touch. Tasks run with this as their directory.
 workspace = "~/Projects"
-# Hard limit for one task, in seconds. Hermes is told to finish inside it too.
-timeout_s = 900
+# Hard limit for one task, in seconds. 0 = no limit: Arc stops killing the
+# task and does not pass a budget to Hermes at all. Set a number to put a
+# ceiling back.
+timeout_s = 0
 max_output_bytes = 16384
 # Ask before each task. false = Arc writes files and runs builds on a
 # spoken instruction with no prompt. The screen is then the only gate,
@@ -177,7 +179,11 @@ max_output_bytes = 16384
 # dangerous commands. Set back to true to restore the prompt.
 confirm = true
 reasoning = "medium"
-run_budget_s = 840
+# Wall-clock budget handed to Hermes. 0 omits the flag (Hermes treats an unset
+# budget as off), which is what lets a long build finish. Set a number to bound
+# the run; Arc also states it to Hermes at 80% so it can wrap up rather than be
+# killed mid-write.
+run_budget_s = 0
 
 [personality]
 custom_prompt = """

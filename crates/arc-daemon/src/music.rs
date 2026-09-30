@@ -83,6 +83,8 @@ pub trait Player: Send + Sync + std::fmt::Debug {
     /// Drop every queue entry after the current one.
     fn remove_remaining(&self) -> Result<(), String>;
     fn set_paused(&self, paused: bool) -> Result<(), String>;
+    /// Jump to `seconds` in the current track. Absolute, not a delta.
+    fn seek(&self, seconds: f64) -> Result<(), String>;
     /// Read the player's own state.
     fn progress(&self) -> Result<Progress, String>;
     /// The player process, when there is one. Used to notice that it died.
@@ -304,6 +306,27 @@ impl Player for MpvPlayer {
     fn set_paused(&self, paused: bool) -> Result<(), String> {
         self.with(|m| {
             m.command(&[json!("set_property"), json!("pause"), json!(paused)])?;
+            Ok(())
+        })
+    }
+
+    fn seek(&self, seconds: f64) -> Result<(), String> {
+        // Absolute + exact, not the keyframes default: a keyframe seek lands
+        // on the nearest keyframe, which for a VBR stream can be a second or
+        // more from where the user asked for.
+        //
+        // The flag spelling was verified against this mpv over its own IPC,
+        // not taken from the manual: `absolute+exact` is answered with
+        // "error running command" (a valid flag, nothing loaded to seek in)
+        // while `absolute+bogus` is answered with "invalid parameter" (the
+        // flag itself was rejected). Those two answers are the only thing
+        // that distinguishes a real flag from a plausible one here.
+        self.with(|m| {
+            m.command(&[
+                json!("seek"),
+                json!(seconds.max(0.0)),
+                json!("absolute+exact"),
+            ])?;
             Ok(())
         })
     }
@@ -569,7 +592,20 @@ fn parse_api_results(out: &str, source: &str) -> Vec<Track> {
             if url.trim().is_empty() {
                 return None;
             }
-            Track::new(title, artist, source, url).ok()
+            // `Track::new` is the one place metadata is capped and validated,
+            // so it builds the track and the artwork is patched in after --
+            // going through the constructor keeps the length limits and the
+            // blank-title refusal identical to every other way in.
+            let mut track = Track::new(title, artist, source, url).ok()?;
+            track.artwork = v
+                .get("artwork")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(600)
+                .collect();
+            Some(track)
         })
         .collect()
 }
@@ -715,6 +751,9 @@ impl Player for NoPlayer {
         Err(self.reason.clone())
     }
     fn set_paused(&self, _p: bool) -> Result<(), String> {
+        Err(self.reason.clone())
+    }
+    fn seek(&self, _s: f64) -> Result<(), String> {
         Err(self.reason.clone())
     }
     fn progress(&self) -> Result<Progress, String> {
@@ -1069,6 +1108,10 @@ mod tests {
         assert_eq!(tracks[0].title, "Windowlicker");
         assert_eq!(tracks[0].artist, "Aphex Twin");
         assert_eq!(tracks[0].url, "https://stream.invalid/a1");
+        // Artwork is the whole reason the API resolver exists over yt-dlp, so
+        // it has to survive the crossing into a Track.
+        assert_eq!(tracks[0].artwork, "https://img.invalid/a1");
+        assert_eq!(tracks[1].artwork, "", "no artwork is empty, not a broken url");
         assert_eq!(tracks[1].artist, "");
         // The source is the daemon's, not the module's: a module that claimed
         // otherwise must not be able to relabel every track.
@@ -1118,24 +1161,23 @@ mod tests {
     // Fallback
     // ------------------------------------------------------------------
 
-    /// A stub resolver that answers from a canned script.
+    /// A stub resolver that answers from a canned result, counting its calls.
     #[derive(Debug)]
     struct Stub {
-        name: &'static str,
         result: Result<Vec<Track>, String>,
         calls: Arc<AtomicUsize>,
     }
 
     impl Stub {
-        fn ok(name: &'static str, titles: &[&str]) -> (Self, Arc<AtomicUsize>) {
+        fn ok(titles: &[&str]) -> (Self, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             let tracks = titles.iter().map(|name| t(name)).collect();
-            (Self { name, result: Ok(tracks), calls: calls.clone() }, calls)
+            (Self { result: Ok(tracks), calls: calls.clone() }, calls)
         }
 
-        fn err(name: &'static str, msg: &str) -> (Self, Arc<AtomicUsize>) {
+        fn err(msg: &str) -> (Self, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
-            (Self { name, result: Err(msg.into()), calls: calls.clone() }, calls)
+            (Self { result: Err(msg.into()), calls: calls.clone() }, calls)
         }
     }
 
@@ -1148,8 +1190,8 @@ mod tests {
 
     #[test]
     fn the_primary_resolver_is_used_when_it_works() {
-        let (api, api_calls) = Stub::ok("api", &["from-api"]);
-        let (ytdlp, ytdlp_calls) = Stub::ok("yt-dlp", &["from-ytdlp"]);
+        let (api, api_calls) = Stub::ok(&["from-api"]);
+        let (ytdlp, ytdlp_calls) = Stub::ok(&["from-ytdlp"]);
         let f = Fallback::new(Arc::new(api), Arc::new(ytdlp));
         let tracks = f.resolve("q", 1).unwrap();
         assert_eq!(tracks[0].title, "from-api");
@@ -1161,8 +1203,8 @@ mod tests {
     /// still be able to play something.
     #[test]
     fn a_missing_python_module_falls_back_to_yt_dlp() {
-        let (api, _) = Stub::err("api", "the ytmusicapi module is not installed");
-        let (ytdlp, ytdlp_calls) = Stub::ok("yt-dlp", &["from-ytdlp"]);
+        let (api, _) = Stub::err("the ytmusicapi module is not installed");
+        let (ytdlp, ytdlp_calls) = Stub::ok(&["from-ytdlp"]);
         let f = Fallback::new(Arc::new(api), Arc::new(ytdlp));
         let tracks = f.resolve("q", 1).unwrap();
         assert_eq!(tracks[0].title, "from-ytdlp");
@@ -1174,8 +1216,8 @@ mod tests {
     /// a worse error than either alone.
     #[test]
     fn when_both_fail_both_reasons_are_reported() {
-        let (api, _) = Stub::err("api", "the ytmusicapi module is not installed");
-        let (ytdlp, _) = Stub::err("yt-dlp", "no playable result");
+        let (api, _) = Stub::err("the ytmusicapi module is not installed");
+        let (ytdlp, _) = Stub::err("no playable result");
         let f = Fallback::new(Arc::new(api), Arc::new(ytdlp));
         let err = f.resolve("q", 1).unwrap_err();
         assert!(err.contains("ytmusicapi module is not installed"), "{err}");

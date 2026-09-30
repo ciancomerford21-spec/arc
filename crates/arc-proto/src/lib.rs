@@ -244,6 +244,13 @@ pub struct NowPlaying {
     pub state: NowPlayingState,
     pub title: String,
     pub artist: String,
+    /// Cover art, empty when the resolver had none. See [`Track::artwork`].
+    ///
+    /// No `serde(default)`: this type writes its Serialize and Deserialize by
+    /// hand (it serialises the two derived fields `label` and `playing`), so
+    /// the attribute would be rejected -- the wire struct below is where the
+    /// default lives, and that is what keeps an older writer decoding.
+    pub artwork: String,
     /// Where it came from, e.g. "youtube music".
     pub source: String,
     /// The player process, when one is known. Zero means unknown.
@@ -277,10 +284,11 @@ impl NowPlaying {
 impl Serialize for NowPlaying {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut m = s.serialize_map(Some(7))?;
+        let mut m = s.serialize_map(Some(8))?;
         m.serialize_entry("state", &self.state)?;
         m.serialize_entry("title", &self.title)?;
         m.serialize_entry("artist", &self.artist)?;
+        m.serialize_entry("artwork", &self.artwork)?;
         m.serialize_entry("source", &self.source)?;
         m.serialize_entry("pid", &self.pid)?;
         m.serialize_entry("label", &self.label())?;
@@ -297,6 +305,7 @@ impl<'de> Deserialize<'de> for NowPlaying {
             state: NowPlayingState,
             title: String,
             artist: String,
+            artwork: String,
             source: String,
             pid: u32,
         }
@@ -306,13 +315,22 @@ impl<'de> Deserialize<'de> for NowPlaying {
                     state: NowPlayingState::Stopped,
                     title: String::new(),
                     artist: String::new(),
+                    artwork: String::new(),
                     source: String::new(),
                     pid: 0,
                 }
             }
         }
         let w = Wire::deserialize(d)?;
-        Ok(Self { state: w.state, title: w.title, artist: w.artist, source: w.source, pid: w.pid })
+        // `artwork` defaults, so a writer predating cover art still decodes.
+        Ok(Self {
+            state: w.state,
+            title: w.title,
+            artist: w.artist,
+            artwork: w.artwork,
+            source: w.source,
+            pid: w.pid,
+        })
     }
 }
 
@@ -328,6 +346,12 @@ pub struct Track {
     pub artist: String,
     #[serde(default)]
     pub source: String,
+    /// Cover art, when the resolver knew one. YouTube Music's API returns it
+    /// and a plain yt-dlp search does not, so this is empty far more often
+    /// than not -- which is why the UI draws a placeholder rather than
+    /// treating "no art" as an error.
+    #[serde(default)]
+    pub artwork: String,
     /// Not sent to clients.
     #[serde(default, skip_serializing)]
     pub url: String,
@@ -350,6 +374,7 @@ impl Track {
             title: title.chars().take(200).collect(),
             artist: artist.trim().chars().take(200).collect(),
             source: source.trim().chars().take(60).collect(),
+            artwork: String::new(),
             url: url.trim().to_string(),
         })
     }
@@ -361,6 +386,7 @@ impl From<&Track> for NowPlaying {
             state: NowPlayingState::Playing,
             title: t.title.clone(),
             artist: t.artist.clone(),
+            artwork: t.artwork.clone(),
             source: t.source.clone(),
             pid: 0,
         }
@@ -462,6 +488,14 @@ pub enum MusicRequest {
     /// which starts *after* the current track).
     Remove {
         index: usize,
+    },
+    /// Jump to `seconds` within the current track.
+    ///
+    /// Absolute rather than relative: a progress bar dragged to 40% means
+    /// "go there", and making the UI compute the delta would put the
+    /// playhead's own rounding into every seek.
+    Seek {
+        seconds: f64,
     },
 }
 
@@ -1019,6 +1053,7 @@ mod tests {
 
     fn track(title: &str, artist: &str) -> Track {
         Track {
+            artwork: String::new(),
             title: title.into(),
             artist: artist.into(),
             source: "youtube music".into(),
@@ -1035,6 +1070,7 @@ mod tests {
             state: NowPlayingState::Playing,
             title: "Hall of Fame".into(),
             artist: "Boards of Canada".into(),
+            artwork: "https://img.invalid/hof".into(),
             source: "youtube music".into(),
             pid: 4242,
         }

@@ -246,6 +246,17 @@ ShellRoot {
   // only runs while it is open -- a widget nobody is looking at should not
   // spawn a process every second.
   property bool musicOpen: false
+  // Which page is showing: "chat" (tools, conversation, thought process) or
+  // "media" (the player and everything you can do to it). Media used to be a
+  // collapsible strip above the panes, which put a queue you can add to and
+  // remove from inside the same column as a chat transcript -- and made both
+  // narrower than either wanted to be.
+  property string tab: "chat"
+  readonly property bool mediaTab: tab === "media"
+  readonly property var tabs: [
+    { id: "chat", label: "CHAT & TOOLS" },
+    { id: "media", label: "MEDIA" }
+  ]
   // A command that is in flight, so the buttons can ignore a second click
   // rather than queueing two skips.
   property string musicBusy: ""
@@ -514,6 +525,24 @@ ShellRoot {
   }
 
   function musicClearQueue() { musicAction_(["clear"]) }
+  // Jump the playhead. `secs` is clamped here as well as in the daemon
+  // because a click on a zero-width bar divides by zero, and NaN sent to a
+  // socket is a seek the player has to reject.
+  function musicSeek(secs) {
+    var s = Number(secs)
+    if (!isFinite(s) || s < 0) return
+    musicAction_(["seek", String(Math.floor(s))])
+  }
+
+  // The cover art for the current track, or "" for none.
+  //
+  // An accessor rather than a direct read so every binding that shows art
+  // gets "" instead of a TypeError when nothing is playing -- the same reason
+  // musicNow and musicQueue exist.
+  readonly property string musicArt: {
+    var t = shell.musicNow
+    return (t && t.artwork) ? String(t.artwork) : ""
+  }
   function musicToggle() { musicAction_(["toggle"]) }
   function musicNext() { musicAction_(["next"]) }
   function musicPrev() { musicAction_(["previous"]) }
@@ -705,7 +734,7 @@ ShellRoot {
             anchors.fill: parent
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onClicked: { shell.musicOpen = true }
+            onClicked: { shell.tab = "media"; shell.musicOpen = true }
           }
           RowLayout {
             id: chipRow
@@ -754,41 +783,185 @@ ShellRoot {
       }
       Rectangle { Layout.fillWidth: true; height: 1; color: c.chrome; opacity: 0.35 }
 
-      // ---------------------------------------------------- music
+      // ---------------------------------------------------- tabs
       //
-      // A section of its own rather than more header: pause, skip and the
-      // queue are controls with state, and a header chip is the wrong shape
-      // for a queue you can add to and remove from.
+      // Two pages, because the two things do not want the same shape. Chat
+      // and tools are three narrow columns that need vertical room for text;
+      // media is one wide page that needs horizontal room for cover art, a
+      // queue and a transport. Sharing one column made both worse, so the
+      // music section became a page of its own.
+      RowLayout {
+        Layout.fillWidth: true
+        spacing: 4
+        Repeater {
+          model: shell.tabs
+          delegate: Rectangle {
+            id: tabBtn
+            required property var modelData
+            readonly property bool active: shell.tab === modelData.id
+            // MEDIA carries a live badge: a track playing on the other tab is
+            // worth knowing about without switching over to check.
+            readonly property bool hasTrack: modelData.id === "media" && shell.music !== null
+            width: tabLbl.implicitWidth + 32
+            height: 28
+            radius: 3
+            color: active
+              ? Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.16)
+              : tabMa.containsMouse ? c.panelHi : "transparent"
+            border.color: active ? c.chrome : c.line
+            Text {
+              id: tabLbl
+              anchors.centerIn: parent
+              text: (modelData.id === "media" && shell.musicNow.state !== "stopped" ? "\u266b " : "") + modelData.label
+              color: tabBtn.active ? c.chrome : c.muted
+              font.family: c.mono; font.pixelSize: 11; font.bold: true; font.letterSpacing: 2
+            }
+            // A playing dot, so MEDIA is not just another inactive tab.
+            Rectangle {
+              visible: tabBtn.hasTrack && !tabBtn.active
+              width: 5; height: 5; radius: 3
+              anchors.right: parent.right; anchors.rightMargin: 8
+              anchors.verticalCenter: parent.verticalCenter
+              color: c.magenta
+              SequentialAnimation on opacity {
+                running: tabBtn.hasTrack && !tabBtn.active
+                loops: Animation.Infinite
+                NumberAnimation { from: 1.0; to: 0.25; duration: 900; easing.type: Easing.InOutQuad }
+                NumberAnimation { from: 0.25; to: 1.0; duration: 900; easing.type: Easing.InOutQuad }
+              }
+            }
+            MouseArea {
+              id: tabMa
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: { shell.tab = tabBtn.modelData.id; shell.musicOpen = tabBtn.modelData.id === "media" }
+            }
+          }
+        }
+        Item { Layout.fillWidth: true }
+      }
+
+      // ---------------------------------------------------- media page
       //
-      // Collapsed it is a single line -- an add-to-queue field and a
-      // disclosure. Expanded it takes the current track, a progress bar, the
-      // transport and the list of what is coming.
-      Rectangle {
+      // A page, not a section. This is where everything about the current
+      // song lives: the art, the bubble, the playhead, every control, the
+      // full queue, and the search that fills it. The chat page keeps only
+      // the compact chip, so a glance at it still says what is playing.
+      Item {
         id: musicPane
         Layout.fillWidth: true
-        implicitHeight: musicBody.implicitHeight + 20
-        radius: 6
-        color: Qt.rgba(c.panel.r, c.panel.g, c.panel.b, 0.94)
-        border.color: shell.music !== null ? c.magenta : c.line
-        visible: shell.music !== null || shell.musicOpen
+        Layout.fillHeight: true
+        visible: shell.mediaTab
+
+        Rectangle {
+          anchors.fill: parent
+          radius: 6
+          color: Qt.rgba(c.panel.r, c.panel.g, c.panel.b, 0.94)
+          border.color: shell.music !== null ? c.magenta : c.line
+        }
 
         RowLayout {
           id: musicBody
-          x: 14
-          y: 10
-          width: parent.width - 28
-          spacing: 12
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
+          anchors.margins: 14
+          spacing: 18
 
-          Text {
-            text: "\u266b"
-            color: shell.music !== null ? c.magenta : c.chromeDim
-            font.pixelSize: 15
-            anchors.verticalCenter: parent.verticalCenter
+          // --- the stage: cover art with the bubble moving over it
+          //
+          // Fixed width rather than proportional, because the art is a square
+          // and a square in a fluid column is either letterboxed or cropped.
+          // The bubble sits on top of it rather than beside it so the motion
+          // reads as coming out of the record.
+          ColumnLayout {
+            Layout.preferredWidth: 232
+            Layout.fillHeight: true
+            spacing: 10
+
+            Item {
+              Layout.fillWidth: true
+              Layout.fillHeight: true
+              Layout.minimumHeight: 200
+
+              Rectangle {
+                id: artFrame
+                anchors.centerIn: parent
+                width: Math.min(parent.width, parent.height)
+                height: width
+                radius: 6
+                color: Qt.rgba(c.text.r, c.text.g, c.text.b, 0.05)
+                border.color: c.line
+                clip: true
+
+                // The cover the YouTube Music API returned. `asynchronous` so
+                // a slow CDN cannot block the whole page's paint, and
+                // `cache: false` because Quickshell's disk cache holds a
+                // stale thumbnail across track changes otherwise.
+                Image {
+                  id: coverArt
+                  anchors.fill: parent
+                  asynchronous: true
+                  cache: false
+                  fillMode: Image.PreserveAspectCrop
+                  source: shell.musicArt
+                  opacity: status === Image.Ready ? 1 : 0
+                  Behavior on opacity { NumberAnimation { duration: 260 } }
+                }
+
+                // Shown only while there is no art to show, so the square is
+                // never an empty grey box with nothing in it.
+                Text {
+                  anchors.centerIn: parent
+                  visible: !coverArt.visible || coverArt.status === Image.Error
+                  text: "\u266b"
+                  color: Qt.rgba(c.chromeDim.r, c.chromeDim.g, c.chromeDim.b, 0.5)
+                  font.pixelSize: 46
+                }
+              }
+
+              // The spectrum. Bar lengths are a function of the playhead, so
+              // it reads the track rather than animating on its own clock.
+              Visualiser_ {
+                id: visualiser
+                anchors.fill: parent
+                visible: shell.music !== null
+                progress: shell.musicProgress
+                playing: shell.musicNow.state === "playing"
+                paused: shell.musicNow.state === "paused"
+              }
+            }
+
+            // The one-line identity under the art, so the art is never the
+            // only way to know what is playing.
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: 2
+              visible: shell.music !== null
+              Text {
+                Layout.fillWidth: true
+                text: String(shell.music ? shell.music.now.title : "")
+                color: c.text
+                font.family: c.mono; font.pixelSize: 13; font.bold: true
+                elide: Text.ElideRight
+              }
+              Text {
+                Layout.fillWidth: true
+                text: String(shell.music ? (shell.music.now.artist || "") : "")
+                visible: text.length > 0
+                color: c.muted
+                font.family: c.mono; font.pixelSize: 11
+                elide: Text.ElideRight
+              }
+            }
           }
 
           ColumnLayout {
             Layout.fillWidth: true
-            spacing: 8
+            Layout.fillHeight: true
+            spacing: 10
 
             // --- the current track, or the field that starts one
             RowLayout {
@@ -818,26 +991,105 @@ ShellRoot {
               }
             }
 
-            // --- progress. Hidden until the player knows how long the track
-            // is: a bar that fills from 0 to 0 forever reads as broken.
+            // --- the current track, stated rather than illustrated
             RowLayout {
               Layout.fillWidth: true
               spacing: 8
+              visible: shell.music !== null
+              Text {
+                text: "\u266b"
+                color: c.magenta; font.pixelSize: 15
+              }
+              Text {
+                Layout.fillWidth: true
+                text: String(shell.music ? shell.music.now.title : "")
+                color: c.text
+                font.family: c.mono; font.pixelSize: 15; font.bold: true
+                elide: Text.ElideRight
+              }
+              Text {
+                text: String(shell.music ? (shell.music.now.artist || "") : "")
+                visible: text.length > 0
+                color: c.muted
+                font.family: c.mono; font.pixelSize: 12
+                elide: Text.ElideRight
+                Layout.maximumWidth: 260
+              }
+              Text {
+                text: shell.musicNow.state === "paused" ? "PAUSED" : ""
+                visible: shell.musicNow.state === "paused"
+                color: c.amber
+                font.family: c.mono; font.pixelSize: 9; font.bold: true
+              }
+              Text {
+                text: String(shell.music ? (shell.music.controllable ? "" : "REPORTED \u00b7 NOT ARC") : "")
+                visible: shell.music !== null && !shell.music.controllable
+                color: c.amber
+                font.family: c.mono; font.pixelSize: 9; font.bold: true
+              }
+            }
+
+            // --- progress. Hidden until the player knows how long the track
+            // is: a bar that fills from 0 to 0 forever reads as broken.
+            //
+            // Clickable, because a progress bar you can only look at is the
+            // one control every other player has and this one did not. The
+            // hover handle is the only affordance: it appears where the
+            // pointer is, so the gesture is discoverable without a label.
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: 10
               visible: shell.music !== null && shell.duration > 0
               Text {
                 text: shell.mmss(shell.position)
                 color: c.muted; font.family: c.mono; font.pixelSize: 10
               }
-              Rectangle {
+              Item {
+                id: seekBar
                 Layout.fillWidth: true
-                height: 4
-                radius: 2
-                color: Qt.rgba(c.text.r, c.text.g, c.text.b, 0.12)
+                height: 18
+                // Click-to-seek only when Arc is the one playing: a track
+                // Arc merely reported cannot be scrubbed, and offering the
+                // gesture would be offering a button that cannot work.
+                enabled: shell.music !== null && shell.music.controllable && shell.duration > 0
+                // The cursor goes on the MouseArea, not here: a bare Item has
+                // no `cursorShape` property, and assigning to a missing one is
+                // a load-time warning that the seek bar then quietly loses.
+                readonly property bool seekable: enabled
+                readonly property real hoverX: seekMa.mouseX < 0 ? -1
+                  : Math.max(0, Math.min(width, seekMa.mouseX))
                 Rectangle {
-                  width: Math.max(0, parent.width * shell.musicProgress)
-                  height: parent.height
-                  radius: 2
-                  color: shell.musicNow.state === "paused" ? c.amber : c.magenta
+                  anchors.verticalCenter: parent.verticalCenter
+                  x: 0; width: parent.width; height: 5; radius: 2.5
+                  color: Qt.rgba(c.text.r, c.text.g, c.text.b, 0.12)
+                  Rectangle {
+                    width: Math.max(0, seekBar.width * shell.musicProgress)
+                    height: parent.height; radius: 2.5
+                    color: shell.musicNow.state === "paused" ? c.amber : c.magenta
+                  }
+                  // Hover marker, plus a wider hit area than it looks.
+                  Rectangle {
+                    visible: seekBar.hoverX >= 0
+                    x: seekBar.hoverX - width / 2
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 3; height: parent.height + 8; radius: 1.5
+                    color: c.text
+                  }
+                }
+                MouseArea {
+                  id: seekMa
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  enabled: seekBar.seekable
+                  cursorShape: seekBar.seekable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  // The x of the press, not the current position: clicking
+                  // seeks to where you clicked even if the poll has not run
+                  // since the last tick.
+                  onClicked: function(mouse) {
+                    if (!seekBar.seekable || seekBar.width <= 0) return
+                    var frac = Math.max(0, Math.min(1, mouse.x / seekBar.width))
+                    shell.musicSeek(frac * shell.duration)
+                  }
                 }
               }
               Text {
@@ -846,28 +1098,50 @@ ShellRoot {
               }
             }
 
-            // --- transport
+            // --- transport: every action Arc can take on the player.
+            //
+            // Pause and resume are one button rather than two, because the
+            // state decides the glyph and a disabled-looking pair of separate
+            // buttons for one action is a control that looks broken half the
+            // time. Everything else is its own button, disabled with a
+            // tooltip saying why rather than silently inert.
             RowLayout {
               Layout.fillWidth: true
               spacing: 6
               visible: shell.music !== null
               enabled: shell.music !== null && shell.music.controllable
               Transport_ {
-                glyph: "\u23ee"; tip: "previous track"
+                glyph: "\u23ee"; tip: "previous \u00b7 restart, or the one before"
                 onClicked: shell.musicPrev()
               }
               Transport_ {
                 glyph: shell.musicNow.state === "paused" ? "\u25b6" : "\u23f8"
                 tip: shell.musicNow.state === "paused" ? "resume" : "pause"
                 active: shell.musicNow.state === "paused"
+                // Bigger than its neighbours: play/pause is the one control
+                // pressed without looking.
+                scale: 1.25
                 onClicked: shell.musicToggle()
               }
               Transport_ {
-                glyph: "\u23ed"; tip: "next track"
+                glyph: "\u23ed"
+                tip: shell.musicQueue.length > 0
+                  ? "next \u00b7 " + shell.musicQueue.length + " queued"
+                  : "next \u00b7 nothing queued"
                 enabled: shell.musicQueue.length > 0
                 onClicked: shell.musicNext()
               }
-              Transport_ { glyph: "\u2715"; tip: "stop"; tint: c.red; onClicked: shell.musicStop() }
+              Transport_ { glyph: "\u2715"; tip: "stop and empty the queue"; tint: c.red; onClicked: shell.musicStop() }
+              Rectangle { width: 1; height: 20; Layout.alignment: Qt.AlignVCenter; color: c.line }
+              Button_ {
+                label: "CLEAR QUEUE"
+                tint: c.magenta
+                // Disabled, not hidden: a queue that cannot be cleared is a
+                // state the user should be able to see is a state.
+                enabled: shell.musicQueue.length > 0
+                opacity: enabled ? 1 : 0.35
+                onClicked: shell.musicClearQueue()
+              }
               Item { Layout.fillWidth: true }
               // The refusal, not a silent no-op. It has to be visible here:
               // these buttons do nothing when there is nothing queued, and a
@@ -881,29 +1155,28 @@ ShellRoot {
                 font.family: c.mono; font.pixelSize: 10
                 elide: Text.ElideRight
               }
-              Button_ {
-                label: "CLEAR QUEUE"
-                visible: shell.musicQueue.length > 0
-                onClicked: shell.musicClearQueue()
-              }
             }
 
             // --- what is coming
             ListView {
               id: queueList
               Layout.fillWidth: true
-              Layout.preferredHeight: Math.min(visibleCount, 5) * 24 + (visibleCount > 0 ? 6 : 0)
+              // Fills whatever the page has left rather than a fixed five
+              // rows: on the media tab the queue is the main event, and
+              // capping it at five made a long queue need scrolling to see
+              // the fifth thing.
+              Layout.fillHeight: true
+              Layout.minimumHeight: 60
               visible: count > 0
               clip: true
               spacing: 2
               model: shell.musicQueue
               ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-              readonly property int visibleCount: Math.min(count, 5)
               delegate: Rectangle {
                 required property int index
                 required property var modelData
                 width: queueList.width - 6
-                height: 22
+                height: 28
                 radius: 3
                 color: rowMa.containsMouse ? c.panelHi : "transparent"
                 MouseArea {
@@ -950,72 +1223,165 @@ ShellRoot {
             }
           }
 
-          // --- add to the queue
+          // --- search and actions
+          //
+          // Its own column because it is the only part of the page that is
+          // about *starting* something rather than about what is playing.
           ColumnLayout {
-            Layout.preferredWidth: Math.max(260, win.width * 0.22)
-            spacing: 6
+            Layout.preferredWidth: Math.max(300, win.width * 0.26)
+            Layout.fillHeight: true
+            spacing: 8
+
             Field {
               id: musicQuery
               Layout.fillWidth: true
-              placeholder: "add to the queue \u2014 artist, track, anything"
+              placeholder: "search YouTube Music \u2014 artist, track, anything"
               onAccepted: function(t) { shell.musicAdd(t); clear() }
             }
             RowLayout {
               Layout.fillWidth: true
               spacing: 6
-              Button_ {
-                label: "ADD"
-                onClicked: { shell.musicAdd(musicQuery.value); musicQuery.clear() }
-              }
+              // Play replaces the queue; add does not. Both are here because
+              // they are different intentions and guessing is how you lose a
+              // queue you cared about.
               Button_ {
                 label: "PLAY NOW"
+                tint: c.magenta
                 onClicked: {
                   var q = musicQuery.value.trim()
                   if (!q.length) return
-                  // Play replaces the queue; enqueue does not. Both are here
-                  // because they are different intentions and guessing is how
-                  // you lose a queue.
                   shell.musicAction_(["play", q])
                   musicQuery.clear()
                 }
               }
-              Item { Layout.fillWidth: true }
-              Text {
-                text: "queue \u00b7 " + shell.musicQueue.length
-                visible: shell.music !== null
-                color: c.chromeDim
-                font.family: c.mono; font.pixelSize: 10
+              Button_ {
+                label: "ADD TO QUEUE"
+                onClicked: { shell.musicAdd(musicQuery.value); musicQuery.clear() }
               }
+              Item { Layout.fillWidth: true }
+            }
+
+            Rectangle { Layout.fillWidth: true; height: 1; color: c.line }
+
+            // Everything Arc can do to the player, in one list. Buttons above
+            // are the fast path; this is the part you read when you want to
+            // know what the controls do, and it is where a refusal from the
+            // daemon is reported rather than silently swallowed.
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: 4
+              Text {
+                text: "ACTIONS"
+                color: c.chrome; font.family: c.mono; font.pixelSize: 10
+                font.bold: true; font.letterSpacing: 2
+              }
+              Repeater {
+                model: [
+                  { cmd: ["toggle"],      label: "Play / pause",        glyph: "\u23f8" },
+                  { cmd: ["previous"],    label: "Previous track",      glyph: "\u23ee" },
+                  { cmd: ["next"],        label: "Next track",          glyph: "\u23ed" },
+                  { cmd: ["stop"],        label: "Stop and empty queue",glyph: "\u2715", danger: true },
+                  { cmd: ["clear"],       label: "Clear upcoming only", glyph: "\u2327" },
+                  { cmd: ["remove", "0"], label: "Remove next queued",  glyph: "\u2717" }
+                ]
+                delegate: Rectangle {
+                  id: act
+                  required property var modelData
+                  readonly property bool usable: act.modelData.cmd[0] === "next" || act.modelData.cmd[0] === "clear" || act.modelData.cmd[0] === "remove"
+                    ? shell.musicQueue.length > 0
+                    : shell.music !== null
+                  width: parent ? parent.width : 0
+                  height: 26
+                  radius: 3
+                  color: actMa.containsMouse && act.usable ? c.panelHi : "transparent"
+                  // Every action is listed even when it cannot run right now,
+                  // greyed with its reason, because an action list that
+                  // changes shape as the queue empties is one you cannot read.
+                  opacity: act.usable ? 1 : 0.35
+                  RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 8; anchors.rightMargin: 8
+                    spacing: 8
+                    Text {
+                      text: act.modelData.glyph
+                      color: act.modelData.danger ? c.red : c.chrome
+                      font.pixelSize: 11
+                    }
+                    Text {
+                      Layout.fillWidth: true
+                      text: act.modelData.label
+                      color: c.text
+                      font.family: c.mono; font.pixelSize: 11
+                      elide: Text.ElideRight
+                    }
+                    Text {
+                      visible: act.usable
+                      text: "run"
+                      color: c.chromeDim
+                      font.family: c.mono; font.pixelSize: 9
+                    }
+                  }
+                  MouseArea {
+                    id: actMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    // Disabled rather than hidden, and the cursor says so:
+                    // a row that greys out but still takes the click and
+                    // refuses is a control that feels broken.
+                    enabled: act.usable
+                    cursorShape: act.usable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: shell.musicAction_(act.modelData.cmd)
+                  }
+                }
+              }
+            }
+
+            Item { Layout.fillHeight: true }
+
+            // The daemon's refusal. Shown here as well as by the transport:
+            // "next" with nothing queued says so rather than doing nothing,
+            // which is the difference between a button that is broken and one
+            // that was pressed at a moment when it had no work.
+            Rectangle {
+              Layout.fillWidth: true
+              visible: shell.musicNote !== ""
+              implicitHeight: noteText.implicitHeight + 16
+              radius: 3
+              color: Qt.rgba(c.amber.r, c.amber.g, c.amber.b, 0.10)
+              border.color: c.amber
+              Text {
+                id: noteText
+                x: 8; y: 8; width: parent.width - 16
+                text: shell.musicNote
+                color: c.amber
+                font.family: c.mono; font.pixelSize: 10
+                wrapMode: Text.Wrap
+              }
+            }
+
+            Text {
+              Layout.fillWidth: true
+              text: "queue \u00b7 " + shell.musicQueue.length + (shell.musicQueue.length > 0 ? " waiting" : "")
+                + "\nresolved through the YouTube Music API"
+              color: c.chromeDim
+              font.family: c.mono; font.pixelSize: 10
+              wrapMode: Text.Wrap
             }
           }
         }
 
-        // Collapse control, in the corner of the section. Closing it does not
-        // stop the music -- it only stops drawing it and stops the playhead
-        // poll, which is the whole reason the poll is gated on this.
-        MouseArea {
-          id: collapseMa
-          anchors.right: parent.right
-          anchors.top: parent.top
-          width: 22
-          height: 22
-          hoverEnabled: true
-          cursorShape: Qt.PointingHandCursor
-          onClicked: { shell.musicOpen = false }
-          Text {
-            anchors.centerIn: parent
-            text: "\u2301"
-            color: collapseMa.containsMouse ? c.text : c.chromeDim
-            font.pixelSize: 12
-          }
-        }
       }
 
       // ---------------------------------------------------- panes
+      //
+      // Only on the chat page. The media page above owns the same slot, so
+      // the two swap rather than stack -- the point of the tab is that the
+      // player gets the whole window when you want the player.
       RowLayout {
         Layout.fillWidth: true
         Layout.fillHeight: true
         spacing: 12
+        visible: !shell.mediaTab
 
         // ============ TOOLS
         Pane_ {
@@ -1315,6 +1681,234 @@ ShellRoot {
   }
 
   // ------------------------------------------------------------ components
+  // The bubble: a soft blob that moves and wobbles with the song.
+  //
+  // Drawn on a canvas rather than animated with Rectangle items. A wobbling
+  // circle built from scaled rectangles looks like a rounded rectangle being
+  // resized, and fifty of them per frame is fifty items to lay out; one
+  // canvas path is one item and one repaint.
+  //
+  // What makes it *move with the song* rather than just move: every term in
+  // the shape and every term in the path is a function of `progress`, the
+  // playhead as a fraction of the track. The blob's size, its wobble phase
+  // and where it drifts along its arc are all driven by that, so the same
+  // moment in a track always draws the same bubble, seeking there jumps it,
+  // and two tracks do not look alike. `phase` adds a free-running wobble on
+  // top so it breathes even while paused on the same second.
+// The visualiser: a circular audio spectrum, fixed in one spot.
+  //
+  // A circle of thin radial bars in three concentric bands, radiating from a
+  // small solid hub, with one continuous ring at the rim. It is a *spectrum*,
+  // not a blob: the silhouette is always circular, the hub never moves, and
+  // only the bar lengths change.
+  //
+  // What was tried and was wrong: a wobbling outline whose radius varied by
+  // angle, drifting around an arc. At a low lobe count that reads as a
+  // deformed egg, not a circle -- the vision check scored the first version at
+  // 40/100 circular for exactly this reason. So the shape is now built from
+  // bars around a fixed circle rather than from a single wandering outline.
+  //
+  // Drawn on one canvas: ~400 line segments per frame is one item and one
+  // repaint, where the same thing as items would be hundreds of them.
+// The visualiser: a circular audio spectrum, fixed in one spot.
+  //
+  // A circle of thin radial bars in three concentric bands, radiating from a
+  // small solid hub, with one continuous ring at the rim. It is a *spectrum*,
+  // not a blob: the silhouette is always circular, the hub never moves, and
+  // only the bar lengths change.
+  //
+  // What was tried and was wrong: a wobbling outline whose radius varied by
+  // angle, drifting around an arc. At a low lobe count that reads as a
+  // deformed egg, not a circle.
+  //
+  // Plain Rectangles, not a Canvas. Canvas is the obvious choice for ~288
+  // radial segments and it does not work here: `Canvas.onPaint` never fires in
+  // this Quickshell -- a probe with a bare Canvas and an explicit
+  // requestPaint() reported 0 paints and logged no error, so the canvas would
+  // have rendered once and silently sat there showing a blank rectangle. That
+  // is the worst possible failure for this component, because a blank square
+  // looks like a design choice. Rectangles are ~288 items at 60fps, which is
+  // nothing, and they actually paint.
+  component Visualiser_: Item {
+    id: vis
+    property real progress: 0     // 0..1 through the track
+    property bool playing: false
+    property bool paused: false
+
+    // The centre never moves. Every dimension below is a fraction of this, so
+    // the burst scales with its box and stays put inside it.
+    readonly property real cx: width / 2
+    readonly property real cy: height / 2
+    readonly property real size: Math.min(width, height)
+    readonly property real hub: size * 0.10
+    readonly property real inner: size * 0.20
+    readonly property real outer: size * 0.46
+
+    readonly property int bars: 96
+    readonly property int rings: 3
+
+    // Band radii: three concentric bands between `inner` and `outer`.
+    readonly property var bandInner: [0, 1, 2].map(function (i) {
+      return inner + (outer - inner) * (i / rings)
+    })
+    readonly property var bandLen: [0, 1, 2].map(function (i) {
+      return (outer - inner) / rings
+    })
+
+    // Bar length at one angle, -1..1.
+    //
+    // Summed sines over (angle, ring) rather than per-bar noise, so adjacent
+    // bars agree and the result has the lobed structure of a real spectrum
+    // instead of looking like static. The ring term offsets the bands so they
+    // are not three copies of one silhouette.
+    //
+    // Coprime lobe counts and differing phase rates are load-bearing. Two terms
+    // at the same rate hold their relationship for the whole track, which reads
+    // as one shape pulsing rather than a spectrum changing -- measured at
+    // "bars barely move" before this was fixed.
+    function spectrumAt(angle, ring) {
+      var t = vis.progress
+      return Math.sin(angle * 2 + t * Math.PI * 2 + ring * 0.9) * 0.42
+           + Math.sin(angle * 3 - t * Math.PI * 3.7 + ring * 1.7) * 0.30
+           + Math.sin(angle * 5 + t * Math.PI * 5.3 + ring * 2.3) * 0.18
+           + Math.sin(angle * 7 - t * Math.PI * 8.9 + ring * 3.1) * 0.10
+    }
+
+    // Bar length as a fraction of its band, 0.12..1.
+    //
+    // The 2.2 power expands the middle of the range. A linear map leaves most
+    // bars within a few percent of the mean, which reads as a static ring even
+    // though every bar technically changed. The floor of 0.12 stops any bar
+    // collapsing to nothing: a spectrum with gaps in it looks broken, not quiet.
+    function levelAt(angle, ring) {
+      var l = 0.12 + 0.88 * Math.pow(vis.spectrumAt(angle, ring) * 0.5 + 0.5, 2.2)
+      return vis.paused ? 0.12 + 0.88 * 0.35 * l : l
+    }
+
+    // Cool at the hub, hot at the rim: brightness grows outward so the edge of
+    // the burst is the hottest part of it.
+    function rampAt(depth) {
+      var u = Math.max(0, Math.min(1, (depth - 0.4) / 0.6))
+      if (vis.paused) return Qt.rgba(c.chromeDim.r, c.chromeDim.g, c.chromeDim.b, 0.5)
+      if (depth < 0.4)
+        return Qt.rgba(0.59, 0.75, 1.0, 0.55 + 0.35 * (depth / 0.4))
+      return Qt.rgba(0.78 + 0.22 * u, 0.51 - 0.26 * u, 0.90 - 0.29 * u, 0.55 + 0.40 * u)
+    }
+
+    // --- the bars
+    //
+    // One Repeater over bars * rings rather than a Repeater per ring, so the
+    // whole spectrum is a single flat list: `index` divides into band and
+    // spoke, and the binding engine sees one model rather than three nested
+    // ones.
+    Repeater {
+      model: vis.bars * vis.rings
+      // A wrapper Item positioned AT the centre with its origin at its own
+      // top-left, so rotating it pivots about the centre. The bar inside then
+      // hangs off the top edge, extending outward along -y.
+      //
+      // Both halves of this are load-bearing, and both were wrong first:
+      //
+      //  - Rotating the bar directly pivots about the *bar's* origin, not the
+      //    centre, so each bar swings in place and all 96 stack at 12 o'clock.
+      //    That is what the first screenshot showed: one vertical chain of bars
+      //    at the top of an otherwise empty ring.
+      //  - Anchoring the bar's own inner end at r0 fails the same way by
+      //    another route -- every inner end lands on the same point, so there
+      //    is nothing for the rotation to sweep.
+      //
+      // A Rectangle, not an Item: the bar needs `color`, and an Item silently
+      // drops the assignment, leaving nothing drawn but a load-time warning.
+      delegate: Item {
+        id: sp
+        required property int index
+        readonly property int ring: Math.floor(index / vis.bars)
+        readonly property int spoke: index % vis.bars
+        readonly property real a: (spoke / vis.bars) * Math.PI * 2
+        readonly property real bandLen: vis.bandLen[ring]
+        // Inset from the band edge so a bar never bleeds into the next band.
+        readonly property real r0: vis.bandInner[ring] + bandLen * 0.06
+        // Animated so the spectrum moves smoothly between 1 Hz playhead
+        // updates rather than stepping. The duration is shorter than the poll
+        // interval on purpose: a bar should finish its move well before the
+        // next one starts, or the animation lags the playhead visibly.
+        readonly property real length:
+          r0 + (bandLen * 0.94) * vis.levelAt(a, ring)
+
+        width: 0
+        height: 0
+        x: vis.cx
+        y: vis.cy
+        transformOrigin: Item.TopLeft
+        rotation: sp.a * 180 / Math.PI
+
+        Rectangle {
+          // -length to -r0, so the bar spans radii r0..length and grows
+          // outward from the centre.
+          x: -width / 2
+          y: -sp.length
+          width: vis.size * 0.02
+          height: Math.max(1, sp.length - sp.r0)
+          color: vis.rampAt((sp.ring + vis.levelAt(sp.a, sp.ring)) / (vis.rings + 1))
+          Behavior on height {
+            NumberAnimation { duration: 220; easing.type: Easing.OutQuad }
+          }
+          Behavior on color {
+            ColorAnimation { duration: 220 }
+          }
+        }
+      }
+    }
+
+    // --- the resting rim and band guides
+    //
+    // The continuous ring at the outer edge is the fixed silhouette: every bar
+    // moves, and this does not, so the burst reads as one object rather than a
+    // cloud of loose spokes.
+    Repeater {
+      model: vis.rings + 1
+      delegate: Rectangle {
+        required property int index
+        // The outermost ring is the rim and is drawn brighter and thicker; the
+        // inner ones are faint guides, structure the bars are built on.
+        readonly property real r: vis.inner + (vis.outer - vis.inner) * (index / vis.rings)
+        readonly property bool isRim: index === vis.rings
+        width: r * 2
+        height: r * 2
+        x: vis.cx - r
+        y: vis.cy - r
+        radius: r
+        color: "transparent"
+        border.width: isRim ? Math.max(1.5, vis.size * 0.016) : 1
+        border.color: isRim
+          ? Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, vis.paused ? 0.45 : 0.9)
+          : Qt.rgba(c.chrome.r, c.chrome.g, c.chrome.b, 0.16)
+      }
+    }
+
+    // --- the hub
+    //
+    // A solid core with a halo, so the burst has a centre of gravity. Without
+    // one the spokes read as floating debris.
+    Rectangle {
+      width: vis.hub * 2
+      height: vis.hub * 2
+      x: vis.cx - vis.hub
+      y: vis.cy - vis.hub
+      radius: vis.hub
+      color: Qt.rgba(0.98, 0.94, 1.0, vis.paused ? 0.4 : 0.95)
+    }
+    Rectangle {
+      width: vis.hub * 3.2
+      height: vis.hub * 3.2
+      x: vis.cx - vis.hub * 1.6
+      y: vis.cy - vis.hub * 1.6
+      radius: vis.hub * 1.6
+      color: "transparent"
+      border.width: 1
+      border.color: Qt.rgba(c.magenta.r, c.magenta.g, c.magenta.b, 0.35)
+    }
+  }
   component Pane_: Rectangle {
     id: pane
     property string title: ""

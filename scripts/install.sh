@@ -49,9 +49,14 @@ fi
 step "Installing files"
 install -Dm755 "$root/target/$profile/arcd" "$bin/arcd"
 install -Dm755 "$root/target/$profile/arc" "$bin/arc"
-rm -rf "$data/python/arc_voice"
+rm -rf "$data/python/arc_voice" "$data/python/arc_music"
 mkdir -p "$data/python"
 cp -r "$root/python/arc_voice" "$data/python/arc_voice"
+# The music resolver. Without ytmusicapi in this venv the daemon falls back to
+# a plain yt-dlp search, so this is installed rather than assumed -- but it is
+# the difference between "play aphex twin" finding the studio track with cover
+# art and finding a 40-minute mix, so it is a real step and not a nicety.
+cp -r "$root/python/arc_music" "$data/python/arc_music"
 find "$data/python" -name __pycache__ -prune -exec rm -rf {} +
 install -Dm644 "$root/README.md" "$data/README.md" 2>/dev/null || true
 
@@ -62,10 +67,28 @@ if [[ ! -f $conf/config.toml ]]; then
 else
     echo "   kept existing $conf/config.toml"
 fi
+# The API resolver runs in the venv, because that is where ytmusicapi is
+# installed. Written on every install rather than only at creation: the venv
+# path is not something a hand-edited config should be able to drift from.
+if grep -q '^\[music\]' "$conf/config.toml"; then
+    sed -i "s|^python = .*|python = \"$data/venv/bin/python\"|" "$conf/config.toml"
+fi
 [[ -f $conf/secrets.env ]] && chmod 600 "$conf/secrets.env"
 
 install -Dm644 "$root/systemd/arcd.service" "$units/arcd.service"
 install -Dm644 "$root/systemd/hermes-proxy.service" "$units/hermes-proxy.service"
+
+step "Installing the music resolver's dependency"
+# The venv has no pip of its own, so uv does the install when it is available.
+if command -v uv >/dev/null; then
+    uv pip install --python "$data/venv/bin/python" "ytmusicapi>=1.8" >/dev/null \
+        || echo "   could not install ytmusicapi; music falls back to a yt-dlp search"
+    "$data/venv/bin/python" -c 'import ytmusicapi' 2>/dev/null \
+        && echo "   ytmusicapi ready" \
+        || echo "   ytmusicapi NOT available -- Arc will use the yt-dlp search"
+else
+    echo "   uv not found; skipping ytmusicapi (music will use the yt-dlp search)"
+fi
 
 step "Starting services"
 systemctl --user daemon-reload

@@ -191,8 +191,20 @@ run_budget_s = 0
 # a player started in the background and forgotten has no handle.
 enabled = true
 player = "mpv"
-# Turns a search string into a stream url plus a real title and artist, so the
-# overlay shows "Windowlicker - Aphex Twin" rather than your own words back.
+# Which search answers "play aphex twin windowlicker":
+#   ytmusic  YouTube Music's own API, through the arc_music Python module.
+#            Songs-only search, so it returns the studio track rather than a
+#            live cover or a 40-minute mix, and it comes with album and
+#            cover art. Falls back to yt-dlp if the module is missing.
+#   yt-dlp   A plain search of all of YouTube. Worse answers, no artwork,
+#            but no Python dependency. Use this if the module will not install.
+search = "ytmusic"
+# The interpreter that runs the arc_music module. Needs ytmusicapi installed
+# (scripts/install.sh does it). Point this at a different interpreter to use a
+# different environment.
+python = "python3"
+# The yt-dlp binary. Both backends need it: the API resolver gets a video id
+# from the search and still has to turn it into a playable stream.
 resolver = "yt-dlp"
 # A resolution that has not answered in this long is called failed rather than
 # left holding the request open.

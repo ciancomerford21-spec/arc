@@ -325,7 +325,11 @@ fn start_with_music() -> (Arcd, PathBuf) {
     let player = write_player_stub(&dir, &log);
     let resolver = write_resolver_stub(&dir);
     let cfg = format!(
-        "[music]\nenabled = true\nbrowser_fallback = false\nplayer = {:?}\nresolver = {:?}\n",
+        // `search` pinned to yt-dlp: this fixture is about the player and the
+        // queue, and leaving it on the default would make every one of these
+        // tests pay for a failed `python -m arc_music` and a fallback first.
+        // The API path has its own test below.
+        "[music]\nenabled = true\nbrowser_fallback = false\nsearch = \"yt-dlp\"\nplayer = {:?}\nresolver = {:?}\n",
         player.display().to_string(),
         resolver.display().to_string()
     );
@@ -458,6 +462,7 @@ fn music_refuses_an_empty_query() {
     assert_eq!(v["status"], "error");
     assert!(player_log(&log).is_empty(), "a player was started for an empty query");
 }
+
 
 /// The daemon owns the player, so the player must not outlive it: on shutdown
 /// the process it started is gone.

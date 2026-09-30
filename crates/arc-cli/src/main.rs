@@ -508,9 +508,27 @@ fn main() -> Result<()> {
                         })?;
                     json!({"type": "music", "op": "remove", "index": index})
                 }
+                "seek" => {
+                    // Parsed from the one positional, like `remove`, and
+                    // rejected loudly rather than passed on as NaN: `seek`
+                    // with no argument used to be a silent no-op waiting to
+                    // happen if it had defaulted to 0.
+                    let secs = arg
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .and_then(|a| a.parse::<f64>().ok())
+                        .filter(|s| s.is_finite() && *s >= 0.0)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "`arc music seek` needs a position in seconds: `arc music seek 90`"
+                            )
+                        })?;
+                    json!({"type": "music", "op": "seek", "seconds": secs})
+                }
                 other => bail!(
                     "unknown music action `{other}` (show, position, play, enqueue, pause, \
-                     resume, toggle, next, previous, stop, clear, remove)"
+                     resume, toggle, next, previous, seek, stop, clear, remove)"
                 ),
             };
             // Reading must work without the daemon: a widget asking "what is

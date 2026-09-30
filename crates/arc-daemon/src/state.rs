@@ -903,6 +903,22 @@ impl Daemon {
                 let status = self.music_from_queue(NowPlayingState::Playing);
                 return Ok(self.publish_music(status));
             }
+            MusicRequest::Seek { seconds } => {
+                self.require_playing()?;
+                // NaN and the infinities arrive from a UI that divided by a
+                // zero-width progress bar. Refusing them here is better than
+                // passing them to the player, which would either clamp them
+                // to 0 or seek somewhere absurd.
+                if !seconds.is_finite() {
+                    return Err("that is not a position in a track".into());
+                }
+                self.player.seek(seconds)?;
+                // The position is not re-read here: the player seeks
+                // asynchronously and reading it back immediately would report
+                // the old one. The 1 Hz poll publishes the truth, and the UI
+                // already ticks on it.
+                return Ok(self.music_status());
+            }
         }
     }
 
@@ -1887,6 +1903,13 @@ mod tests {
         }
         fn set_paused(&self, p: bool) -> Result<(), String> {
             self.note(format!("pause {p}"))
+        }
+        fn seek(&self, seconds: f64) -> Result<(), String> {
+            // Recorded as a note rather than applied to `progress`: the real
+            // player seeks asynchronously, so a stub that moved the playhead
+            // here would make the seek tests pass against a player that does
+            // not behave that way.
+            self.note(format!("seek {seconds}"))
         }
         fn progress(&self) -> Result<music::Progress, String> {
             Ok(*self.progress.lock().unwrap())

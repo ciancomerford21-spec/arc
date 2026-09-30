@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_proto::Track;
@@ -443,7 +443,7 @@ impl Resolver for YtDlp {
             buf
         });
         let mut err = String::new();
-        let status = self.wait(&mut child, &mut err);
+        let status = wait_for(&mut child, self.timeout, &mut err);
         let out = reader.join().unwrap_or_default();
 
         if !status {
@@ -458,35 +458,6 @@ impl Resolver for YtDlp {
             return Err(format!("no playable result for {query:?}"));
         }
         Ok(tracks)
-    }
-}
-
-impl YtDlp {
-    /// Wait for the child, killing it at the deadline. Returns whether it
-    /// exited on its own.
-    fn wait(&self, child: &mut Child, err: &mut String) -> bool {
-        let deadline = Instant::now() + self.timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(st)) => {
-                    if !st.success()
-                        && let Some(mut e) = child.stderr.take()
-                    {
-                        use std::io::Read;
-                        let _ = e.read_to_string(err);
-                    }
-                    return st.success();
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-            }
-        }
     }
 }
 
@@ -532,6 +503,180 @@ pub fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// YouTube Music API resolver
+// ---------------------------------------------------------------------------
+
+/// The YouTube Music API, through the `arc_music` Python module.
+///
+/// This exists because yt-dlp answers the wrong question. `yt-dlp` searches
+/// all of YouTube, so "play aphex twin windowlicker" can come back with a
+/// live cover, a 40-minute mix or a reaction video, and it carries no album
+/// and no artwork. YouTube Music's own search is songs-only and returns the
+/// studio track with its cover, which is why the media UI can show art and
+/// an album at all.
+///
+/// What the API cannot do is hand back anything playable: a search result is
+/// a video id. So the Python side does the search and passes each id to
+/// yt-dlp for the stream, and this struct owns the boundary -- it runs the
+/// module, parses its JSON lines, and hands [`Track`]s to the queue.
+///
+/// A subprocess rather than a Rust client on purpose. The API's request
+/// signing changes without notice; `ytmusicapi` tracks that, and reimplementing
+/// it here would mean Arc breaks the week YouTube rotates a key.
+#[derive(Debug)]
+pub struct YtMusicApi {
+    python: String,
+    module: String,
+    timeout: Duration,
+    source: String,
+}
+
+impl YtMusicApi {
+    pub fn new(cfg: &arc_config::Music) -> Self {
+        Self {
+            python: cfg.python.clone(),
+            module: "arc_music".into(),
+            timeout: Duration::from_secs(cfg.resolve_timeout_s.max(1) * 2),
+            source: "youtube music".into(),
+        }
+    }
+}
+
+/// Parse the module's output: one JSON object per line.
+///
+/// Line-oriented rather than one JSON array, so a long search streams its
+/// results out as it resolves them and the daemon can take the first. A line
+/// that does not parse is skipped, not fatal -- a truncated final line from a
+/// killed child should not discard the tracks that already arrived.
+fn parse_api_results(out: &str, source: &str) -> Vec<Track> {
+    out.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('{') {
+                return None;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else { return None };
+            let title = v.get("title").and_then(Value::as_str).unwrap_or("");
+            let artist = v.get("artist").and_then(Value::as_str).unwrap_or("");
+            let url = v.get("url").and_then(Value::as_str).unwrap_or("");
+            // `Track::new` refuses a blank title but happily accepts a blank
+            // url, so the check has to be here: a track with no stream is
+            // queued, reached, and then plays nothing -- an entry in the UI
+            // that cannot be silenced by any control on it.
+            if url.trim().is_empty() {
+                return None;
+            }
+            Track::new(title, artist, source, url).ok()
+        })
+        .collect()
+}
+
+impl Resolver for YtMusicApi {
+    fn resolve(&self, query: &str, count: usize) -> Result<Vec<Track>, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("nothing to search for".into());
+        }
+        let mut child = Command::new(&self.python)
+            .args(["-m", &self.module, "search", query, "--count", &count.clamp(1, 20).to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run {}: {e}", self.python))?;
+
+        let stdout = child.stdout.take();
+        let reader = std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut o) = stdout {
+                use std::io::Read;
+                let _ = o.read_to_string(&mut buf);
+            }
+            buf
+        });
+
+        let mut err = String::new();
+        let ok = wait_for(&mut child, self.timeout, &mut err);
+        let out = reader.join().unwrap_or_default();
+        if !ok {
+            // The module's own message is the useful one: it knows whether it
+            // is missing, unauthenticated, or just found nothing.
+            return Err(err.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("the YouTube Music resolver did not answer in time").chars().take(200).collect());
+        }
+        let tracks = parse_api_results(&out, &self.source);
+        if tracks.is_empty() {
+            return Err(format!("nothing playable for {query:?}"));
+        }
+        Ok(tracks)
+    }
+}
+
+/// Wait for a child, killing it at the deadline. Returns whether it exited on
+/// its own. Shared with [`YtDlp`] rather than duplicated: the deadline and the
+/// stderr handling are the same problem twice otherwise.
+fn wait_for(child: &mut Child, timeout: Duration, err: &mut String) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                if !st.success()
+                    && let Some(mut e) = child.stderr.take()
+                {
+                    use std::io::Read;
+                    let _ = e.read_to_string(err);
+                }
+                return st.success();
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Try one resolver, then the other, reporting both failures if both fail.
+///
+/// This is what keeps a missing Python package from being a broken music
+/// button. `ytmusicapi` is one `uv pip install` away from absent, and a host
+/// that upgrades Arc without re-running the installer should get the older,
+/// worse yt-dlp search rather than a refusal to play anything at all. Both
+/// errors are reported because "nothing playable" and "the module is missing"
+/// call for different fixes, and collapsing them into one message loses that.
+#[derive(Debug)]
+pub struct Fallback {
+    primary: Arc<dyn Resolver>,
+    secondary: Arc<dyn Resolver>,
+}
+
+impl Fallback {
+    pub fn new(primary: Arc<dyn Resolver>, secondary: Arc<dyn Resolver>) -> Self {
+        Self { primary, secondary }
+    }
+}
+
+impl Resolver for Fallback {
+    fn resolve(&self, query: &str, count: usize) -> Result<Vec<Track>, String> {
+        match self.primary.resolve(query, count) {
+            Ok(t) if !t.is_empty() => Ok(t),
+            Ok(_) => match self.secondary.resolve(query, count) {
+                Ok(t) => Ok(t),
+                Err(e2) => Err(format!("no results: {e2}")),
+            },
+            Err(e1) => match self.secondary.resolve(query, count) {
+                Ok(t) if !t.is_empty() => Ok(t),
+                Ok(_) => Err(e1),
+                Err(e2) => Err(format!("{e1} (yt-dlp also failed: {e2})")),
+            },
+        }
+    }
 }
 
 /// A player that refuses everything, used when playback is switched off.
@@ -751,6 +896,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn t(name: &str) -> Track {
         Track::new(name, "Someone", "test", &format!("https://example.invalid/{name}")).unwrap()
@@ -901,6 +1047,139 @@ mod tests {
         assert_eq!(q.len(), 2);
         // A limit of zero would refuse everything, so it is raised to one.
         assert!(Queue::default().with_limit(0).push(vec![t("a")]).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // YouTube Music API resolver
+    // ------------------------------------------------------------------
+
+    /// The module speaks one JSON object per line; that has to become the
+    /// same `Track` the yt-dlp path produces, or the queue grows rows of a
+    /// different shape depending on which resolver answered.
+    #[test]
+    fn api_results_parse_into_the_same_track_shape() {
+        let out = concat!(
+            r#"{"title":"Windowlicker","artist":"Aphex Twin","album":"Windowlicker","duration":366,"video_id":"a1","url":"https://stream.invalid/a1","artwork":"https://img.invalid/a1","source":"youtube music"}"#,
+            "\n",
+            r#"{"title":"Xenon","artist":"","album":"","duration":0,"video_id":"b2","url":"https://stream.invalid/b2","artwork":"","source":"youtube music"}"#,
+            "\n",
+        );
+        let tracks = parse_api_results(out, "youtube music");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].title, "Windowlicker");
+        assert_eq!(tracks[0].artist, "Aphex Twin");
+        assert_eq!(tracks[0].url, "https://stream.invalid/a1");
+        assert_eq!(tracks[1].artist, "");
+        // The source is the daemon's, not the module's: a module that claimed
+        // otherwise must not be able to relabel every track.
+        assert!(tracks.iter().all(|t| t.source == "youtube music"));
+    }
+
+    /// A killed child leaves a truncated last line. The tracks that arrived
+    /// before it are still good, so a parse failure costs one track and not
+    /// the whole search.
+    #[test]
+    fn api_results_survive_a_truncated_line() {
+        let out = concat!(
+            r#"{"title":"Good","artist":"A","url":"https://stream.invalid/a"}"#,
+            "\n",
+            r#"{"title":"Cut off here","artist":"B","url"#,
+        );
+        let tracks = parse_api_results(out, "youtube music");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "Good");
+    }
+
+    /// A row with no url cannot play. The module already refuses to emit one;
+    /// skipping it here too means a stale module produces a shorter queue
+    /// rather than a queue full of silence.
+    #[test]
+    fn api_results_skip_a_track_with_no_url() {
+        let out = concat!(
+            r#"{"title":"No stream","artist":"A","url":""}"#,
+            "\n",
+            r#"{"title":"Fine","artist":"B","url":"https://stream.invalid/b"}"#,
+            "\n",
+        );
+        let tracks = parse_api_results(out, "youtube music");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "Fine");
+    }
+
+    #[test]
+    fn api_results_ignore_prose_and_blank_lines() {
+        // Anything the module prints that is not a JSON object -- a warning,
+        // a stray banner -- must not become a track.
+        let out = "WARNING: something\n\nnot json at all\n";
+        assert!(parse_api_results(out, "youtube music").is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Fallback
+    // ------------------------------------------------------------------
+
+    /// A stub resolver that answers from a canned script.
+    #[derive(Debug)]
+    struct Stub {
+        name: &'static str,
+        result: Result<Vec<Track>, String>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Stub {
+        fn ok(name: &'static str, titles: &[&str]) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tracks = titles.iter().map(|name| t(name)).collect();
+            (Self { name, result: Ok(tracks), calls: calls.clone() }, calls)
+        }
+
+        fn err(name: &'static str, msg: &str) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (Self { name, result: Err(msg.into()), calls: calls.clone() }, calls)
+        }
+    }
+
+    impl Resolver for Stub {
+        fn resolve(&self, _q: &str, _c: usize) -> Result<Vec<Track>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+    }
+
+    #[test]
+    fn the_primary_resolver_is_used_when_it_works() {
+        let (api, api_calls) = Stub::ok("api", &["from-api"]);
+        let (ytdlp, ytdlp_calls) = Stub::ok("yt-dlp", &["from-ytdlp"]);
+        let f = Fallback::new(Arc::new(api), Arc::new(ytdlp));
+        let tracks = f.resolve("q", 1).unwrap();
+        assert_eq!(tracks[0].title, "from-api");
+        assert_eq!(api_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ytdlp_calls.load(Ordering::SeqCst), 0, "the fallback ran needlessly");
+    }
+
+    /// The reason the chain exists: a host without `ytmusicapi` installed must
+    /// still be able to play something.
+    #[test]
+    fn a_missing_python_module_falls_back_to_yt_dlp() {
+        let (api, _) = Stub::err("api", "the ytmusicapi module is not installed");
+        let (ytdlp, ytdlp_calls) = Stub::ok("yt-dlp", &["from-ytdlp"]);
+        let f = Fallback::new(Arc::new(api), Arc::new(ytdlp));
+        let tracks = f.resolve("q", 1).unwrap();
+        assert_eq!(tracks[0].title, "from-ytdlp");
+        assert_eq!(ytdlp_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Both failures are reported. "the module is missing" and "no results"
+    /// need different fixes, so losing the first to get the second would be
+    /// a worse error than either alone.
+    #[test]
+    fn when_both_fail_both_reasons_are_reported() {
+        let (api, _) = Stub::err("api", "the ytmusicapi module is not installed");
+        let (ytdlp, _) = Stub::err("yt-dlp", "no playable result");
+        let f = Fallback::new(Arc::new(api), Arc::new(ytdlp));
+        let err = f.resolve("q", 1).unwrap_err();
+        assert!(err.contains("ytmusicapi module is not installed"), "{err}");
+        assert!(err.contains("no playable result"), "{err}");
     }
 
     #[test]

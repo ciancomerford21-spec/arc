@@ -485,7 +485,26 @@ pub struct Music {
     /// and drives pause/skip/queue through that socket.
     pub player: String,
     /// Turns a search string into a stream url plus title and artist.
+    ///
+    /// Only read when `search = "yt-dlp"`. It names the yt-dlp binary; the
+    /// API resolver resolves streams with the same binary but finds the
+    /// *tracks* through YouTube Music itself.
     pub resolver: String,
+    /// Which search backend resolves a query: `ytmusic` (YouTube Music's own
+    /// API, via the `arc_music` Python module) or `yt-dlp` (a plain video
+    /// search, which is what shipped first).
+    ///
+    /// They answer the same request differently and it is visible: `yt-dlp`
+    /// searches all of YouTube, so "play aphex twin" can return a 40-minute
+    /// mix or a live cover, and it carries no album or artwork. `ytmusic`
+    /// searches songs only, so the result is the studio track with cover art.
+    /// yt-dlp remains reachable as a fallback because the API needs a Python
+    /// module installed, and that is one missing package away from nothing
+    /// working at all.
+    pub search: String,
+    /// The interpreter that runs the `arc_music` module, and the module's
+    /// import path. Only read when `search = "ytmusic"`.
+    pub python: String,
     /// How long a resolution may take before it is called failed, in seconds.
     /// yt-dlp normally answers in a couple of seconds; a hung one would
     /// otherwise hold the daemon's socket handler open indefinitely.
@@ -507,6 +526,8 @@ impl Default for Music {
             enabled: true,
             player: "mpv".into(),
             resolver: "yt-dlp".into(),
+            search: "ytmusic".into(),
+            python: "python3".into(),
             resolve_timeout_s: 30,
             search_results: 1,
             queue_limit: 100,

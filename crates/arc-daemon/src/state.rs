@@ -539,7 +539,38 @@ impl Daemon {
     pub fn new(config: Config, bar_file: Option<PathBuf>) -> Result<Self, String> {
         let music_cfg = config.music.clone();
         let (player, resolver): (Arc<dyn Player>, Arc<dyn Resolver>) = if music_cfg.enabled {
-            (Arc::new(music::MpvPlayer::new(&music_cfg)), Arc::new(music::YtDlp::new(&music_cfg)))
+            let player = Arc::new(music::MpvPlayer::new(&music_cfg));
+            // The API resolver is the better search -- songs only, with real
+            // artwork and albums -- but it needs a Python module installed,
+            // so it is chained in front of yt-dlp rather than instead of it.
+            // A host that upgrades the binaries without the module gets the
+            // older search instead of a dead music button.
+            let resolver: Arc<dyn Resolver> = match music_cfg.search.as_str() {
+                "yt-dlp" | "ytdlp" => {
+                    tracing::info!(backend = "yt-dlp", "music search backend");
+                    Arc::new(music::YtDlp::new(&music_cfg))
+                }
+                "" | "ytmusic" | "api" => {
+                    tracing::info!(
+                        backend = "youtube music api",
+                        python = %music_cfg.python,
+                        "music search backend (falls back to yt-dlp)"
+                    );
+                    Arc::new(music::Fallback::new(
+                        Arc::new(music::YtMusicApi::new(&music_cfg)),
+                        Arc::new(music::YtDlp::new(&music_cfg)),
+                    ))
+                }
+                other => {
+                    // An unknown backend name would otherwise fall through to
+                    // the default arm and appear to work while doing something
+                    // the config did not ask for.
+                    return Err(format!(
+                        "[music] search = {other:?} is not a backend; use \"ytmusic\" or \"yt-dlp\""
+                    ));
+                }
+            };
+            (player, resolver)
         } else {
             tracing::info!("playback disabled in config; every music request will be refused");
             (
